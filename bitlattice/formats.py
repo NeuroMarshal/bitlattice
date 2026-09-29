@@ -22,7 +22,7 @@ import torch
 
 __all__ = [
     "Format", "TableFormat", "UniformFormat", "NativeFormat", "ScaleSpec",
-    "get", "register", "available", "exmy_values", "table", "uniform", "native",
+    "get", "register", "available", "exmy_values", "table", "uniform", "native", "fit_group",
 ]
 
 SCALE_DTYPES = ("fp32", "fp16", "bf16", "e4m3", "e8m0")
@@ -38,6 +38,7 @@ class ScaleSpec:
     group: int = 64
     dtype: str = "fp16"
     global_scale: bool = False
+    strict: bool = False          # group fixed by a hardware layout (nvfp4, mxfp4); never adapted per layer
 
     def __post_init__(self):
         if self.dtype not in SCALE_DTYPES:
@@ -265,6 +266,19 @@ def uniform(bits: int, group: int = 64, scale: str = "fp16", symmetric: bool = F
     return UniformFormat(name or f"int{bits}", bits, qmin, qmax, ScaleSpec(group, scale), zero_point, init)
 
 
+def fit_group(fmt: Format, cols: int) -> Format | None:
+    """Format with its scale group adapted to a layer of ``cols`` input features: the largest divisor of ``cols``
+    that is a multiple of 8 and not above the nominal group, else one scale per row. None if impossible (strict
+    hardware groups or ``cols`` not a multiple of 8)."""
+    sc = fmt.scale
+    if sc is None or sc.group <= 0 or cols % sc.group == 0:
+        return fmt
+    if sc.strict or cols % 8:
+        return None
+    g = next((g for g in range(sc.group - sc.group % 8, 7, -8) if cols % g == 0), -1)
+    return fmt.with_scale(group=g)
+
+
 def native(dtype: torch.dtype) -> NativeFormat:
     return NativeFormat(str(dtype).replace("torch.", ""), dtype)
 
@@ -307,8 +321,8 @@ def get(spec) -> Format:
 for _name, _fmt in {
     "fp4": TableFormat("fp4", 4, _E2M1, ScaleSpec(16, "fp32")),
     "e2m1": TableFormat("e2m1", 4, _E2M1, ScaleSpec(16, "fp32")),
-    "nvfp4": TableFormat("nvfp4", 4, _E2M1, ScaleSpec(16, "e4m3", global_scale=True)),
-    "mxfp4": TableFormat("mxfp4", 4, _E2M1, ScaleSpec(32, "e8m0")),
+    "nvfp4": TableFormat("nvfp4", 4, _E2M1, ScaleSpec(16, "e4m3", global_scale=True, strict=True)),
+    "mxfp4": TableFormat("mxfp4", 4, _E2M1, ScaleSpec(32, "e8m0", strict=True)),
     "nf4": TableFormat("nf4", 4, NF4_VALUES, ScaleSpec(64, "fp16")),
     "fp6_e2m3": TableFormat("fp6_e2m3", 6, exmy_values(2, 3), ScaleSpec(32, "e8m0")),
     "fp6_e3m2": TableFormat("fp6_e3m2", 6, exmy_values(3, 2), ScaleSpec(32, "e8m0")),

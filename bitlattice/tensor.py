@@ -1,0 +1,249 @@
+"""LatticeTensor: a torch.Tensor subclass holding a weight in a lattice format.
+
+The logical tensor (shape, dtype) is what PyTorch code sees; the storage is packed codes + group scales (+ global
+scale, zero points) and an optional set of input columns kept in high precision. ``F.linear`` and ``F.embedding``
+use dedicated paths; every other operator falls back to the dequantized weight, so arbitrary modules work and
+autograd produces a dense gradient of the logical shape.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+import torch
+from torch.utils._pytree import tree_map
+
+from . import _ops
+from . import formats as F
+from . import reference as R
+
+__all__ = ["LatticeTensor", "is_lattice"]
+
+_PARTS = ("packed", "scales", "global_scale", "zeros", "hi_idx", "hi_val")
+
+
+def is_lattice(t) -> bool:
+    return isinstance(t, LatticeTensor)
+
+
+class LatticeTensor(torch.Tensor):
+    packed: torch.Tensor
+    scales: torch.Tensor
+    global_scale: torch.Tensor | None
+    zeros: torch.Tensor | None
+    hi_idx: torch.Tensor | None
+    hi_val: torch.Tensor | None
+    fmt: F.Format
+
+    @staticmethod
+    def __new__(cls, packed, scales, global_scale, zeros, fmt, shape, dtype=torch.bfloat16, hi_idx=None, hi_val=None,
+                requires_grad=False):
+        t = torch.Tensor._make_wrapper_subclass(cls, torch.Size(shape), dtype=dtype, device=packed.device,
+                                                requires_grad=requires_grad)
+        t.packed, t.scales, t.global_scale, t.zeros = packed, scales, global_scale, zeros
+        t.hi_idx, t.hi_val = hi_idx, hi_val
+        t.fmt = F.get(fmt)
+        return t
+
+    def __init__(self, *args, **kwargs):  # state is set in __new__
+        super().__init__()
+
+    # ------------------------------------------------------------------------------------------------------------
+    # construction
+
+    @classmethod
+    def from_float(cls, w: torch.Tensor, fmt, method: str = "mse", keep: float = 0.0,
+                   keep_dtype: torch.dtype = torch.bfloat16, saliency: torch.Tensor | None = None,
+                   dtype: torch.dtype | None = None) -> "LatticeTensor":
+        """Quantize a dense tensor. ``keep``: fraction of input columns (of the 2-D view) stored in ``keep_dtype``,
+        chosen by ``saliency`` (per column, larger = more important; default: column L2 norm)."""
+        fmt = F.get(fmt)
+        w2 = R.view2d(w.detach()).to(torch.float32)
+        rows, cols = w2.shape
+        hi_idx = hi_val = None
+        k = int(round(max(0.0, min(1.0, keep)) * cols))
+        if k > 0:
+            score = saliency.to(w2.device, torch.float32) if saliency is not None else w2.square().sum(0)
+            hi_idx = torch.topk(score, k).indices.sort().values
+            hi_val = w2[:, hi_idx].to(keep_dtype)
+            w2 = w2.clone()
+            w2[:, hi_idx] = 0.0
+        q = R.quantize(w2, fmt, method=method)
+        logical = dtype or (w.dtype if w.dtype.is_floating_point else torch.bfloat16)
+        return cls(q.packed, q.scales, q.global_scale, q.zeros, fmt, w.shape, logical, hi_idx, hi_val)
+
+    # ------------------------------------------------------------------------------------------------------------
+    # views of the storage
+
+    @property
+    def rows(self) -> int:
+        return 1 if self.dim() == 1 else self.shape[0]
+
+    @property
+    def cols(self) -> int:
+        return self.numel() // self.rows
+
+    def parts(self) -> dict[str, torch.Tensor | None]:
+        return {k: getattr(self, k) for k in _PARTS}
+
+    def dequantize(self, dtype: torch.dtype | None = None) -> torch.Tensor:
+        """Dense tensor of the logical shape in ``dtype`` (default: the logical dtype)."""
+        dtype = dtype or self.dtype
+        kd = dtype if dtype in (torch.float32, torch.bfloat16, torch.float16) else torch.float32
+        w = _ops.dequantize(self.packed, self.scales, self.global_scale, self.zeros, self.fmt, self.rows, self.cols, kd)
+        if self.hi_idx is not None:
+            w[:, self.hi_idx] = self.hi_val.to(kd)
+        return w.to(dtype).reshape(self.shape)
+
+    def dequantize_rows(self, idx: torch.Tensor, dtype: torch.dtype | None = None) -> torch.Tensor:
+        """Dequantize selected rows only ([len(idx), cols]); requires per-row or finer groups."""
+        dtype = dtype or self.dtype
+        spec = self.fmt.scale
+        if spec.group == 0:
+            return self.dequantize(dtype).reshape(self.rows, self.cols)[idx]
+        kd = dtype if dtype in (torch.float32, torch.bfloat16, torch.float16) else torch.float32
+        z = self.zeros[idx] if self.zeros is not None else None
+        w = _ops.dequantize(self.packed[idx].contiguous(), self.scales[idx].contiguous(), self.global_scale, z,
+                            self.fmt, idx.numel(), self.cols, kd)
+        if self.hi_idx is not None:
+            w[:, self.hi_idx] = self.hi_val[idx].to(kd)
+        return w.to(dtype)
+
+    def storage_bytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in self.parts().values() if t is not None)
+
+    def __repr__(self, *, tensor_contents=None) -> str:
+        keep = f", keep={self.hi_idx.numel()}/{self.cols}" if self.hi_idx is not None else ""
+        return (f"LatticeTensor(shape={tuple(self.shape)}, format={self.fmt.name}, dtype={self.dtype}, "
+                f"device={self.device}{keep})")
+
+    # ------------------------------------------------------------------------------------------------------------
+    # torch.compile / FX support
+
+    def __tensor_flatten__(self):
+        names = [k for k in _PARTS if getattr(self, k) is not None]
+        return names, (self.fmt, tuple(self.shape), self.dtype)
+
+    @staticmethod
+    def __tensor_unflatten__(inner, ctx, outer_size, outer_stride):
+        fmt, shape, dtype = ctx
+        return LatticeTensor(inner["packed"], inner["scales"], inner.get("global_scale"), inner.get("zeros"), fmt,
+                             shape, dtype, inner.get("hi_idx"), inner.get("hi_val"))
+
+    def _map(self, fn, **kw) -> "LatticeTensor":
+        p = {k: (fn(v) if v is not None else None) for k, v in self.parts().items()}
+        return LatticeTensor(p["packed"], p["scales"], p["global_scale"], p["zeros"], self.fmt, kw.get("shape", self.shape),
+                             kw.get("dtype", self.dtype), p["hi_idx"], p["hi_val"])
+
+    # ------------------------------------------------------------------------------------------------------------
+    # operator interception
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func is torch.nn.functional.linear:
+            x, w = args[0], args[1]
+            b = args[2] if len(args) > 2 else kwargs.get("bias")
+            if isinstance(w, LatticeTensor) and not isinstance(x, LatticeTensor):
+                return _LatticeLinear.apply(x, w, b)
+        if func is torch.nn.functional.embedding:
+            idx, w = args[0], args[1]
+            if isinstance(w, LatticeTensor) and not kwargs.get("max_norm") and len(args) <= 2:
+                return _LatticeEmbedding.apply(idx, w, kwargs.get("padding_idx"))
+        with torch._C.DisableTorchFunctionSubclass():
+            return func(*args, **kwargs)
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        aten = torch.ops.aten
+        if func in (aten.detach.default, aten.alias.default):
+            return args[0]._map(lambda t: t)
+        if func is aten.clone.default:
+            return args[0]._map(lambda t: t.clone())
+        if func is aten._to_copy.default:
+            src = args[0]
+            device = kwargs.get("device", src.device)
+            dtype = kwargs.get("dtype", src.dtype)
+            moved = src._map(lambda t: t.to(device))
+            moved_dtype = dtype if dtype is not None and dtype.is_floating_point else src.dtype
+            return moved._map(lambda t: t, dtype=moved_dtype)
+        if func is aten.copy_.default:
+            dst, src = args[0], args[1]
+            if isinstance(src, LatticeTensor) and src.fmt == dst.fmt:
+                for k in _PARTS:
+                    d, s = getattr(dst, k), getattr(src, k)
+                    if d is not None and s is not None and d.shape == s.shape:
+                        d.copy_(s)
+                    else:
+                        setattr(dst, k, s.to(dst.device).clone() if s is not None else None)
+                return dst
+            dense = src.dequantize(torch.float32) if isinstance(src, LatticeTensor) else src
+            q = LatticeTensor.from_float(dense.to(dst.device), dst.fmt, method="rtn", dtype=dst.dtype)
+            for k in _PARTS:
+                setattr(dst, k, getattr(q, k))
+            return dst
+        if func in (aten.is_same_size.default,):
+            return args[0].shape == args[1].shape
+
+        def unwrap(t):
+            return t.dequantize() if isinstance(t, LatticeTensor) else t
+
+        return func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs))
+
+
+# --------------------------------------------------------------------------------------------------------------
+# autograd paths
+
+class _LatticeLinear(torch.autograd.Function):
+    """y = x W^T + b with W dequantized on the fly (forward and backward); no dense W is kept between them."""
+
+    @staticmethod
+    def forward(ctx, x, w: LatticeTensor, bias):
+        W = w.dequantize(x.dtype)
+        ctx.save_for_backward(x)
+        ctx.w = w
+        ctx.has_bias = bias is not None
+        return torch.nn.functional.linear(x, W, bias)
+
+    @staticmethod
+    def backward(ctx, gy):
+        (x,) = ctx.saved_tensors
+        w = ctx.w
+        W = w.dequantize(gy.dtype)
+        gx = gy @ W if ctx.needs_input_grad[0] else None
+        gw = None
+        if ctx.needs_input_grad[1]:
+            gw = (gy.reshape(-1, gy.shape[-1]).t() @ x.reshape(-1, x.shape[-1])).to(w.dtype)
+        gb = gy.reshape(-1, gy.shape[-1]).sum(0) if ctx.has_bias and ctx.needs_input_grad[2] else None
+        return gx, gw, gb
+
+
+class _LatticeEmbedding(torch.autograd.Function):
+    """Row lookup dequantizing only the referenced rows."""
+
+    @staticmethod
+    def forward(ctx, idx, w: LatticeTensor, padding_idx):
+        flat = idx.reshape(-1)
+        uniq, inv = torch.unique(flat, return_inverse=True)
+        rows = w.dequantize_rows(uniq)
+        out = rows[inv].reshape(*idx.shape, w.cols)
+        ctx.save_for_backward(idx)
+        ctx.shape, ctx.dtype, ctx.padding_idx = w.shape, w.dtype, padding_idx
+        return out
+
+    @staticmethod
+    def backward(ctx, gy):
+        (idx,) = ctx.saved_tensors
+        gw = torch.zeros(ctx.shape[0], gy.shape[-1], dtype=ctx.dtype, device=gy.device)
+        gw.index_add_(0, idx.reshape(-1), gy.reshape(-1, gy.shape[-1]).to(ctx.dtype))
+        if ctx.padding_idx is not None:
+            gw[ctx.padding_idx] = 0
+        return None, gw.reshape(ctx.shape), None
+
+
+def to_parameter(t: LatticeTensor, requires_grad: bool = True) -> torch.nn.Parameter:
+    return torch.nn.Parameter(t, requires_grad=requires_grad)
+
+
+def summary(t: Any) -> str:
+    return repr(t)
