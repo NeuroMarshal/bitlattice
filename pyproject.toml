@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69", "wheel", "torch>=2.6"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bitlattice"
+version = "0.1.0.dev0"
+description = "Training and fine-tuning of PyTorch models directly in low-bit and arbitrary number formats."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "NeuroMarshal" }]
+requires-python = ">=3.10"
+dependencies = ["torch>=2.6", "safetensors>=0.4"]
+
+[project.optional-dependencies]
+hf = ["transformers>=4.45", "accelerate>=0.30", "huggingface_hub>=0.23"]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["bitlattice", "bitlattice.quant", "bitlattice.optim", "bitlattice.nn", "bitlattice.io"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
