@@ -233,12 +233,17 @@ class _LatticeEmbedding(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, gy):
+        """Row-sparse gradient (COO over rows): only referenced rows are materialized."""
         (idx,) = ctx.saved_tensors
-        gw = torch.zeros(ctx.shape[0], gy.shape[-1], dtype=ctx.dtype, device=gy.device)
-        gw.index_add_(0, idx.reshape(-1), gy.reshape(-1, gy.shape[-1]).to(ctx.dtype))
+        flat = idx.reshape(-1)
+        rows, inv = torch.unique(flat, return_inverse=True)
+        vals = torch.zeros(rows.numel(), gy.shape[-1], dtype=ctx.dtype, device=gy.device)
+        vals.index_add_(0, inv, gy.reshape(-1, gy.shape[-1]).to(ctx.dtype))
         if ctx.padding_idx is not None:
-            gw[ctx.padding_idx] = 0
-        return None, gw.reshape(ctx.shape), None
+            vals[rows == ctx.padding_idx] = 0
+        gw = torch.sparse_coo_tensor(rows.unsqueeze(0), vals, (ctx.shape[0], gy.shape[-1]), is_coalesced=True,
+                                     check_invariants=False)
+        return None, gw.reshape(ctx.shape) if len(ctx.shape) != 2 else gw, None
 
 
 def to_parameter(t: LatticeTensor, requires_grad: bool = True) -> torch.nn.Parameter:

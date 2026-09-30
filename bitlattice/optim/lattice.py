@@ -237,6 +237,12 @@ class Lattice(torch.optim.Optimizer):
         pid = self._pid[p]
         seed = (self.seed + 7919 * pid) & 0xFFFFFFFF
         G = p.grad
+        if G.is_sparse:
+            if self._sparse_ok(p, g):
+                self._update_sparse(p, G, st, g, seed)
+                self._send_back(p, st)
+                return
+            G = G.to_dense()
         matrix = p.dim() >= 2 and min(p.shape[0], p.numel() // p.shape[0]) > 1
         if matrix and self._tileable(p, g):
             self._update_tiled(p, G, st, g, seed)
@@ -309,6 +315,59 @@ class Lattice(torch.optim.Optimizer):
                 _ops.step_native(w, ph, D, phase_cb=cb, offset=r0 * cols, **kw)
         if quant:
             p.scales.copy_(torch.cat(new_scales, 0))
+
+    # ------------------------------------------------------------------------------------------------------------
+    # row-sparse gradients (embeddings): only the referenced rows are updated
+
+    def _sparse_ok(self, p: torch.Tensor, g: dict) -> bool:
+        if p.dim() != 2 or g["momentum"] != "none" or not (p.is_cuda and _ops.HAVE_EXT):
+            return False
+        if isinstance(p, LatticeTensor):
+            return p.hi_idx is None and p.fmt.scale.group != 0 and _ops.cuda_ok(p.fmt, p.rows, p.cols, p.packed.device)
+        return p.dtype in (torch.bfloat16, torch.float16, torch.float32) and p.is_contiguous() and p.shape[1] % 8 == 0
+
+    def _update_sparse(self, p: torch.Tensor, G: torch.Tensor, st: dict, g: dict, seed: int) -> None:
+        G = G.coalesce()
+        rows = G.indices()[0]
+        vals = G.values()
+        if rows.numel() == 0:
+            return
+        n_rows, cols = p.shape
+        kind = g["direction"]
+        if kind == "factored":
+            if "r" not in st:
+                st["r"] = torch.zeros(n_rows, device=p.device)
+                st["c"] = torch.zeros(cols, device=p.device)
+                st["k"] = 0
+            st["k"] += 1
+            r_sub = st["r"][rows].contiguous()
+            D = _ops.direction(vals, "factored", r_sub, st["c"], st["k"], g["beta2"], clip=g["clip"])
+            st["r"][rows] = r_sub
+        else:
+            D = _ops.direction(vals, kind, block=g["block"], ns_steps=g["ns_steps"], ns_dtype=g["ns_dtype"],
+                               sinkhorn_iters=g["sinkhorn_iters"], clip=g["clip"])
+        bits = g["phase_bits"]
+        cb = _ops.phase_container(bits)
+        kw = dict(lr=g["lr"], weight_decay=g["weight_decay"], phase_bits=bits, rounding=g["rounding"],
+                  seed=(seed + 104729 * st["step"]) & 0xFFFFFFFF, step=st["step"], strata=g["strata"])
+        if bits and "phase" not in st:
+            st["phase"] = torch.zeros(n_rows, cols * cb // 8, dtype=torch.uint8, device=p.device)
+        ph = st["phase"][rows].contiguous() if bits else None
+        k = rows.numel()
+        if isinstance(p, LatticeTensor):
+            packed = p.packed[rows].contiguous()
+            zeros = p.zeros[rows].contiguous() if p.zeros is not None else None
+            sc = _ops.step_quantized(packed, ph, p.scales[rows].contiguous(), p.global_scale, zeros, D, p.fmt, k, cols,
+                                     phase_cb=cb, scale_rule=g["scale_rule"], trust=g["trust"],
+                                     trust_lr=g["trust_lr"], **kw)
+            p.packed[rows] = packed
+            p.scales[rows] = sc
+        else:
+            w = p.data[rows].contiguous()
+            _ops.step_native(w, ph.reshape(-1) if bits else None, D, phase_cb=cb, **kw)
+            p.data[rows] = w
+        if bits:
+            st["phase"][rows] = ph
 
     def _update_native(self, p, w: torch.Tensor, D: torch.Tensor, st: dict, key: str, kw: dict) -> None:
         bits = kw["phase_bits"]

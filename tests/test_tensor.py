@@ -56,7 +56,8 @@ def test_embedding_rows_and_grad():
     out.sum().backward()
     expect = torch.zeros(100, 32, device=DEV)
     expect.index_add_(0, idx.reshape(-1), torch.ones(6, 32, device=DEV))
-    assert torch.allclose(p.grad, expect)
+    assert p.grad.is_sparse
+    assert torch.allclose(p.grad.to_dense(), expect)
 
 
 def test_conv_falls_back_with_autograd():

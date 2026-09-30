@@ -188,3 +188,38 @@ def test_row_tiles_match_untiled(fmt):
     else:
         assert torch.equal(p1.packed, p2.packed) and torch.equal(p1.scales, p2.scales)
     assert torch.equal(o1.state[p1]["phase"], o2.state[p2]["phase"])
+
+
+@pytest.mark.parametrize("fmt", ["nvfp4", "int8", "bf16"])
+def test_sparse_embedding_updates_only_referenced_rows(fmt):
+    torch.manual_seed(0)
+    emb = torch.nn.Embedding(1000, 64, device=DEV, sparse=(fmt == "bf16"))
+    if fmt == "bf16":
+        emb.to(torch.bfloat16)
+    else:
+        bl.quantize_(emb, format=fmt, targets=(torch.nn.Embedding,), min_features=16)
+    before = (emb.weight.dequantize(torch.float32) if fmt != "bf16" else emb.weight.detach().float()).clone()
+    opt = bl.Lattice(emb.parameters(), lr=0.1, direction="factored")
+    idx = torch.tensor([[3, 7, 7, 900]], device=DEV)
+    for _ in range(5):
+        emb(idx).float().square().sum().backward()
+        assert emb.weight.grad.is_sparse
+        opt.step()
+        opt.zero_grad()
+    after = emb.weight.dequantize(torch.float32) if fmt != "bf16" else emb.weight.detach().float()
+    changed = (after != before).any(1).nonzero().reshape(-1).tolist()
+    assert set(changed) <= {3, 7, 900} and len(changed) >= 2
+    assert after[[3, 7, 900]].square().sum() < before[[3, 7, 900]].square().sum()   # loss = sum of squares shrinks
+
+
+def test_tied_dense_and_sparse_gradients_accumulate():
+    torch.manual_seed(0)
+    emb = torch.nn.Embedding(128, 64, device=DEV)
+    head = torch.nn.Linear(64, 128, bias=False, device=DEV)
+    bl.quantize_(emb, format="nvfp4", targets=(torch.nn.Embedding,), min_features=16)
+    head.weight = emb.weight
+    idx = torch.tensor([[1, 2, 3]], device=DEV)
+    head(emb(idx)).sum().backward()
+    assert emb.weight.grad is not None and emb.weight.grad.shape == (128, 64)
+    opt = bl.Lattice([emb.weight], lr=1e-3, direction="factored")
+    opt.step()
