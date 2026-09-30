@@ -54,8 +54,10 @@ def param_groups(model: torch.nn.Module, head_direction: str = "factored", head_
 
 
 def build(model: torch.nn.Module, preset: str = "muon", lr: float = 3e-3, *, fused_backward: bool = False,
-          seed: int = 0, weight_decay: float = 0.0, **overrides) -> Lattice:
-    """Lattice optimizer for ``model`` from a preset; ``overrides`` replace preset options."""
+          seed: int = 0, weight_decay: float = 0.0, storage: str = "gpu", **overrides) -> Lattice:
+    """Lattice optimizer for ``model`` from a preset; ``overrides`` replace preset options. ``storage`` selects
+    where optimizer state lives ('gpu', 'state_in_ram', 'state_and_acts_in_ram'); for the last policy also run the
+    forward pass inside ``bitlattice.storage.activations_in_ram()``."""
     if preset not in PRESETS:
         raise KeyError(f"unknown preset {preset!r}; known: {sorted(PRESETS)}")
     opts = {**PRESETS[preset], **overrides}
@@ -63,4 +65,8 @@ def build(model: torch.nn.Module, preset: str = "muon", lr: float = 3e-3, *, fus
     groups = param_groups(model, head_direction="factored" if opts.get("direction", "").startswith("muon")
                           else opts.get("direction", "factored"), head_momentum=head_momentum,
                           weight_decay=weight_decay)
-    return Lattice(groups, lr=lr, seed=seed, fused_backward=fused_backward, **opts)
+    from ..storage import POLICIES
+    if storage not in POLICIES:
+        raise ValueError(f"storage must be one of {POLICIES}")
+    state_device = "cpu" if storage in ("state_in_ram", "state_and_acts_in_ram") else "cuda"
+    return Lattice(groups, lr=lr, seed=seed, fused_backward=fused_backward, state_device=state_device, **opts)

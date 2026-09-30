@@ -122,3 +122,46 @@ def test_discrete_activation_trains():
         opt.step()
         losses.append(loss.item())
     assert sum(losses[-20:]) / 20 < 0.45
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_state_in_ram_matches_gpu_state(fused):
+    teacher, s1 = _teacher_student(seed=5)
+    _, s2 = _teacher_student(seed=5)
+    for s in (s1, s2):
+        bl.quantize_(s, format="nvfp4", min_features=16)
+    o1 = bl.optim.build(s1, "muon", lr=5e-3, fused_backward=fused)
+    o2 = bl.optim.build(s2, "muon", lr=5e-3, fused_backward=fused, storage="state_in_ram")
+    l1 = _train(s1, teacher, o1, steps=25)
+    l2 = _train(s2, teacher, o2, steps=25)
+    assert l1 == l2
+    o2.synchronize()
+    for p1, p2 in zip(s1.parameters(), s2.parameters()):
+        assert not o2.state[p2]["phase"].is_cuda
+        assert torch.equal(o1.state[p1]["phase"].cpu(), o2.state[p2]["phase"])
+    plan = bl.plan(s2, o2)
+    assert plan.state_gpu_bytes < plan.state_host_bytes
+
+
+def test_activations_in_ram_same_gradients():
+    teacher, s1 = _teacher_student(seed=6)
+    bl.quantize_(s1, format="int4", min_features=16)
+    x = torch.randn(64, 64, device=DEV)
+    y = teacher(x).detach()
+    torch.nn.functional.mse_loss(s1(x), y).backward()
+    ref = [p.grad.clone() for p in s1.parameters()]
+    for p in s1.parameters():
+        p.grad = None
+    with bl.storage.activations_in_ram():
+        loss = torch.nn.functional.mse_loss(s1(x), y)
+    loss.backward()
+    for r, p in zip(ref, s1.parameters()):
+        assert torch.equal(r, p.grad)
+
+
+def test_plan_reports_compression():
+    _, student = _teacher_student()
+    bl.quantize_(student, format="nvfp4", min_features=16)
+    opt = bl.optim.build(student, "muon", fused_backward=True)
+    p = bl.plan(student, opt)
+    assert p.bits_per_weight < 8 and p.state_gpu_bytes > 0 and "weights" in str(p)
