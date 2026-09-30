@@ -5,7 +5,7 @@ import shutil
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.9;12.0")
+# TORCH_CUDA_ARCH_LIST unset: build for the GPUs visible at build time (e.g. "8.6;8.9;12.0" for a portable build)
 
 cxx = ["-O3", "-std=c++20", "-DGLOG_USE_GLOG_EXPORT"]
 nvcc = ["-O3", "-std=c++20", "--expt-relaxed-constexpr", "-lineinfo", "--fmad=false", "-DGLOG_USE_GLOG_EXPORT"]

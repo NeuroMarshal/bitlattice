@@ -15,7 +15,7 @@ their `nn.Module` code, and the optimizer is a `torch.optim.Optimizer`.
 Requirements: PyTorch ≥ 2.6 with CUDA, a CUDA toolkit matching the PyTorch build, a C++20 host compiler.
 
 ```bash
-pip install -e . --no-build-isolation            # builds bitlattice._C for TORCH_CUDA_ARCH_LIST (default 8.9;12.0)
+pip install -e . --no-build-isolation            # builds bitlattice._C for the visible GPUs (or TORCH_CUDA_ARCH_LIST)
 pip install -e ".[hf,test]" --no-build-isolation  # + transformers loading, tests
 ```
 
