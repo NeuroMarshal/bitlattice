@@ -18,10 +18,15 @@ Tensor newton_schulz(Tensor x, int64_t steps) {
   x = x / (at::linalg_vector_norm(x, 2, {-2, -1}, /*keepdim=*/true) + 1e-7);
   const bool tr = x.size(-2) > x.size(-1);
   if (tr) x = x.transpose(-2, -1);
+  const bool batched = x.dim() == 3;
+  if (!batched) x = x.unsqueeze(0);
+  x = x.contiguous();
   for (int64_t i = 0; i < steps; ++i) {
-    Tensor s = at::matmul(x, x.transpose(-2, -1));
-    x = a * x + at::matmul(b * s + c * at::matmul(s, s), x);
+    Tensor s = at::bmm(x, x.transpose(-2, -1));
+    Tensor B = at::baddbmm(s, s, s, /*beta=*/b, /*alpha=*/c);        // b*S + c*S^2
+    x = at::baddbmm(x, B, x, /*beta=*/a, /*alpha=*/1.0);              // a*X + B X
   }
+  if (!batched) x = x.squeeze(0);
   return tr ? x.transpose(-2, -1) : x;
 }
 
