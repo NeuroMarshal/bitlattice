@@ -68,3 +68,23 @@ def test_drop_and_replace_modules():
     assert removed == ["model.layers.1"] and isinstance(m.model.layers[1], torch.nn.Identity)
     old = bl.surgery.replace_module(m, "model.norm", torch.nn.Identity())
     assert old is not None and isinstance(m.model.norm, torch.nn.Identity)
+
+
+def test_primitives_on_dense_and_lattice():
+    m = _model(1000)
+    bl.quantize_(m, format="int8", min_features=16, rules=(bl.Rule("*lm_head"),))
+    name = "model.layers.0.mlp.up_proj.weight"
+    before = bl.surgery.values(m.get_parameter(name))
+    bl.surgery.resize_(m, name, 160, dim=0, init="zeros")                 # grow output channels
+    after = m.get_parameter(name)
+    assert isinstance(after, LatticeTensor) and after.shape == (160, 64)
+    assert torch.allclose(bl.surgery.values(after)[:128], before, atol=2e-2 * before.abs().max())
+    bl.surgery.select_(m, name, torch.arange(128), dim=0)                 # prune back
+    bl.surgery.resize_(m, "model.layers.0.mlp.down_proj.weight", 128, dim=1)
+    bl.surgery.update_(m, "lm_head.weight", lambda v: v.mul_(0.5))
+    bl.surgery.sync_shapes_(m)
+    assert m.model.layers[0].mlp.up_proj.out_features == 128
+    x = torch.randint(0, 1000, (1, 8), device=DEV)
+    assert torch.isfinite(m(x).logits).all()
+    bl.surgery.insert_module(m, "model.layers", 1, torch.nn.Identity())
+    assert len(m.model.layers) == 3
