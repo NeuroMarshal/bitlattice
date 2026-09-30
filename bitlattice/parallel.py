@@ -380,6 +380,8 @@ def _block_inputs(backbone: torch.nn.Module, blocks, input_ids: torch.Tensor | N
                 box["hidden"] = h
             kw.pop("hidden_states", None)
             box["kwargs"].append(dict(kw))
+            if i == len(blocks) - 1:
+                raise _Stop                     # skip the final norm: it may live on another process
             return h
         return fwd
 
@@ -391,6 +393,8 @@ def _block_inputs(backbone: torch.nn.Module, blocks, input_ids: torch.Tensor | N
             backbone(inputs_embeds=inputs_embeds, use_cache=False, **kwargs)
         else:
             backbone(input_ids=input_ids, use_cache=False, **kwargs)
+    except _Stop:
+        pass
     finally:
         for b, f in zip(blocks, saved):
             if f is None:

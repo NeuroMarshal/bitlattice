@@ -55,15 +55,32 @@ def is_main() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
-def _group(src: int, dst: int):
-    """Communicator for transfers from ``src`` to ``dst`` (created collectively for all ordered pairs at once)."""
+_CHANNELS = ("main", "aux")
+
+
+def _group(src: int, dst: int, channel: str = "main"):
+    """Communicator for transfers from ``src`` to ``dst`` on ``channel`` (created collectively for all ordered pairs
+    and channels at once). NCCL matches point-to-point operations by order per communicator, so transfers issued in
+    a different order (auxiliary inputs of the head) use their own channel."""
     if not _GROUPS:
         w = dist.get_world_size()
-        for i in range(w):
-            for j in range(w):
-                if i != j:
-                    _GROUPS[(i, j)] = dist.new_group([i, j])
-    return _GROUPS[(src, dst)]
+        for ch in _CHANNELS:
+            for i in range(w):
+                for j in range(w):
+                    if i != j:
+                        _GROUPS[(i, j, ch)] = dist.new_group([i, j])
+        # NCCL creates a point-to-point communicator on its first transfer, blocking until the peer does the same;
+        # a first transfer issued at different points of the schedule would deadlock. Exchange one element on every
+        # communicator now, in the same order on all processes.
+        me = dist.get_rank()
+        probe = torch.zeros(1, device=torch.device("cuda", torch.cuda.current_device()))
+        for (i, j, ch), g in sorted(_GROUPS.items()):
+            if me == i:
+                dist.send(probe, j, group=g)
+            elif me == j:
+                dist.recv(probe, i, group=g)
+        torch.cuda.synchronize()
+    return _GROUPS[(src, dst, channel)]
 
 
 @dataclass
@@ -109,6 +126,29 @@ def _block_kwargs(backbone, blocks, ids, embed: bool, width: int, dtype, device)
     return None, kws
 
 
+def _prune(keep: list) -> None:
+    """Drop finished sends (their communication works hold the sent tensors until then)."""
+    alive = []
+    for work, t in keep:
+        if work.is_completed():
+            work.wait()
+        else:
+            alive.append((work, t))
+    keep[:] = alive
+
+
+def _release(t: torch.Tensor) -> None:
+    """Drop the storage of a graph output that is no longer read (its shape is kept separately)."""
+    t.data = torch.empty(1, dtype=t.dtype, device=t.device)
+
+
+def _backward_released(out: torch.Tensor, grad: torch.Tensor) -> None:
+    """backward(out, grad) for an output whose storage was released: the engine is called directly, because
+    torch.autograd.backward checks that the gradient has the output's (now placeholder) shape."""
+    torch.autograd.Variable._execution_engine.run_backward(
+        (out,), (grad,), False, False, (), True, True)
+
+
 class _RunAhead:
     """Bounds how far the host runs ahead of its GPU: at most ``window`` units (segment x micro-batch) are queued.
     Without the bound the command queue fills up, the host blocks inside a kernel launch, and NCCL's proxy thread,
@@ -126,7 +166,8 @@ class _RunAhead:
 
 
 def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = None, *, micro: int = 4,
-               optimizer=None, backward: bool = True, chunk: int = 1024, run_ahead: int = 3) -> torch.Tensor:
+               optimizer=None, backward: bool = True, chunk: int = 1024, run_ahead: int = 3,
+               extra_loss=None) -> torch.Tensor:
     """Forward (and backward) of a causal LM batch over all processes; returns the mean next-token loss (the same
     value on every process). Every process must call it with the same ``input_ids`` / ``labels``.
 
@@ -134,7 +175,10 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                  updates are deferred to the last micro-batch of each segment. With a non-fused optimizer pass None
                  and call ``optimizer.step()`` afterwards.
     backward  -- False: evaluation only (no graph, no update).
-    run_ahead -- units of work (segment x micro-batch) the host may queue ahead of the GPU."""
+    run_ahead -- units of work (segment x micro-batch) the host may queue ahead of the GPU.
+    extra_loss -- fn(model, hidden, input_ids, labels, next_embeds) -> loss added on the head's process, with
+                 ``hidden`` the last block output (before the final norm) and ``next_embeds`` the input embeddings
+                 of tokens 1.. (detached; sent from the embedding's process), e.g. a multi-token-prediction head."""
     me = dist.get_rank()
     dev = model.bl_local_device
     segs = getattr(model, "_bl_pipeline_plan", None)
@@ -156,22 +200,39 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
     grad = torch.enable_grad() if backward else torch.no_grad()
     ins, outs, losses, keep = {}, {}, {}, []
     ahead = _RunAhead(max(1, run_ahead))
+    head_owner = segs[-1].owner
+    next_emb = {}
+    if extra_loss is not None and embed_here:
+        with torch.no_grad():
+            for m, ids in enumerate(ids_mb):
+                e = emb(ids[:, 1:]).detach()
+                if head_owner == me:
+                    next_emb[m] = e
+                else:
+                    keep.append((dist.isend(e, head_owner, group=_group(me, head_owner, "aux")), None))
     with grad:
         prep = [_block_kwargs(backbone, blocks, ids, embed_here, width, dtype, dev) for ids in ids_mb]
+        # forward: each segment (run of units on this GPU) micro-batch by micro-batch, so its output for micro-batch
+        # m leaves for the next GPU as early as possible. The graph is cut between every two units, also locally,
+        # so that the backward can go unit by unit.
         for s, seg in enumerate(segs):
             if seg.owner != me:
                 continue
+            last = len(seg.items) - 1
             for m in range(M):
                 shape = (*ids_mb[m].shape, width)
                 y = None
-                if seg.prev is not None:
-                    y = torch.empty(shape, dtype=dtype, device=dev)
-                    _log("fwd recv", s, m, "from", seg.prev)
-                    dist.irecv(y, seg.prev, group=_group(seg.prev, me)).wait()
-                    if backward:
-                        y.requires_grad_(True)
-                    ins[(s, m)] = y
-                for item in seg.items:
+                for j, item in enumerate(seg.items):
+                    if j == 0 and seg.prev is not None:
+                        y = torch.empty(shape, dtype=dtype, device=dev)
+                        _log("fwd recv", s, m, "from", seg.prev)
+                        dist.irecv(y, seg.prev, group=_group(seg.prev, me)).wait()
+                    elif j > 0 and y is not None:
+                        y = y.detach()
+                    if y is not None:
+                        if backward:
+                            y.requires_grad_(True)
+                        ins[(s, j, m)] = y
                     if item[0] == "embed":
                         y = prep[m][0]
                     elif item[0] == "block":
@@ -180,40 +241,64 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                     else:
                         from .nn.loss import linear_cross_entropy
                         h = norm(y) if norm is not None else y
-                        losses[m] = linear_cross_entropy(h[:, :-1], head.weight, lab_mb[m][:, 1:],
-                                                         getattr(head, "bias", None), chunk) * (n_tok[m] / sum(n_tok))
+                        loss = linear_cross_entropy(h[:, :-1], head.weight, lab_mb[m][:, 1:],
+                                                    getattr(head, "bias", None), chunk)
+                        if extra_loss is not None:
+                            e = next_emb.get(m)
+                            if e is None:
+                                e = torch.empty(ids_mb[m].shape[0], ids_mb[m].shape[1] - 1, width, dtype=dtype,
+                                                device=dev)
+                                dist.irecv(e, segs[0].owner, group=_group(segs[0].owner, me, "aux")).wait()
+                            loss = loss + extra_loss(model, y, ids_mb[m], lab_mb[m], e)
+                        losses[m] = loss * (n_tok[m] / sum(n_tok))
                         y = None
-                if y is not None:
-                    outs[(s, m)] = y
-                    if seg.next is not None:
-                        send = y.detach()
-                        _log("fwd send", s, m, "to", seg.next)
-                        keep.append((dist.isend(send, seg.next, group=_group(me, seg.next)), send))
+                    if y is not None:
+                        outs[(s, j, m)] = (y, y.shape)
+                        if j == last and seg.next is not None:
+                            _log("fwd send", s, m, "to", seg.next)
+                            keep.append((dist.isend(y.detach(), seg.next, group=_group(me, seg.next)), None))
+                            # the activation now lives on the next process; backward needs only the graph node
+                            _release(y)
                 ahead.tick()
+                _prune(keep)
+        # backward: unit by unit, each over all micro-batches; a unit's gradients are complete after its last
+        # micro-batch and the fused update applies and frees them, so one unit of gradients exists at a time
         if backward:
             for s in reversed(range(len(segs))):
                 seg = segs[s]
                 if seg.owner != me:
                     continue
-                for m in range(M):
-                    defer = optimizer.accumulate() if optimizer is not None and m < M - 1 else contextlib.nullcontext()
-                    with defer:
-                        if m in losses and ("head",) in seg.items:
-                            torch.autograd.backward(losses[m])
-                        else:
-                            g = torch.empty_like(outs[(s, m)])
-                            _log("bwd recv", s, m, "from", seg.next)
-                            dist.irecv(g, seg.next, group=_group(seg.next, me)).wait()
-                            torch.autograd.backward(outs[(s, m)], g)
-                    outs.pop((s, m), None)
-                    if seg.prev is not None:
-                        gi = ins.pop((s, m)).grad
-                        _log("bwd send", s, m, "to", seg.prev)
-                        keep.append((dist.isend(gi, seg.prev, group=_group(me, seg.prev)), gi))
-                    ahead.tick()
+                last = len(seg.items) - 1
+                for j in reversed(range(len(seg.items))):
+                    for m in range(M):
+                        defer = (optimizer.accumulate() if optimizer is not None and m < M - 1
+                                 else contextlib.nullcontext())
+                        with defer:
+                            if seg.items[j][0] == "head":
+                                torch.autograd.backward(losses[m])
+                            else:
+                                y, shape = outs.pop((s, j, m))
+                                if j == last:
+                                    g = torch.empty(shape, dtype=dtype, device=dev)
+                                    _log("bwd recv", s, m, "from", seg.next)
+                                    dist.irecv(g, seg.next, group=_group(seg.next, me)).wait()
+                                else:
+                                    g = ins.pop((s, j + 1, m)).grad
+                                if y.requires_grad and g is not None:
+                                    _backward_released(y, g)
+                        if j == 0 and seg.prev is not None:
+                            gi = ins.pop((s, 0, m)).grad
+                            _log("bwd send", s, m, "to", seg.prev)
+                            keep.append((dist.isend(gi, seg.prev, group=_group(me, seg.prev)), None))
+                        ahead.tick()
+                        _prune(keep)
+                    if _DEBUG:
+                        live = sum(1 for p in model.parameters() if p.grad is not None)
+                        _log("bwd unit", s, j, "done:", f"{torch.cuda.memory_allocated() / 2 ** 30:.2f} GiB,",
+                             live, "params hold a gradient")
     _log("step done, waiting for", len(keep), "sends")
     for work, _ in keep:
-        work.wait()
+        work.wait()                      # orders this process's stream after its sends (the works hold the tensors)
     total = (sum(losses.values()).detach().float() if losses else torch.zeros((), device=dev)).reshape(1)
     dist.all_reduce(total)
     return total[0]

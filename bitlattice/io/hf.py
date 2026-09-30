@@ -444,9 +444,20 @@ def _format_from_spec(d: dict) -> F.Format:
 
 
 def save(model: torch.nn.Module, path: str, max_shard_bytes: int = 4 << 30) -> None:
-    """Save weights (lattice parts included) as safetensors + bitlattice.json + the model config."""
+    """Save weights (lattice parts included) as safetensors + bitlattice.json + the model config.
+
+    In a multi-process run (``torch.distributed`` initialized) every process calls it: each writes the parameters
+    it holds (meta parameters are another process's), and process 0 merges the indexes into one checkpoint that
+    loads like a single-process one."""
+    import torch.distributed as dist
     from safetensors.torch import save_file
-    os.makedirs(path, exist_ok=True)
+    multi = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    rank = dist.get_rank() if multi else 0
+    tag = f"r{rank}-" if multi else ""
+    if rank == 0:
+        os.makedirs(path, exist_ok=True)
+    if multi:
+        dist.barrier()
     meta: dict[str, Any] = {"version": 1, "tensors": {}}
     flat: dict[str, torch.Tensor] = {}
     seen = {}
@@ -455,6 +466,8 @@ def save(model: torch.nn.Module, path: str, max_shard_bytes: int = 4 << 30) -> N
             meta.setdefault("tied", {})[name] = seen[id(p)]
             continue
         seen[id(p)] = name
+        if p.device.type == "meta":
+            continue
         if isinstance(p, LatticeTensor):
             meta["tensors"][name] = {"format": _format_spec(p.fmt), "shape": list(p.shape),
                                      "dtype": str(p.dtype).replace("torch.", "")}
@@ -463,8 +476,10 @@ def save(model: torch.nn.Module, path: str, max_shard_bytes: int = 4 << 30) -> N
                     flat[f"{name}.__{k}"] = v.detach().contiguous().cpu()
         else:
             flat[name] = p.detach().contiguous().cpu()
-    for name, b in model.named_buffers():
-        flat.setdefault(name, b.detach().contiguous().cpu())
+    if rank == 0:
+        for name, b in model.named_buffers():
+            if b.device.type != "meta":
+                flat.setdefault(name, b.detach().contiguous().cpu())
     shards, cur, size = [], {}, 0
     for k, v in flat.items():
         n = v.numel() * v.element_size()
@@ -476,9 +491,28 @@ def save(model: torch.nn.Module, path: str, max_shard_bytes: int = 4 << 30) -> N
     shards.append(cur)
     weight_map = {}
     for i, sh in enumerate(shards):
-        fname = f"model-{i + 1:05d}-of-{len(shards):05d}.safetensors"
+        fname = f"model-{tag}{i + 1:05d}-of-{len(shards):05d}.safetensors"
         save_file(sh, os.path.join(path, fname), metadata={"format": "pt"})
         weight_map.update({k: fname for k in sh})
+    part = (os.path.join(path, f"bitlattice.{tag}json"), os.path.join(path, f"index.{tag}json"))
+    if multi:
+        with open(part[0], "w") as f:
+            json.dump(meta, f)
+        with open(part[1], "w") as f:
+            json.dump(weight_map, f)
+        dist.barrier()
+        if rank != 0:
+            return
+        meta, weight_map = {"version": 1, "tensors": {}}, {}
+        for r in range(dist.get_world_size()):
+            with open(os.path.join(path, f"bitlattice.r{r}-json")) as f:
+                m = json.load(f)
+            meta["tensors"].update(m["tensors"])
+            meta.setdefault("tied", {}).update(m.get("tied", {}))
+            with open(os.path.join(path, f"index.r{r}-json")) as f:
+                weight_map.update(json.load(f))
+            os.remove(os.path.join(path, f"bitlattice.r{r}-json"))
+            os.remove(os.path.join(path, f"index.r{r}-json"))
     with open(os.path.join(path, "model.safetensors.index.json"), "w") as f:
         json.dump({"metadata": {}, "weight_map": weight_map}, f, indent=1)
     with open(os.path.join(path, "bitlattice.json"), "w") as f:

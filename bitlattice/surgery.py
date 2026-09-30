@@ -26,8 +26,8 @@ import torch
 
 from .tensor import LatticeTensor
 
-__all__ = ["values", "assign_", "update_", "resize_", "select_", "set_parameter", "sync_shapes_", "drop_modules",
-           "replace_module", "insert_module", "extend_vocab", "mean_of_pieces"]
+__all__ = ["values", "assign_", "update_", "resize_", "select_", "set_parameter", "train_rows_", "sync_shapes_",
+           "drop_modules", "replace_module", "insert_module", "sparse_embeddings_", "extend_vocab", "mean_of_pieces"]
 
 Init = str | torch.Tensor | Callable[[torch.Tensor, int, int], torch.Tensor]
 
@@ -130,8 +130,31 @@ def select_(model: torch.nn.Module, name: str, index: torch.Tensor, dim: int = 0
     assign_(model, name, v.index_select(dim, torch.as_tensor(index, device=v.device)).contiguous())
 
 
+def train_rows_(model: torch.nn.Module, name: str, rows) -> None:
+    """Train only ``rows`` of parameter ``name`` (None: all rows again). The optimizer updates just those rows, and
+    ``bitlattice.nn.linear_cross_entropy`` computes the output-head gradient for those rows only, so a large
+    vocabulary matrix never gets a dense gradient. The parameter must stay trainable (requires_grad)."""
+    p = model.get_parameter(name)
+    if rows is None:
+        if hasattr(p, "_bl_rows"):
+            del p._bl_rows
+        return
+    p._bl_rows = torch.as_tensor(rows, dtype=torch.long, device=p.device if p.device.type != "meta" else "cpu")
+    p.requires_grad_(True)
+
+
 # --------------------------------------------------------------------------------------------------------------
 # module level
+
+def sparse_embeddings_(model: torch.nn.Module) -> int:
+    """Row-sparse gradients for every nn.Embedding (only the looked-up rows get a gradient); returns the count."""
+    n = 0
+    for m in model.modules():
+        if isinstance(m, torch.nn.Embedding):
+            m.sparse = True
+            n += 1
+    return n
+
 
 def sync_shapes_(module: torch.nn.Module) -> None:
     """Set the size attributes of standard modules from their current weights."""

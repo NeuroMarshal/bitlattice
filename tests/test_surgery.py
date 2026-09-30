@@ -88,3 +88,34 @@ def test_primitives_on_dense_and_lattice():
     assert torch.isfinite(m(x).logits).all()
     bl.surgery.insert_module(m, "model.layers", 1, torch.nn.Identity())
     assert len(m.model.layers) == 3
+
+
+def test_train_rows_limits_updates_and_head_gradient():
+    m = _model(512)
+    head = "lm_head.weight"
+    bl.surgery.sparse_embeddings_(m)
+    rows = torch.arange(500, 512)
+    bl.surgery.train_rows_(m, head, rows)
+    bl.surgery.train_rows_(m, "model.embed_tokens.weight", rows)
+    for n, p in m.named_parameters():
+        if n not in (head, "model.embed_tokens.weight"):
+            p.requires_grad_(False)
+    before_h = m.lm_head.weight.detach().clone()
+    before_e = m.model.embed_tokens.weight.detach().clone()
+    opt = bl.optim.build(m, "muon", lr=1e-2, fused_backward=True)
+    x = torch.randint(490, 512, (2, 16), device=DEV)
+    for _ in range(3):
+        bl.nn.causal_lm_loss(m, x).backward()
+        opt.step()
+    dh = (m.lm_head.weight.detach() - before_h).abs().sum(1)
+    de = (m.model.embed_tokens.weight.detach() - before_e).abs().sum(1)
+    assert dh[:500].sum() == 0 and (dh[500:] > 0).any()
+    assert de[:500].sum() == 0 and (de[500:] > 0).any()
+    # the marked-rows gradient equals the dense one on those rows
+    m2 = _model(512)
+    x = torch.randint(0, 512, (2, 16), device=DEV)
+    dense = torch.autograd.grad(bl.nn.causal_lm_loss(m2, x), m2.lm_head.weight)[0]
+    bl.surgery.train_rows_(m2, head, rows)
+    sparse = torch.autograd.grad(bl.nn.causal_lm_loss(m2, x), m2.lm_head.weight)[0]
+    assert sparse.is_sparse
+    assert torch.allclose(sparse.to_dense()[rows].float(), dense[rows].float(), atol=1e-3, rtol=1e-2)

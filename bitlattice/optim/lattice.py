@@ -50,6 +50,19 @@ def _validate(g: dict) -> None:
         raise ValueError("vector_direction cannot be a matrix direction")
 
 
+def _restrict_rows(G: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+    """Row-sparse gradient holding only ``rows`` (parameters marked with ``bitlattice.surgery.train_rows_``)."""
+    rows = rows.to(G.device)
+    if G.is_sparse:
+        G = G.coalesce()
+        idx, val = G.indices()[0], G.values()
+        keep = torch.isin(idx, rows)
+        idx, val = idx[keep], val[keep]
+    else:
+        idx, val = rows, G[rows]
+    return torch.sparse_coo_tensor(idx.unsqueeze(0), val, G.shape, is_coalesced=True, check_invariants=False)
+
+
 def _ns(g: dict) -> dict:
     return {"ns_coeffs": g["ns_coeffs"], "ns_algo": g["ns_algo"]}
 
@@ -273,6 +286,9 @@ class Lattice(torch.optim.Optimizer):
         pid = self._pid[p]
         seed = (self.seed + 7919 * pid) & 0xFFFFFFFF
         G = p.grad
+        rows = getattr(p, "_bl_rows", None)
+        if rows is not None:
+            G = _restrict_rows(G, rows)
         if G.is_sparse:
             if self._sparse_ok(p, g):
                 self._update_sparse(p, G, st, g, seed)

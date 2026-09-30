@@ -53,6 +53,9 @@ class _LinearCE(torch.autograd.Function):
         n = h.shape[0]
         need_h, need_w = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
         need_b = bias is not None and ctx.needs_input_grad[2]
+        rows = getattr(weight, "_bl_rows", None) if need_w else None
+        if rows is not None:                            # gradient for the marked rows only (row-sparse)
+            need_w = False
         gh = torch.zeros(n, d, dtype=torch.float32, device=h.device) if need_h else None
         gw = torch.empty(V, d, dtype=weight.dtype, device=h.device) if need_w else None
         gb = torch.empty(V, dtype=bias.dtype, device=h.device) if need_b else None
@@ -86,6 +89,20 @@ class _LinearCE(torch.autograd.Function):
                 gw[v0:v1] = gwt.to(gw.dtype)
             if need_b:
                 gb[v0:v1] = gbt.to(gb.dtype)
+        if rows is not None:
+            rows = rows.to(h.device)
+            Wr = W[rows]
+            gwr = torch.zeros(rows.numel(), d, dtype=torch.float32, device=h.device)
+            for s in range(0, n, chunk):
+                hc = h[s:s + chunk].to(dtype)
+                p = (hc @ Wr.t()).float()
+                if bias is not None:
+                    p += bias[rows].float()
+                p = p.sub_(lse[s:s + chunk, None]).exp_()
+                p -= (ysafe[s:s + chunk, None] == rows[None, :]).float()
+                p.mul_(coef[s:s + chunk, None])
+                gwr += p.to(dtype).t() @ hc
+            gw = torch.sparse_coo_tensor(rows.unsqueeze(0), gwr.to(weight.dtype), (V, d), check_invariants=False)
         gh = gh.to(hidden.dtype).reshape(hidden.shape) if need_h else None
         return gh, gw, gb, None, None, None, None
 
