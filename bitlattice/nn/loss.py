@@ -71,9 +71,9 @@ class _LinearCE(torch.autograd.Function):
                     logits += bias[v0:v1].float()
                 p = logits.sub_(lse[s:s + chunk, None]).exp_()                 # softmax restricted to the tile
                 y = ysafe[s:s + chunk]
-                inside = (y >= v0) & (y < v1)
-                rows = torch.nonzero(inside).squeeze(1)
-                p[rows, y[rows] - v0] -= 1.0
+                inside = ((y >= v0) & (y < v1)).to(p.dtype)                    # no host sync (no nonzero)
+                col = (y - v0).clamp_(0, v1 - v0 - 1)
+                p.scatter_add_(1, col[:, None], -inside[:, None])
                 p.mul_(coef[s:s + chunk, None])
                 pd = p.to(dtype)
                 if need_h:

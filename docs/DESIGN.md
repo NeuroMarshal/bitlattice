@@ -42,7 +42,17 @@ rounding uses `frac((bitrev(step mod K) + h_i)/K)`.
   one block per group. Fixed scales use a purely element-wise kernel.
 * `step_native`: bf16/fp16 computed in fp32, fp32 in fp64; neighbours from the ordinal bit pattern.
 * `dequantize`: packed codes → bf16/fp16/fp32.
-* `direction`: ATen implementation (Newton–Schulz batched over blocks, factored, Sinkhorn, …).
+* `factored_direction` / `factored_scales` / `factored_apply`: fused factored direction in three passes (row and
+  column sums of squares into deterministic partial buffers, then the scaled direction); the scales/apply split
+  lets large matrices be updated in row tiles with the same result as the untiled update.
+* `direction`: ATen implementation of the other directions. Newton–Schulz runs batched over blocks with fused
+  `baddbmm` iterations; options: coefficient schedule (`muon` fixed quintic, or `polar_express`: per-iteration
+  minimax schedule of Amsel et al. 2025 with a 1.05 safety factor), block shape (square or `(rows, cols)`), dtype
+  (bf16, fp16, fp32) and algorithm (`standard`, or `gram`: iterate on the Gram matrix `R = XXᵀ` and accumulate the
+  polynomial, restarted after two steps, after Zhang, Amsel, Chen and Dao 2026 — mathematically the same result,
+  fewer FLOPs for wide blocks; `auto` uses it for aspect ≥ 2 outside bf16).
+* `quantize_nvfp4`: activations → E2M1 codes with E4M3 block scales (16 elements) and a per-tensor fp32 global
+  scale; ties go to the lower value, as everywhere in the library.
 * Compiled with `--fmad=false` so that kernels and the reference (`bitlattice/reference.py`) agree bit for bit
   except where a group sum order decides a scale step at a numerical tie.
 
@@ -54,6 +64,34 @@ autograd functions (no dense weight kept between forward and backward; embedding
 rows). All other operators dequantize and run the dense operator; autograd then yields a dense gradient of the
 logical shape, which the optimizer consumes. `__tensor_flatten__`/`__tensor_unflatten__` are defined.
 
+## Compute policies
+
+`exact` dequantizes to the activation dtype and runs a dense GEMM. `fp4` (nvfp4 weights, compute capability ≥ 10)
+quantizes activations to NVFP4 on the fly and runs the forward GEMM on FP4 tensor cores (`torch._scaled_mm` with
+block scales in the 128×4 tiled layout); the backward stays exact. The policy is set globally, per layer
+(`QuantConfig.compute`) or for a region (`bl.compute(...)`, process-wide so that the backward and checkpoint
+recomputation on autograd threads see it).
+
+## Memory
+
+* Optimizer in backward (`fused_backward`): each parameter is updated when its gradient is complete and the gradient
+  is freed; `Lattice.accumulate()` defers updates for gradient accumulation.
+* Storage policies: optimizer state in pinned host memory, brought in on a side stream in the recorded update order
+  (one stream and one order per device); tensors saved for backward in host memory (`save_on_cpu`).
+* Output layer + cross-entropy (`bl.nn.linear_cross_entropy`): token chunks forward, keeping only the log-sum-exp;
+  backward over vocabulary tiles × token chunks, so neither logits nor an fp32 copy of the head gradient exist.
+* Token-chunked position-wise modules (`bl.nn.token_chunked_`): MLPs run on sequence slices, each checkpointed,
+  so the intermediate activations of one slice exist at a time.
+* Row-sparse embedding gradients (only referenced rows are materialized and updated).
+
+## Multiple GPUs
+
+`bl.parallel.infer_device_map` splits the model into contiguous runs of blocks (the largest `ModuleList`) over the
+GPUs, minimizing the largest ratio of assigned bytes to the device budget; tied parameters stay together.
+`bl.dispatch` moves the modules and installs pre-hooks that move inputs to each module's device, so forward,
+autograd, generation and the optimizer work unchanged; updates stay local to each device. `bl.io.load(...,
+device_map="auto")` sizes the split from the checkpoint headers and loads every tensor directly onto its GPU.
+
 ## Loading
 
 `bl.io.load` builds the model with `accelerate.init_empty_weights(include_buffers=False)`, groups checkpoint
@@ -62,8 +100,11 @@ module at a time.
 
 ## Planned
 
-1. Fused factored-direction kernel (row/column statistics and on-the-fly `U` inside the step kernel).
-2. Fused dequantize-GEMM and FP8/FP4 tensor-core paths; selection of the widest exact hardware block per format.
-3. Optimizer state and activation checkpoints in host memory with prefetch (storage policies).
-4. Row-sparse embedding gradients; vocabulary-tiled output head.
-5. Pipeline parallelism with per-layer local updates.
+1. Full FP4 training path: dgrad and wgrad GEMMs on FP4 tensor cores (2-D 16×16 weight blocks so that `W` and `Wᵀ`
+   share codes, random Hadamard transform on the wgrad operands, stochastic rounding of gradients), following the
+   public NVFP4 pre-training recipe.
+2. Fused dequantize-GEMM for formats without a hardware path (level table in shared memory); FP8 path for int4/int5.
+3. Pipeline schedule (micro-batches) over the layer split.
+4. Symmetric GEMM kernels for Newton–Schulz (`XXᵀ`, `R²` at half the FLOPs).
+5. GGUF loading.
+6. Kernels for linear-attention layers of hybrid models.

@@ -21,9 +21,10 @@ Tensor bl_dequantize(Tensor packed, Tensor scales, std::optional<Tensor> global_
 Tensor bl_factored_direction(Tensor G, Tensor r, Tensor c, int64_t k, double beta2, double clip);
 std::tuple<Tensor, Tensor> bl_factored_scales(Tensor G, Tensor r, Tensor c, int64_t k, double beta2, double clip);
 Tensor bl_factored_apply(Tensor G, Tensor a, Tensor b, int64_t row0, int64_t nrows);
-std::tuple<Tensor, Tensor> bl_quantize_nvfp4(Tensor x, Tensor global_scale);
+std::tuple<Tensor, Tensor> bl_quantize_nvfp4(Tensor x, Tensor global_scale, int64_t seed, int64_t step);
 Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::optional<Tensor> c, int64_t k, double beta2,
-                    int64_t block, int64_t ns_steps, int64_t ns_dtype, int64_t sinkhorn_iters, double clip);
+                    int64_t block, int64_t ns_steps, int64_t ns_dtype, int64_t sinkhorn_iters, double clip,
+                    int64_t block_cols, int64_t ns_coeffs, int64_t ns_algo);
 
 TORCH_LIBRARY(bitlattice, m) {
   m.def(
@@ -41,11 +42,11 @@ TORCH_LIBRARY(bitlattice, m) {
       "int scale_dt, int group, int rows, int cols, int out_dtype) -> Tensor");
   m.def(
       "direction(Tensor G, int kind, Tensor(a!)? r, Tensor(b!)? c, int k, float beta2, int block, int ns_steps, "
-      "int ns_dtype, int sinkhorn_iters, float clip) -> Tensor");
+      "int ns_dtype, int sinkhorn_iters, float clip, int block_cols=0, int ns_coeffs=0, int ns_algo=0) -> Tensor");
   m.def("factored_direction(Tensor G, Tensor(a!) r, Tensor(b!) c, int k, float beta2, float clip) -> Tensor");
   m.def("factored_scales(Tensor G, Tensor(a!) r, Tensor(b!) c, int k, float beta2, float clip) -> (Tensor, Tensor)");
   m.def("factored_apply(Tensor G, Tensor a, Tensor b, int row0, int nrows) -> Tensor");
-  m.def("quantize_nvfp4(Tensor x, Tensor global_scale) -> (Tensor, Tensor)");
+  m.def("quantize_nvfp4(Tensor x, Tensor global_scale, int seed=-1, int step=0) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {

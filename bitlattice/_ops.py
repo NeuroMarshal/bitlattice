@@ -94,18 +94,30 @@ def step_native(w, phase, D, *, lr: float, weight_decay: float, phase_bits: int,
                                      int(offset))
 
 
-def direction(G, kind: str, r=None, c=None, k: int = 1, beta2: float = 0.95, block: int = 0, ns_steps: int = 5,
-              ns_dtype: str = "bf16", sinkhorn_iters: int = 2, clip: float = 1.0) -> torch.Tensor:
-    """Update direction as float32 [rows, cols], RMS clipped to ``clip``."""
+_NS_DTYPE = {"fp32": 0, "bf16": 1, "fp16": 2}
+_NS_COEFFS = {"muon": 0, "polar_express": 1}
+_NS_ALGO = {"auto": 0, "standard": 1, "gram": 2}
+
+
+def block_shape(block) -> tuple[int, int]:
+    return (int(block), int(block)) if isinstance(block, int) else (int(block[0]), int(block[1]))
+
+
+def direction(G, kind: str, r=None, c=None, k: int = 1, beta2: float = 0.95, block=0, ns_steps: int = 5,
+              ns_dtype: str = "bf16", sinkhorn_iters: int = 2, clip: float = 1.0, ns_coeffs: str = "muon",
+              ns_algo: str = "auto") -> torch.Tensor:
+    """Update direction as float32 [rows, cols], RMS clipped to ``clip``. ``block``: int (square) or (rows, cols)."""
     if kind == "factored" and HAVE_EXT and G.is_cuda and (G.numel() // max(1, G.shape[0] if G.dim() > 1 else 1)) % 4 == 0:
         return torch.ops.bitlattice.factored_direction(G, r, c, int(k), float(beta2), float(clip))
+    br, bc = block_shape(block) if kind == "muon_block" else (0, 0)
     if HAVE_EXT:
-        return torch.ops.bitlattice.direction(G, _DIRECTION[kind], r, c, int(k), float(beta2),
-                                              int(block if kind == "muon_block" else 0), int(ns_steps),
-                                              1 if ns_dtype == "bf16" else 0, int(sinkhorn_iters), float(clip))
+        return torch.ops.bitlattice.direction(G, _DIRECTION[kind], r, c, int(k), float(beta2), br, int(ns_steps),
+                                              _NS_DTYPE[ns_dtype], int(sinkhorn_iters), float(clip), bc,
+                                              _NS_COEFFS[ns_coeffs], _NS_ALGO[ns_algo])
     if kind in ("muon", "muon_block"):
-        U = R.muon_direction(G, block if kind == "muon_block" else 0, ns_steps,
-                             torch.bfloat16 if ns_dtype == "bf16" else torch.float32)
+        U = R.muon_direction(G, (br, bc), ns_steps,
+                             {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[ns_dtype],
+                             ns_coeffs, ns_algo)
     elif kind == "factored":
         st = {"r": r, "c": c, "k": k - 1}
         U = R.factored_direction(G, st, beta2)

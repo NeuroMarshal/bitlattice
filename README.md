@@ -31,12 +31,11 @@ model = bl.io.load("Qwen/Qwen3-0.6B", bl.quant.presets.default("nvfp4", keep=0.0
 # or quantize an existing model in place
 bl.quantize_(model, format="int4", keep=0.1, method="mse")
 
-opt = bl.optim.build(model, "muon", lr=3e-3)       # presets: muon, muon_precise, light, balanced, precise, stateless
+opt = bl.optim.build(model, "muon", lr=3e-3, fused_backward=True, storage="auto")
 for batch in data:
-    loss = model(**batch).loss
-    loss.backward()
+    loss = bl.nn.causal_lm_loss(model, batch["input_ids"])   # chunked head + cross-entropy, no full logits
+    loss.backward()                                         # parameters are updated during backward
     opt.step()
-    opt.zero_grad()
 
 bl.io.save(model, "out/")                           # native format, reload with bl.io.load("out/")
 ```
@@ -83,9 +82,15 @@ projections; BF16 channel budget). Groups adapt to layer width where the format 
 | `rounding` | `sr`, `strat`, `rtn` |
 | `scale_rule` | `fit` (refit group scales to the updated values), `fit_latent`, `fixed` |
 | `momentum` | `none`, `fp32`, `ternary` |
-| `weight_decay`, `clip`, `beta2`, `ns_steps`, `ns_dtype`, `trust`, `trust_lr`, `strata` | see docstrings |
+| `block` | Newton–Schulz block: int (square) or `(rows, cols)` |
+| `ns_steps`, `ns_dtype` | iterations; `bf16`, `fp16`, `fp32` |
+| `ns_coeffs` | `muon` (fixed quintic), `polar_express` (per-iteration schedule) |
+| `ns_algo` | `auto`, `standard`, `gram` (Gram-matrix iteration, fewer FLOPs for wide blocks) |
+| `weight_decay`, `clip`, `beta2`, `trust`, `trust_lr`, `strata`, `tile_elems` | see docstrings |
 
-`fused_backward=True` applies each parameter update as soon as its gradient is accumulated and frees the gradient.
+`fused_backward=True` applies each parameter update as soon as its gradient is accumulated and frees the gradient;
+`with opt.accumulate(): loss.backward()` sums gradients over micro-batches instead, and the next backward outside
+the context applies the update. Matrices larger than `tile_elems` are updated in row tiles.
 `bl.optim.build(model, preset)` groups parameters automatically (embeddings and output heads use the factored
 direction, vectors are exempt from weight decay).
 
@@ -99,6 +104,33 @@ Presets:
 | `balanced` | factored | 2 bits | |
 | `precise` | factored | 8 bits | hard formats and tasks |
 | `stateless` | Sinkhorn | 0 bits | no optimizer state; formats of ≥ 8 bits |
+
+## Memory
+
+| tool | effect |
+|---|---|
+| `build(..., storage=...)` | `gpu`; `state_in_ram` (optimizer state in pinned host memory, prefetched per layer); `state_and_acts_in_ram` (also run the forward in `bl.storage.activations_in_ram()`); `auto` |
+| `bl.nn.causal_lm_loss`, `bl.nn.linear_cross_entropy` | output layer + cross-entropy in chunks: no logits, no fp32 head gradient |
+| `bl.nn.token_chunked_(model, "*mlp", chunk=2048)` | MLPs run on checkpointed sequence slices (long contexts) |
+| `model.gradient_checkpointing_enable()` | Hugging Face checkpointing, compatible with all of the above |
+| `bl.plan(model, opt)` | weights, optimizer state (GPU / host), gradient peak, weights per device |
+
+## Several GPUs
+
+```python
+model = bl.io.load("Qwen/Qwen3-8B", bl.quant.presets.default("nvfp4"), device_map="auto",
+                   max_memory={0: "13GiB", 1: "11GiB"})       # contiguous layer split, loaded directly per GPU
+# or for a model in memory:  bl.dispatch(model, bl.infer_device_map(model, {0: "12GiB", 1: "12GiB"}))
+```
+
+Each GPU holds a contiguous run of layers; activations cross the split points, and every parameter is updated on
+its own device during backward. Works with generation, checkpointing and all storage policies.
+
+## Compute
+
+`bl.set_compute("fp4")` (or `QuantConfig(compute="fp4")` per layer, or `with bl.compute("fp4"):`) runs the forward
+GEMMs of nvfp4 layers on FP4 tensor cores (compute capability ≥ 10.0; ~3× the BF16 GEMM rate on an RTX 5070 Ti at
+8192²), with activations quantized to NVFP4 on the fly. The default `exact` dequantizes to BF16.
 
 ## Checkpoints
 
@@ -115,15 +147,19 @@ forward, derivative of the expectation), `expect_det`, `ste`, `true`.
 
 ## Status
 
-Version 0.1 (development). Implemented: formats, CUDA step and dequantization kernels, tensor subclass,
-quantization API, optimizer, checkpoint IO. Not yet: fused factored-direction kernel, fused low-bit GEMM paths
-(FP8/FP4 tensor cores), optimizer state offload to host memory, pipeline parallelism. See `docs/DESIGN.md`.
+Version 0.1 (development). Implemented: formats, CUDA step, dequantization and fused factored-direction kernels,
+tensor subclass, quantization API, optimizer (fused backward, row tiles, sparse embeddings, gradient accumulation),
+storage policies, chunked output layer, token-chunked modules, layer split over GPUs, NVFP4 forward on FP4 tensor
+cores, checkpoint IO for dense and pre-quantized layouts. Planned: FP4 backward GEMMs, fused dequantize-GEMM for
+other formats, pipeline schedule, GGUF. See `docs/DESIGN.md`.
 
 ## Tests
 
 ```bash
 pytest            # kernels against the reference implementation, tensor subclass, quantization, optimizer, IO
-python bench/bench_kernels.py
+python bench/bench_kernels.py                      # kernel timings
+python bench/profile_context.py --model <id>       # peak memory and step time versus context length
+python bench/optimizer_ablation.py --variant ...   # optimizer options on a small byte-level LM
 ```
 
 ## License

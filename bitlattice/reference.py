@@ -376,28 +376,65 @@ def lattice_step_native(w: torch.Tensor, phase: torch.Tensor | None, D: torch.Te
 # ---------------------------------------------------------------------------------------------------------------
 # directions
 
-def newton_schulz(g: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
-    a, b, c = 3.4445, -4.7750, 2.0315
-    x = g / (g.norm(dim=(-2, -1), keepdim=True) + eps)
+_PE = ((8.28721201814563, -23.595886519098837, 17.300387312530933),
+       (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+       (3.9486908534822946, -2.908902115962949, 0.5518191394370137),
+       (3.3184196573706015, -2.488488024314874, 0.51004894012372),
+       (2.300652019954817, -1.6689039845747493, 0.4188073119525673))
+
+
+def ns_coefficients(kind: str, i: int) -> tuple[float, float, float]:
+    """(a, b, c) of iteration ``i``: 'muon' (fixed quintic) or 'polar_express' (Amsel et al. 2025, safety 1.05)."""
+    if kind == "muon":
+        return 3.4445, -4.7750, 2.0315
+    a, b, c = _PE[min(i, 4)]
+    return a / 1.05, b / 1.05 ** 3, c / 1.05 ** 5
+
+
+def newton_schulz(g: torch.Tensor, steps: int = 5, eps: float = 1e-7, coeffs: str = "muon",
+                  algo: str = "standard") -> torch.Tensor:
+    """Polar factor approximation. ``algo='gram'`` iterates on the Gram matrix (restart after 2 steps)."""
+    dtype = g.dtype
+    x = (g.float() / (g.float().norm(dim=(-2, -1), keepdim=True) + eps)).to(dtype)
     tr = x.shape[-2] > x.shape[-1]
     if tr:
         x = x.mT
-    for _ in range(steps):
-        s = x @ x.mT
-        x = a * x + (b * s + c * s @ s) @ x
+    gram = algo == "gram" or (algo == "auto" and x.shape[-1] >= 2 * x.shape[-2] and dtype != torch.bfloat16)
+    if not gram:
+        for i in range(steps):
+            a, b, c = ns_coefficients(coeffs, i)
+            s = x @ x.mT
+            x = a * x + (b * s + c * s @ s) @ x
+        return x.mT if tr else x
+    eye = torch.eye(x.shape[-2], device=x.device, dtype=x.dtype)
+    R = x @ x.mT
+    Q = None
+    for i in range(steps):
+        a, b, c = ns_coefficients(coeffs, i)
+        if i == 2:
+            x = Q @ x
+            R = x @ x.mT
+        P = a * eye + b * R + c * R @ R
+        Q = P if i in (0, 2) else Q @ P
+        if i + 1 not in (steps, 2):
+            R = P @ R @ P
+    x = Q @ x
     return x.mT if tr else x
 
 
-def muon_direction(G: torch.Tensor, block: int = 0, steps: int = 5, dtype=torch.float32) -> torch.Tensor:
+def muon_direction(G: torch.Tensor, block=0, steps: int = 5, dtype=torch.float32, coeffs: str = "muon",
+                   algo: str = "standard") -> torch.Tensor:
+    """Block-diagonal orthogonalized direction; ``block`` is an int (square) or (rows, cols)."""
     g = view2d(G).to(dtype)
     m, n = g.shape
-    if block <= 0 or (m <= block and n <= block):
-        return (newton_schulz(g, steps) * math.sqrt(max(m, n))).float()
-    X = torch.nn.functional.pad(g, (0, (-n) % block, 0, (-m) % block))
+    br, bc = (block, block) if isinstance(block, int) else block
+    if br <= 0 or (m <= br and n <= bc):
+        return (newton_schulz(g, steps, coeffs=coeffs, algo=algo) * math.sqrt(max(m, n))).float()
+    X = torch.nn.functional.pad(g, (0, (-n) % bc, 0, (-m) % br))
     M, N = X.shape
-    X = X.view(M // block, block, N // block, block).permute(0, 2, 1, 3).reshape(-1, block, block)
-    Y = newton_schulz(X, steps) * math.sqrt(block)
-    Y = Y.view(M // block, N // block, block, block).permute(0, 2, 1, 3).reshape(M, N)
+    X = X.view(M // br, br, N // bc, bc).permute(0, 2, 1, 3).reshape(-1, br, bc)
+    Y = newton_schulz(X, steps, coeffs=coeffs, algo=algo) * math.sqrt(max(br, bc))
+    Y = Y.view(M // br, N // bc, br, bc).permute(0, 2, 1, 3).reshape(M, N)
     return Y[:m, :n].float()
 
 

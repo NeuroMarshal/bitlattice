@@ -203,23 +203,37 @@ class _LatticeLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w: LatticeTensor, bias):
         from . import backend
-        ctx.save_for_backward(x)
         ctx.w = w
         ctx.has_bias = bias is not None
-        if backend.qualifies_fp4(x, w):
+        ctx.policy = backend.fp4_policy(x, w)
+        if ctx.policy == "fp4_all":
+            y, xt = backend.fp4_forward_saving(x, w, bias)
+            ctx.save_for_backward(*xt)
+            ctx.x_meta = (x.shape, x.dtype)
+            return y
+        ctx.save_for_backward(x)
+        if ctx.policy == "fp4":
             return backend.nvfp4_linear(x, w, bias)
         return torch.nn.functional.linear(x, w.dequantize(x.dtype), bias)
 
     @staticmethod
     def backward(ctx, gy):
-        (x,) = ctx.saved_tensors
         w = ctx.w
+        gb = gy.reshape(-1, gy.shape[-1]).sum(0) if ctx.has_bias and ctx.needs_input_grad[2] else None
+        if ctx.policy == "fp4_all":
+            from . import backend
+            shape, dtype = ctx.x_meta
+            gx, gw = backend.fp4_backward(gy, w, backend.Fp4Operand(*ctx.saved_tensors), ctx.needs_input_grad[0],
+                                          ctx.needs_input_grad[1])
+            gx = gx.to(dtype).reshape(shape) if gx is not None else None
+            gw = gw.to(w.dtype) if gw is not None else None
+            return gx, gw, gb
+        (x,) = ctx.saved_tensors
         W = w.dequantize(gy.dtype)
         gx = gy @ W if ctx.needs_input_grad[0] else None
         gw = None
         if ctx.needs_input_grad[1]:
             gw = (gy.reshape(-1, gy.shape[-1]).t() @ x.reshape(-1, x.shape[-1])).to(w.dtype)
-        gb = gy.reshape(-1, gy.shape[-1]).sum(0) if ctx.has_bias and ctx.needs_input_grad[2] else None
         return gx, gw, gb
 
 

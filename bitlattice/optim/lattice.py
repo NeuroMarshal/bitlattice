@@ -31,7 +31,7 @@ SCALE_RULES = ("fit", "fit_latent", "fixed")
 DEFAULTS: dict[str, Any] = dict(
     lr=3e-3, direction="muon_block", vector_direction="factored", phase_bits=2, rounding="sr", scale_rule="fit",
     momentum="none", beta1=0.9, beta2=0.95, weight_decay=0.0, clip=1.0, block=512, ns_steps=5, ns_dtype="bf16",
-    sinkhorn_iters=2, trust=0.01, trust_lr=1.0, strata=16, tile_elems=1 << 24,
+    ns_coeffs="muon", ns_algo="auto", sinkhorn_iters=2, trust=0.01, trust_lr=1.0, strata=16, tile_elems=1 << 24,
 )
 
 
@@ -40,10 +40,18 @@ def _validate(g: dict) -> None:
                          ("rounding", ROUNDINGS), ("scale_rule", SCALE_RULES)):
         if g[key] not in allowed:
             raise ValueError(f"{key}={g[key]!r}; expected one of {allowed}")
+    for key, allowed in (("ns_dtype", ("bf16", "fp16", "fp32")), ("ns_coeffs", ("muon", "polar_express")),
+                         ("ns_algo", ("auto", "standard", "gram"))):
+        if g[key] not in allowed:
+            raise ValueError(f"{key}={g[key]!r}; expected one of {allowed}")
     if not 0 <= g["phase_bits"] <= 8:
         raise ValueError("phase_bits must be in [0, 8]")
     if g["vector_direction"] in ("muon", "muon_block"):
         raise ValueError("vector_direction cannot be a matrix direction")
+
+
+def _ns(g: dict) -> dict:
+    return {"ns_coeffs": g["ns_coeffs"], "ns_algo": g["ns_algo"]}
 
 
 class Lattice(torch.optim.Optimizer):
@@ -256,7 +264,7 @@ class Lattice(torch.optim.Optimizer):
             st["k"] += 1
             r, c = st["r"], st["c"]
         return _ops.direction(G, kind, r, c, st.get("k", 1), g["beta2"], g["block"], g["ns_steps"], g["ns_dtype"],
-                              g["sinkhorn_iters"], g["clip"])
+                              g["sinkhorn_iters"], g["clip"], **_ns(g))
 
     def _update(self, p: torch.Tensor, g: dict) -> None:
         st = self.state[p]
@@ -306,7 +314,8 @@ class Lattice(torch.optim.Optimizer):
         kind = g["direction"]
         step_rows = max(1, g["tile_elems"] // cols)
         if kind == "muon_block":
-            step_rows = max(g["block"], step_rows - step_rows % g["block"])
+            br = _ops.block_shape(g["block"])[0]
+            step_rows = max(br, step_rows - step_rows % br)
         if kind == "factored":
             if "r" not in st:
                 st["r"] = torch.zeros(rows, device=G.device)
@@ -329,7 +338,7 @@ class Lattice(torch.optim.Optimizer):
                 D = torch.ops.bitlattice.factored_apply(G2, a, b, r0, n)
             else:
                 D = _ops.direction(G2[r0:r0 + n], kind, block=g["block"], ns_steps=g["ns_steps"],
-                                   ns_dtype=g["ns_dtype"], clip=g["clip"])
+                                   ns_dtype=g["ns_dtype"], clip=g["clip"], **_ns(g))
             if quant:
                 zeros = p.zeros[r0:r0 + n] if p.zeros is not None else None
                 sc = _ops.step_quantized(p.packed[r0:r0 + n], st["phase"][r0:r0 + n] if bits else None,
@@ -372,7 +381,7 @@ class Lattice(torch.optim.Optimizer):
             D = _ops.direction(vals, "factored", r_sub, st["c"], st["k"], g["beta2"], clip=g["clip"])
             st["r"][rows] = r_sub
         else:
-            D = _ops.direction(vals, kind, block=g["block"], ns_steps=g["ns_steps"], ns_dtype=g["ns_dtype"],
+            D = _ops.direction(vals, kind, block=g["block"], ns_steps=g["ns_steps"], ns_dtype=g["ns_dtype"], **_ns(g),
                                sinkhorn_iters=g["sinkhorn_iters"], clip=g["clip"])
         bits = g["phase_bits"]
         cb = _ops.phase_container(bits)

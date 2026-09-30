@@ -157,7 +157,10 @@ def infer_device_map(model: torch.nn.Module, max_memory: Mapping | None = None, 
 
 def _move(obj, device: torch.device):
     if torch.is_tensor(obj):
-        return obj.to(device, non_blocking=True) if obj.device != device else obj
+        if obj.device == device:
+            return obj
+        # asynchronous only towards a GPU: a non-blocking device-to-host copy is not complete on return
+        return obj.to(device, non_blocking=device.type == "cuda")
     if isinstance(obj, tuple):
         return tuple(_move(o, device) for o in obj)
     if isinstance(obj, list):
@@ -203,9 +206,24 @@ def dispatch(model: torch.nn.Module, device_map: Mapping[str, torch.device | str
     _place(model, device_map)
     for h in getattr(model, "_bl_dispatch_hooks", []):
         h.remove()
+    # hook the outermost callable modules whose state lives on a single device: their inputs are moved there, and
+    # everything inside runs on that device
+    devs: dict[str, set] = {}
+    for name, mod in model.named_modules():
+        devs[name] = {t.device for t in list(mod.parameters()) + list(mod.buffers())}
+    targets = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, (torch.nn.ModuleList, torch.nn.ModuleDict)) or len(devs[name]) != 1:
+            continue
+        parent = name.rpartition(".")[0] if name else None
+        while parent is not None and isinstance(model.get_submodule(parent), (torch.nn.ModuleList,
+                                                                              torch.nn.ModuleDict)):
+            parent = parent.rpartition(".")[0] if parent else None
+        if name and parent is not None and len(devs[parent]) == 1:
+            continue                                                     # covered by an enclosing module
+        targets[name] = (mod, next(iter(devs[name])))
     hooks = []
-    for name, dev in device_map.items():
-        mod = model.get_submodule(name) if name else model
+    for name, (mod, dev) in targets.items():
 
         def pre(module, args, kwargs, _dev=dev):
             return _move(args, _dev), _move(kwargs, _dev)

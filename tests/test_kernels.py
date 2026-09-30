@@ -1,4 +1,6 @@
 """CUDA kernels against the reference implementation."""
+import math
+
 import pytest
 import torch
 
@@ -175,3 +177,38 @@ def test_fused_factored_matches_reference(shape, dtype):
         U = R.clip_rms(R.factored_direction(G, st, 0.95), 1.0)
         assert torch.allclose(r1, st["r"], rtol=1e-5) and torch.allclose(c1, st["c"], rtol=1e-5)
         assert torch.allclose(D, U, rtol=1e-4, atol=1e-6)
+
+
+@pytest.mark.parametrize("coeffs", ["muon", "polar_express"])
+@pytest.mark.parametrize("algo", ["standard", "gram"])
+@pytest.mark.parametrize("block", [0, 32, (16, 64)])
+def test_newton_schulz_variants_match_reference(coeffs, algo, block):
+    torch.manual_seed(0)
+    G = torch.randn(96, 200, device=DEV)
+    kind = "muon_block" if block else "muon"
+    D = _ops.direction(G, kind, block=block, ns_dtype="fp32", ns_coeffs=coeffs, ns_algo=algo)
+    U = R.clip_rms(R.muon_direction(G, block, 5, torch.float32, coeffs, algo), 1.0)
+    assert ((D - U).norm() / U.norm()).item() < 1e-4
+
+
+@pytest.mark.parametrize("coeffs", ["muon", "polar_express"])
+def test_gram_newton_schulz_equals_standard(coeffs):
+    torch.manual_seed(0)
+    G = torch.randn(128, 1024, device=DEV)
+    a = R.newton_schulz(G.double(), 5, coeffs=coeffs, algo="standard")
+    for dtype, tol in ((torch.float32, 1e-4), (torch.float16, 3e-2)):
+        b = torch.ops.bitlattice.direction(G.to(dtype), 5, None, None, 1, 0.95, 0, 5,
+                                           0 if dtype == torch.float32 else 2, 2, 1e9, 0, 1 if coeffs != "muon" else 0, 2)
+        ref = (a * math.sqrt(1024)).float()
+        assert ((b - ref).norm() / ref.norm()).item() < tol, dtype
+
+
+def test_polar_express_is_closer_to_orthogonal():
+    torch.manual_seed(0)
+    G = torch.randn(256, 256, device=DEV) @ torch.diag(torch.logspace(-3, 0, 256, device=DEV))
+    errs = {}
+    for coeffs in ("muon", "polar_express"):
+        X = R.newton_schulz(G, 5, coeffs=coeffs)
+        sv = torch.linalg.svdvals(X)
+        errs[coeffs] = (sv - 1).abs().mean().item()
+    assert errs["polar_express"] < errs["muon"]
