@@ -1,5 +1,5 @@
 """Bitlattice: training and fine-tuning of PyTorch models directly in low-bit and arbitrary number formats."""
-from . import backend, formats, io, nn, optim, parallel, quant, storage
+from . import backend, formats, io, nn, optim, parallel, pipeline, quant, storage
 from .backend import compute, set_compute
 from ._ops import HAVE_EXT
 from .formats import Format, NativeFormat, TableFormat, UniformFormat

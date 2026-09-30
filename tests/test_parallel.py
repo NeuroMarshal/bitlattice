@@ -193,3 +193,72 @@ def test_auto_storage_policy(monkeypatch):
     opt = bl.optim.build(m, "muon", storage="auto")
     assert opt.storage == "state_in_ram" and opt.state_device == "cpu"
     assert len(bl.plan(m, opt).weights_by_device) == 1
+
+
+def test_interleaved_map_alternates_and_balances():
+    m = transformers.Qwen2ForCausalLM(_config(layers=8)).to(torch.bfloat16)
+    dm = bl.parallel.interleaved_device_map(m, ["cuda:0", "cuda:1"])
+    devs = [d.index for d in _unit_devices(dm, 8)]
+    assert devs[:4] == [0, 1, 0, 1]
+    assert dm["lm_head"].index == 1 and dm["model.embed_tokens"].index == 0
+    assert devs.count(0) >= devs.count(1)                   # the head device gets fewer blocks
+    dm2 = bl.parallel.interleaved_device_map(m, ["cuda:0", "cuda:1"], chunk=2)
+    assert [d.index for d in _unit_devices(dm2, 8)][:4] == [0, 0, 1, 1]
+
+
+@pytest.mark.parametrize("micro", [1, 2, 3])
+def test_pipelined_loss_matches_plain_loss(dense_dir, micro):
+    m = bl.io.load(dense_dir, bl.quant.presets.default("int8"), device=DEV, dtype=torch.float32)
+    ids = _ids(b=6, t=12)
+    ref = bl.nn.causal_lm_loss(m, ids)
+    got = bl.parallel.pipelined_causal_lm_loss(m, ids, micro=micro)
+    assert torch.allclose(got, ref, rtol=1e-5, atol=1e-6)
+    g_ref = torch.autograd.grad(bl.nn.causal_lm_loss(m, ids), m.model.layers[1].mlp.up_proj.weight)[0]
+    g_got = torch.autograd.grad(bl.parallel.pipelined_causal_lm_loss(m, ids, micro=micro),
+                                m.model.layers[1].mlp.up_proj.weight)[0]
+    assert torch.allclose(g_got, g_ref, rtol=1e-4, atol=1e-6)
+
+
+def test_pipelined_training_with_checkpointing_and_host_split(dense_dir):
+    dm = bl.parallel.interleaved_device_map(
+        transformers.Qwen2ForCausalLM(_config()).to(torch.bfloat16), ["cuda:0", "cpu"])
+    m = bl.io.load(dense_dir, bl.quant.presets.default("int8"), device_map=dm, dtype=torch.float32)
+    assert {p.device.type for p in m.model.layers[0].parameters()} != {p.device.type for p in
+                                                                         m.model.layers[1].parameters()}
+    m.gradient_checkpointing_enable()
+    m.config.use_cache = False
+    m.train()
+    opt = bl.optim.build(m, "muon", lr=3e-3, fused_backward=True)
+    ids = _ids(b=4)
+    losses = []
+    for _ in range(12):
+        loss = bl.parallel.pipelined_causal_lm_loss(m, ids, micro=2)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    assert losses[-1] < losses[0]
+    assert all(p.grad is None for p in m.parameters())
+
+
+@two_gpus
+def test_two_gpu_pipelined_equals_single_device(dense_dir):
+    def run(model, pipelined):
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
+        model.train()
+        opt = bl.optim.build(model, "muon", lr=3e-3, fused_backward=True)
+        ids = _ids(b=4)
+        out = []
+        for _ in range(8):
+            loss = (bl.parallel.pipelined_causal_lm_loss(model, ids, micro=4) if pipelined
+                    else bl.nn.causal_lm_loss(model, ids))
+            loss.backward()
+            opt.step()
+            out.append(loss.item())
+        return out
+
+    a = run(bl.io.load(dense_dir, bl.quant.presets.default("nvfp4"), device=DEV), False)
+    b = run(bl.io.load(dense_dir, bl.quant.presets.default("nvfp4"), device_map="interleaved"), True)
+    # identical first step; later steps differ by the bf16 accumulation order of the micro-batch gradients
+    assert abs(a[0] - b[0]) <= 1e-3 * a[0] and b[-1] < 0.8 * b[0]
+    assert all(abs(x - y) <= 0.05 * abs(x) for x, y in zip(a, b)), (a, b)

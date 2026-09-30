@@ -206,9 +206,13 @@ def _device_plan(path, model, layout, quant, device, device_map, max_memory):
         dev = torch.device(device)
         return (lambda name: dev), None
     from .. import parallel
+    if isinstance(device_map, str) and device_map.startswith("interleaved"):
+        chunk = int(device_map.partition(":")[2] or 1)
+        devs = list(max_memory) if max_memory else None
+        device_map = parallel.interleaved_device_map(model, devs, chunk)
     if isinstance(device_map, str):
         if device_map not in ("auto", "balanced"):
-            raise ValueError("device_map must be 'auto', 'balanced' or a dict")
+            raise ValueError("device_map must be 'auto', 'balanced', 'interleaved[:chunk]' or a dict")
         sizes = _estimate_sizes(path, model, layout, quant)
         device_map = parallel.infer_device_map(
             model, max_memory, param_bytes=lambda n, p: sizes.get(n, p.numel() * p.element_size()))
@@ -227,7 +231,8 @@ def load(path_or_id: str, quant: QuantConfig | None = None, *, device: str | tor
     quant       -- QuantConfig for dense weights (None: keep dense in ``dtype``). Pre-quantized checkpoints keep
                    their stored format unless ``requantize`` (dequantize then apply ``quant``).
     device_map  -- None (everything on ``device``), 'auto' / 'balanced' (contiguous split over the GPUs, sized from
-                   the checkpoint headers and ``max_memory``) or {module name: device}; see ``bitlattice.parallel``
+                   the checkpoint headers and ``max_memory``), 'interleaved[:chunk]' (blocks round-robin over the GPUs
+                   for ``bitlattice.parallel.pipelined_causal_lm_loss``) or {module name: device}
     model_cls   -- transformers class to instantiate (default: from config.architectures).
     """
     from safetensors import safe_open
@@ -243,6 +248,8 @@ def load(path_or_id: str, quant: QuantConfig | None = None, *, device: str | tor
     buffers = dict(model.named_buffers())
     modules = dict(model.named_modules())
     device, dmap = _device_plan(path, model, layout, quant, device, device_map, max_memory)
+    local = _local_device(dmap)
+    mine = (lambda name: True) if local is None else (lambda name: device(name) == local)
 
     for shard in _shards(path):
         with safe_open(shard, framework="pt", device="cpu") as f:
@@ -252,7 +259,7 @@ def load(path_or_id: str, quant: QuantConfig | None = None, *, device: str | tor
                 by_prefix[prefix][suffix] = k
             for prefix, sfx in by_prefix.items():
                 packed = _packed_parts(f, sfx, layout["kind"]) if prefix in modules else None
-                if packed:
+                if packed and mine(f"{prefix}.weight"):
                     _load_packed(model, f, prefix, {s: sfx[s] for s in packed}, layout, quant, requantize, device,
                                  dtype)
                 rest = {s: k for s, k in sfx.items() if not packed or s not in packed}
@@ -260,26 +267,42 @@ def load(path_or_id: str, quant: QuantConfig | None = None, *, device: str | tor
                     if suffix in _PART_SUFFIXES and prefix in modules and packed:
                         continue
                     target = f"{prefix}.{suffix}" if prefix else suffix
+                    if target in params and not mine(target):
+                        continue
                     _load_dense(model, f, target, k, params, buffers, modules, quant, layout, device, dtype)
-    missing = [n for n, p in model.named_parameters() if p.device.type == "meta"]
+    missing = [n for n, p in model.named_parameters() if p.device.type == "meta" and mine(n)]
     if missing and getattr(config, "tie_word_embeddings", False):
         model.tie_weights()
-        missing = [n for n, p in model.named_parameters() if p.device.type == "meta"]
+        missing = [n for n, p in model.named_parameters() if p.device.type == "meta" and mine(n)]
     if missing:
         raise RuntimeError(f"weights missing from the checkpoint: {missing[:8]}{'...' if len(missing) > 8 else ''}")
-    _finish(model, device, dmap)
+    _finish(model, device, dmap, local)
     return model
 
 
-def _finish(model, device, dmap):
+def _local_device(dmap):
+    """In a multi-process run (torch.distributed initialized) with a device map, each process loads only the
+    parameters placed on its own GPU; the rest stay on the meta device."""
+    import torch.distributed as dist
+    if dmap is None or not (dist.is_available() and dist.is_initialized()):
+        return None
+    return torch.device("cuda", torch.cuda.current_device())
+
+
+def _finish(model, device, dmap, local=None):
     for name, b in list(model.named_buffers()):
-        if b.device != device(name):
+        target = local if local is not None else device(name)            # small buffers live on every process
+        if b.device != target:
             mod_name, _, attr = name.rpartition(".")
             mod = model.get_submodule(mod_name) if mod_name else model
-            mod._buffers[attr] = b.to(device(name))
+            mod._buffers[attr] = b.to(target)
     if dmap is not None:
         from .. import parallel
-        parallel.dispatch(model, dmap)
+        if local is None:
+            parallel.dispatch(model, dmap)
+        else:
+            model.bl_device_map = dict(dmap)
+            model.bl_local_device = local
     model.eval()
 
 
@@ -455,6 +478,8 @@ def _load_bitlattice(path, config, model_cls, dtype, device, trust_remote_code, 
         meta = json.load(f)
     model = _skeleton(config, model_cls, dtype, trust_remote_code)
     device, dmap = _device_plan(path, model, {"kind": "bitlattice"}, None, device, device_map, max_memory)
+    local = _local_device(dmap)
+    mine = (lambda name: True) if local is None else (lambda name: device(name) == local)
     parts: dict[str, dict[str, torch.Tensor]] = defaultdict(dict)
     buffers = dict(model.named_buffers())
     for shard in _shards(path):
@@ -462,21 +487,26 @@ def _load_bitlattice(path, config, model_cls, dtype, device, trust_remote_code, 
             for k in f.keys():
                 if ".__" in k:
                     name, part = k.split(".__", 1)
-                    parts[name][part] = f.get_tensor(k).to(device(name))
+                    if mine(name):
+                        parts[name][part] = f.get_tensor(k).to(device(name))
                 elif k in buffers:
-                    _set(model, k, f.get_tensor(k).to(device(k)), False)
-                else:
+                    _set(model, k, f.get_tensor(k).to(local or device(k)), False)
+                elif mine(k):
                     _set(model, k, f.get_tensor(k).to(device(k)), True)
     for name, info in meta["tensors"].items():
+        if not mine(name):
+            continue
         p = parts[name]
         lt = LatticeTensor(p["packed"], p["scales"], p.get("global_scale"), p.get("zeros"),
                            _format_from_spec(info["format"]), info["shape"], getattr(torch, info["dtype"]),
                            p.get("hi_idx"), p.get("hi_val"))
         _set(model, name, lt, True)
     for name, src in meta.get("tied", {}).items():
+        if not mine(src):
+            continue
         mod_name, _, attr = name.rpartition(".")
         setattr(model.get_submodule(mod_name) if mod_name else model, attr, model.get_parameter(src))
-    _finish(model, device, dmap)
+    _finish(model, device, dmap, local)
     return model
 
 

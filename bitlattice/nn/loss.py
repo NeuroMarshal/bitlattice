@@ -95,11 +95,8 @@ def linear_cross_entropy(hidden: torch.Tensor, weight: torch.Tensor, labels: tor
                          dtype: torch.dtype | None = None) -> torch.Tensor:
     """Mean cross-entropy of ``hidden @ weight.T (+ bias)`` against ``labels`` without full logits. Inputs on
     another device than ``weight`` are moved to it (layer-split models)."""
-    dev = weight.device
-    if hidden.device != dev:
-        hidden = hidden.to(dev)
-    if labels.device != dev:
-        labels = labels.to(dev)
+    from ..parallel import to_device
+    hidden, labels = to_device(hidden, weight.device), to_device(labels, weight.device)
     dtype = dtype or (hidden.dtype if hidden.dtype in (torch.bfloat16, torch.float16) else torch.float32)
     return _LinearCE.apply(hidden, weight, bias, labels, chunk, ignore_index, dtype)
 

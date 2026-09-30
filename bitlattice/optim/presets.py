@@ -37,7 +37,7 @@ def param_groups(model: torch.nn.Module, head_direction: str = "factored", head_
     emb = {id(m.weight) for m in model.modules() if isinstance(m, torch.nn.Embedding)}
     heads, matrices, vectors, seen = [], [], [], set()
     for name, p in model.named_parameters():
-        if not p.requires_grad or id(p) in seen:
+        if not p.requires_grad or id(p) in seen or p.device.type == "meta":      # meta: owned by another process
             continue
         seen.add(id(p))
         module = name.rsplit(".", 1)[0] if "." in name else ""
