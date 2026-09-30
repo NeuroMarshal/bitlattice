@@ -16,8 +16,8 @@ PRESETS: dict[str, dict[str, Any]] = {
     "muon_precise": dict(direction="muon_block", phase_bits=8),
     # factored (Adafactor-like, no momentum) direction with a 1 / 2 / 8-bit phase
     "light": dict(direction="factored", phase_bits=1),
-    "balanced": dict(direction="factored", phase_bits=2, head_momentum="ternary"),
-    "precise": dict(direction="factored", phase_bits=8, head_momentum="ternary"),
+    "balanced": dict(direction="factored", phase_bits=2),
+    "precise": dict(direction="factored", phase_bits=8),
     # no optimizer state at all: memory equals inference; for formats of 8 bits and more
     "stateless": dict(direction="sinkhorn", vector_direction="sinkhorn", phase_bits=0, rounding="sr"),
 }
