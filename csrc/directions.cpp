@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 #include <optional>
+#include <tuple>
+#include <utility>
 
 using at::Tensor;
 
@@ -73,10 +75,11 @@ Tensor ns_gram(Tensor x, int64_t steps, int64_t ck, int64_t restart) {
   return at::bmm(Q, x);
 }
 
-Tensor newton_schulz(Tensor x, int64_t steps, int64_t ck = kMuonCoeffs, int64_t algo = kNsStandard) {
-  const auto dtype = x.scalar_type();
-  x = x.to(at::kFloat);
-  x = (x / (at::linalg_vector_norm(x, 2, {-2, -1}, /*keepdim=*/true) + 1e-7)).to(dtype);
+// Polar factor approximation of x [.., n, m] (any float dtype), computed in ``dtype``. The Frobenius norm is taken
+// in fp32 and applied in the source dtype before the cast, so tiny gradients do not underflow in fp16.
+Tensor newton_schulz(Tensor x, int64_t steps, at::ScalarType dtype, int64_t ck, int64_t algo) {
+  Tensor nrm = at::linalg_vector_norm(x, 2, at::IntArrayRef{-2, -1}, /*keepdim=*/true, at::kFloat).add_(1e-7);
+  x = at::div(x, nrm.to(x.scalar_type())).to(dtype);
   const bool tr = x.size(-2) > x.size(-1);
   if (tr) x = x.transpose(-2, -1);
   const bool batched = x.dim() == 3;
@@ -89,20 +92,26 @@ Tensor newton_schulz(Tensor x, int64_t steps, int64_t ck = kMuonCoeffs, int64_t 
   return tr ? x.transpose(-2, -1) : x;
 }
 
-// Block-diagonal orthogonalization with [br, bc] blocks (bc == 0: square br x br); each block is scaled by
-// sqrt(max(br, bc)), the full matrix by sqrt(max(m, n)).
-Tensor muon(const Tensor& G, int64_t br, int64_t bc, int64_t steps, at::ScalarType dtype, int64_t ck, int64_t algo) {
-  Tensor g = view2d(G).to(dtype);
+// Block-diagonal orthogonalization with [br, bc] blocks (bc == 0: square br x br; bc < 0: bands of br rows over the
+// full width). Returns the unscaled result in ``dtype`` (possibly a strided view) and its scale: sqrt(max(br, bc))
+// per block, sqrt(max(m, n)) for the full matrix.
+std::pair<Tensor, double> muon(const Tensor& G, int64_t br, int64_t bc, int64_t steps, at::ScalarType dtype,
+                               int64_t ck, int64_t algo) {
+  Tensor g = view2d(G);
   const int64_t m = g.size(0), n = g.size(1);
-  if (bc <= 0) bc = br;
+  if (bc == 0) bc = br;
+  if (bc < 0) bc = n;
   if (br <= 0 || (m <= br && n <= bc))
-    return (newton_schulz(g, steps, ck, algo) * std::sqrt(static_cast<double>(std::max(m, n)))).to(at::kFloat);
-  Tensor X = at::constant_pad_nd(g, {0, (bc - n % bc) % bc, 0, (br - m % br) % br});
+    return {newton_schulz(g, steps, dtype, ck, algo), std::sqrt(static_cast<double>(std::max(m, n)))};
+  const int64_t pr = (br - m % br) % br, pc = (bc - n % bc) % bc;
+  Tensor X = pr || pc ? at::constant_pad_nd(g, {0, pc, 0, pr}) : g;
   const int64_t M = X.size(0), N = X.size(1);
-  X = X.view({M / br, br, N / bc, bc}).permute({0, 2, 1, 3}).reshape({-1, br, bc});
-  Tensor Y = newton_schulz(X, steps, ck, algo) * std::sqrt(static_cast<double>(std::max(br, bc)));
-  Y = Y.view({M / br, N / bc, br, bc}).permute({0, 2, 1, 3}).reshape({M, N});
-  return Y.slice(0, 0, m).slice(1, 0, n).to(at::kFloat);
+  const bool bands = N == bc;                              // row bands: blocks are contiguous row ranges
+  X = bands ? X.reshape({M / br, br, N}) : X.view({M / br, br, N / bc, bc}).permute({0, 2, 1, 3}).reshape({-1, br, bc});
+  Tensor Y = newton_schulz(X, steps, dtype, ck, algo);
+  Y = bands ? Y.reshape({M, N}) : Y.view({M / br, N / bc, br, bc}).permute({0, 2, 1, 3}).reshape({M, N});
+  if (pr || pc) Y = Y.slice(0, 0, m).slice(1, 0, n);
+  return {Y, std::sqrt(static_cast<double>(std::max(br, bc)))};
 }
 
 Tensor factored(const Tensor& G, Tensor r, Tensor c, int64_t k, double beta2, double eps) {
@@ -134,6 +143,7 @@ Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::option
                     int64_t block, int64_t ns_steps, int64_t ns_dtype, int64_t sinkhorn_iters, double clip,
                     int64_t block_cols, int64_t ns_coeffs, int64_t ns_algo) {
   Tensor U;
+  double scale = 1.0;
   switch (kind) {
     case kRaw: U = view2d(G).to(at::kFloat); break;
     case kSign: U = view2d(G).to(at::kFloat).sign(); break;
@@ -148,11 +158,16 @@ Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::option
       U = factored(G, *r, *c, k, beta2, 1e-12);
       break;
     case kMuon:
-      U = muon(G, block, block_cols, ns_steps, ns_dtype == 1 ? at::kBFloat16 : ns_dtype == 2 ? at::kHalf : at::kFloat,
-               ns_coeffs, ns_algo);
+      std::tie(U, scale) = muon(G, block, block_cols, ns_steps,
+                                ns_dtype == 1 ? at::kBFloat16 : ns_dtype == 2 ? at::kHalf : at::kFloat, ns_coeffs,
+                                ns_algo);
       break;
     default: TORCH_CHECK(false, "unknown direction ", kind);
   }
-  Tensor rho = U.square().mean().sqrt();
-  return (U / at::clamp_min(rho / clip, 1.0)).contiguous();
+  // D = scale * U / max(1, RMS(scale * U) / clip): one fp32 reduction and one pass into a fresh fp32 tensor
+  Tensor rho = at::linalg_vector_norm(U, 2, std::nullopt, false, at::kFloat)
+                   .mul_(scale / std::sqrt(static_cast<double>(std::max<int64_t>(U.numel(), 1))));
+  Tensor f = at::clamp_min(rho / clip, 1.0).reciprocal_().mul_(scale);
+  Tensor out = at::empty(U.sizes(), U.options().dtype(at::kFloat));
+  return at::mul_out(out, U, f);
 }

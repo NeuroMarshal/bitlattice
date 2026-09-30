@@ -100,7 +100,10 @@ _NS_ALGO = {"auto": 0, "standard": 1, "gram": 2}
 
 
 def block_shape(block) -> tuple[int, int]:
-    return (int(block), int(block)) if isinstance(block, int) else (int(block[0]), int(block[1]))
+    """(rows, cols) of a Newton-Schulz block; cols = -1 means the full width (row bands)."""
+    if isinstance(block, int):
+        return int(block), int(block)
+    return int(block[0]), -1 if block[1] is None else int(block[1])
 
 
 def direction(G, kind: str, r=None, c=None, k: int = 1, beta2: float = 0.95, block=0, ns_steps: int = 5,

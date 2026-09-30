@@ -424,10 +424,12 @@ def newton_schulz(g: torch.Tensor, steps: int = 5, eps: float = 1e-7, coeffs: st
 
 def muon_direction(G: torch.Tensor, block=0, steps: int = 5, dtype=torch.float32, coeffs: str = "muon",
                    algo: str = "standard") -> torch.Tensor:
-    """Block-diagonal orthogonalized direction; ``block`` is an int (square) or (rows, cols)."""
+    """Block-diagonal orthogonalized direction; ``block`` is an int (square) or (rows, cols); cols = -1: bands of
+    ``rows`` rows over the full width."""
     g = view2d(G).to(dtype)
     m, n = g.shape
     br, bc = (block, block) if isinstance(block, int) else block
+    bc = n if bc is None or bc < 0 else br if bc == 0 else bc
     if br <= 0 or (m <= br and n <= bc):
         return (newton_schulz(g, steps, coeffs=coeffs, algo=algo) * math.sqrt(max(m, n))).float()
     X = torch.nn.functional.pad(g, (0, (-n) % bc, 0, (-m) % br))

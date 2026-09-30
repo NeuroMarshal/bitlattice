@@ -181,7 +181,7 @@ def test_fused_factored_matches_reference(shape, dtype):
 
 @pytest.mark.parametrize("coeffs", ["muon", "polar_express"])
 @pytest.mark.parametrize("algo", ["standard", "gram"])
-@pytest.mark.parametrize("block", [0, 32, (16, 64)])
+@pytest.mark.parametrize("block", [0, 32, (16, 64), (16, None)])
 def test_newton_schulz_variants_match_reference(coeffs, algo, block):
     torch.manual_seed(0)
     G = torch.randn(96, 200, device=DEV)

@@ -82,7 +82,7 @@ projections; BF16 channel budget). Groups adapt to layer width where the format 
 | `rounding` | `sr`, `strat`, `rtn` |
 | `scale_rule` | `fit` (refit group scales to the updated values), `fit_latent`, `fixed` |
 | `momentum` | `none`, `fp32`, `ternary` |
-| `block` | Newton–Schulz block: int (square) or `(rows, cols)` |
+| `block` | Newton–Schulz block: int (square), `(rows, cols)`, or `(rows, None)` for row bands over the full width |
 | `ns_steps`, `ns_dtype` | iterations; `bf16`, `fp16`, `fp32` |
 | `ns_coeffs` | `muon` (fixed quintic), `polar_express` (per-iteration schedule) |
 | `ns_algo` | `auto`, `standard`, `gram` (Gram-matrix iteration, fewer FLOPs for wide blocks) |
@@ -99,7 +99,7 @@ Presets:
 | preset | direction | phase | use |
 |---|---|---|---|
 | `muon` | block Newton–Schulz | 2 bits | default; 4–16-bit formats |
-| `muon_fast` | Newton–Schulz on 256×1024 blocks | 2 bits | large models: ~2× cheaper orthogonalization |
+| `muon_fast` | Gram Newton–Schulz on 256-row bands (fp16, Polar Express) | 2 bits | large models: ~7× cheaper orthogonalization |
 | `muon_precise` | block Newton–Schulz | 8 bits | ternary, binary, 2-bit formats |
 | `light` | factored | 1 bit | minimal state |
 | `balanced` | factored | 2 bits | |
