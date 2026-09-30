@@ -40,6 +40,7 @@ class QuantConfig:
     group, scale -- override the scale group size / scale dtype of the format
     targets      -- module types that are quantized
     min_features -- layers with fewer input features stay dense
+    compute      -- per-layer compute policy ('exact', 'fp4'); None follows bitlattice.set_compute
     rules        -- ordered list of Rule; the first match decides
     """
 
@@ -52,6 +53,7 @@ class QuantConfig:
     scale: str | None = None
     targets: tuple[type, ...] = (torch.nn.Linear,)
     min_features: int = 32
+    compute: str | None = None
     rules: tuple[Rule, ...] = ()
 
     def __post_init__(self):

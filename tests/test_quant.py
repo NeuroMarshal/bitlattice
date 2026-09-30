@@ -92,3 +92,15 @@ def test_quantized_model_output_close():
     bl.quantize_(m, presets.default("int8"))
     out = m(idx)
     assert ((out - ref).norm() / ref.norm()).item() < 0.02
+
+
+def test_per_layer_compute_policy():
+    m = Tiny().to(DEV)
+    cfg = QuantConfig(format="nvfp4", compute="fp4", rules=(Rule("*lm_head"), Rule("*o_proj", {"compute": "exact"})))
+    bl.quantize_(m, cfg)
+    assert m.layers[1].up.weight.compute == "fp4" and m.layers[1].o_proj.weight.compute == "exact"
+    assert bl.backend.get_compute(m.layers[1].up.weight) == "fp4"
+    with bl.compute("exact"):
+        assert bl.backend.get_compute(m.layers[1].up.weight) == "exact"
+    moved = m.layers[1].up.weight.to("cpu")
+    assert moved.compute == "fp4"

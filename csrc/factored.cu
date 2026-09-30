@@ -33,20 +33,26 @@ __device__ __forceinline__ void atomic_max_pos(float* addr, float v) {
   atomicMax(reinterpret_cast<int*>(addr), __float_as_int(v));  // valid for non-negative floats
 }
 
-// pass 1: row sums, column sums of G^2, max |G|
+// Deterministic reductions: every block writes its partial sums to a buffer (no floating-point atomics);
+// partials are summed in a fixed order afterwards. Block (x, y) covers columns [x*1024, x*1024+1024) and rows
+// [y*32, y*32+32).
+__device__ __forceinline__ void block_rows(float part, float (*warp_rows)[kTileRows], int i) {
+  for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off);
+  if ((threadIdx.x & 31) == 0) warp_rows[threadIdx.x >> 5][i] = part;
+}
+
+// pass 1: row partials [col_blocks, rows], column partials [row_tiles, cols], max |G|
 template <typename T>
-__global__ void sq_sums(const T* G, int64_t rows, int64_t cols, float* row_sq, float* col_sq, float* amax) {
-  __shared__ float srow[kTileRows];
+__global__ void sq_sums(const T* G, int64_t rows, int64_t cols, float* row_part, float* col_part, float* amax) {
+  __shared__ float warp_rows[kThreads / 32][kTileRows];
   const int64_t c0 = (static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x) * kColsPerThread;
   const int64_t r0 = static_cast<int64_t>(blockIdx.y) * kTileRows;
-  if (threadIdx.x < kTileRows) srow[threadIdx.x] = 0.0f;
-  __syncthreads();
   float cacc[4] = {0.f, 0.f, 0.f, 0.f};
   float m = 0.0f;
   const bool active = c0 < cols;
-  for (int i = 0; i < kTileRows && r0 + i < rows; ++i) {
+  for (int i = 0; i < kTileRows; ++i) {
     float part = 0.0f;
-    if (active) {
+    if (active && r0 + i < rows) {
       float v[4];
       load4<T>(G + (r0 + i) * cols + c0, v);
 #pragma unroll
@@ -57,46 +63,50 @@ __global__ void sq_sums(const T* G, int64_t rows, int64_t cols, float* row_sq, f
         m = fmaxf(m, fabsf(v[j]));
       }
     }
-    for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off);
-    if ((threadIdx.x & 31) == 0 && part != 0.0f) atomicAdd(&srow[i], part);
+    block_rows(part, warp_rows, i);
   }
   if (active) {
-#pragma unroll
-    for (int j = 0; j < 4; ++j) atomicAdd(&col_sq[c0 + j], cacc[j]);
+    float4* cp = reinterpret_cast<float4*>(col_part + static_cast<int64_t>(blockIdx.y) * cols + c0);
+    *cp = make_float4(cacc[0], cacc[1], cacc[2], cacc[3]);
   }
   for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
-  if ((threadIdx.x & 31) == 0) atomic_max_pos(amax, m);
+  if ((threadIdx.x & 31) == 0) atomic_max_pos(amax, m);          // max is order independent
   __syncthreads();
-  if (threadIdx.x < kTileRows && r0 + threadIdx.x < rows) atomicAdd(&row_sq[r0 + threadIdx.x], srow[threadIdx.x]);
+  if (threadIdx.x < kTileRows && r0 + threadIdx.x < rows) {
+    float s = 0.0f;
+    for (int w = 0; w < kThreads / 32; ++w) s += warp_rows[w][threadIdx.x];
+    row_part[static_cast<int64_t>(blockIdx.x) * rows + r0 + threadIdx.x] = s;
+  }
 }
 
-// pass 2: per-row sums of G^2 * b_j^2
+// pass 2: row partials [col_blocks, rows] of G^2 * b_j^2
 template <typename T>
-__global__ void weighted_sums(const T* G, int64_t rows, int64_t cols, const float* b, float* row_w) {
-  __shared__ float srow[kTileRows];
+__global__ void weighted_sums(const T* G, int64_t rows, int64_t cols, const float* b, float* row_part) {
+  __shared__ float warp_rows[kThreads / 32][kTileRows];
   const int64_t c0 = (static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x) * kColsPerThread;
   const int64_t r0 = static_cast<int64_t>(blockIdx.y) * kTileRows;
-  if (threadIdx.x < kTileRows) srow[threadIdx.x] = 0.0f;
-  __syncthreads();
   const bool active = c0 < cols;
   float bb[4] = {0.f, 0.f, 0.f, 0.f};
   if (active) {
 #pragma unroll
     for (int j = 0; j < 4; ++j) bb[j] = b[c0 + j] * b[c0 + j];
   }
-  for (int i = 0; i < kTileRows && r0 + i < rows; ++i) {
+  for (int i = 0; i < kTileRows; ++i) {
     float part = 0.0f;
-    if (active) {
+    if (active && r0 + i < rows) {
       float v[4];
       load4<T>(G + (r0 + i) * cols + c0, v);
 #pragma unroll
       for (int j = 0; j < 4; ++j) part += v[j] * v[j] * bb[j];
     }
-    for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off);
-    if ((threadIdx.x & 31) == 0 && part != 0.0f) atomicAdd(&srow[i], part);
+    block_rows(part, warp_rows, i);
   }
   __syncthreads();
-  if (threadIdx.x < kTileRows && r0 + threadIdx.x < rows) atomicAdd(&row_w[r0 + threadIdx.x], srow[threadIdx.x]);
+  if (threadIdx.x < kTileRows && r0 + threadIdx.x < rows) {
+    float s = 0.0f;
+    for (int w = 0; w < kThreads / 32; ++w) s += warp_rows[w][threadIdx.x];
+    row_part[static_cast<int64_t>(blockIdx.x) * rows + r0 + threadIdx.x] = s;
+  }
 }
 
 // pass 3: D = G * a_i * b_j
@@ -134,20 +144,23 @@ std::tuple<at::Tensor, at::Tensor> bl_factored_scales(at::Tensor G, at::Tensor r
   const int64_t rows = g2.size(0), cols = g2.size(1);
   TORCH_CHECK(cols % kColsPerThread == 0, "factored kernel needs cols % 4 == 0");
   auto f32 = g2.options().dtype(at::kFloat);
-  at::Tensor row_sq = at::zeros({rows}, f32), col_sq = at::zeros({cols}, f32), amax = at::zeros({1}, f32);
   const dim3 grid(static_cast<unsigned>((cols / kColsPerThread + kThreads - 1) / kThreads),
                   static_cast<unsigned>((rows + kTileRows - 1) / kTileRows));
+  at::Tensor row_part = at::empty({static_cast<int64_t>(grid.x), rows}, f32);
+  at::Tensor col_part = at::empty({static_cast<int64_t>(grid.y), cols}, f32);
+  at::Tensor amax = at::zeros({1}, f32);
   auto stream = at::cuda::getCurrentCUDAStream();
   const bool bf = g2.scalar_type() == at::kBFloat16;
   if (bf) {
     sq_sums<__nv_bfloat16><<<grid, kThreads, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(g2.data_ptr<at::BFloat16>()), rows, cols, row_sq.data_ptr<float>(),
-        col_sq.data_ptr<float>(), amax.data_ptr<float>());
+        reinterpret_cast<const __nv_bfloat16*>(g2.data_ptr<at::BFloat16>()), rows, cols, row_part.data_ptr<float>(),
+        col_part.data_ptr<float>(), amax.data_ptr<float>());
   } else {
-    sq_sums<float><<<grid, kThreads, 0, stream>>>(g2.data_ptr<float>(), rows, cols, row_sq.data_ptr<float>(),
-                                                  col_sq.data_ptr<float>(), amax.data_ptr<float>());
+    sq_sums<float><<<grid, kThreads, 0, stream>>>(g2.data_ptr<float>(), rows, cols, row_part.data_ptr<float>(),
+                                                  col_part.data_ptr<float>(), amax.data_ptr<float>());
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  at::Tensor row_sq = row_part.sum(0), col_sq = col_part.sum(0);
   // statistics on O(rows + cols) vectors
   at::Tensor pk = amax.clamp_min(1e-30);
   at::Tensor inv2 = 1.0 / (pk * pk);
@@ -158,7 +171,7 @@ std::tuple<at::Tensor, at::Tensor> bl_factored_scales(at::Tensor G, at::Tensor r
   at::Tensor rbar = rr.mean().clamp_min(1e-12);
   at::Tensor a = at::where(rr > 0, at::rsqrt(rr / rbar), at::zeros_like(rr)) / pk;  // row factor incl. 1/max|G|
   at::Tensor b = at::where(cc > 0, at::rsqrt(cc), at::zeros_like(cc));
-  at::Tensor row_w = at::zeros({rows}, f32);
+  at::Tensor row_w = at::empty({static_cast<int64_t>(grid.x), rows}, f32);
   if (bf) {
     weighted_sums<__nv_bfloat16><<<grid, kThreads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(g2.data_ptr<at::BFloat16>()), rows, cols, b.data_ptr<float>(),
@@ -168,6 +181,7 @@ std::tuple<at::Tensor, at::Tensor> bl_factored_scales(at::Tensor G, at::Tensor r
                                                         row_w.data_ptr<float>());
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  row_w = row_w.sum(0);
   at::Tensor rms = ((a * a * row_w).sum() / static_cast<double>(rows * cols)).sqrt();
   a = a / at::clamp_min(rms / clip, 1.0);
   return {a, b};

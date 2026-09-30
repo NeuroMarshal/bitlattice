@@ -42,6 +42,7 @@ class LatticeTensor(torch.Tensor):
         t.packed, t.scales, t.global_scale, t.zeros = packed, scales, global_scale, zeros
         t.hi_idx, t.hi_val = hi_idx, hi_val
         t.fmt = F.get(fmt)
+        t.compute = None          # per-tensor compute policy ('exact', 'fp4'); None follows bitlattice.backend
         return t
 
     def __init__(self, *args, **kwargs):  # state is set in __new__
@@ -131,8 +132,10 @@ class LatticeTensor(torch.Tensor):
 
     def _map(self, fn, **kw) -> "LatticeTensor":
         p = {k: (fn(v) if v is not None else None) for k, v in self.parts().items()}
-        return LatticeTensor(p["packed"], p["scales"], p["global_scale"], p["zeros"], self.fmt, kw.get("shape", self.shape),
-                             kw.get("dtype", self.dtype), p["hi_idx"], p["hi_val"])
+        t = LatticeTensor(p["packed"], p["scales"], p["global_scale"], p["zeros"], self.fmt, kw.get("shape", self.shape),
+                          kw.get("dtype", self.dtype), p["hi_idx"], p["hi_val"])
+        t.compute = self.compute
+        return t
 
     # ------------------------------------------------------------------------------------------------------------
     # operator interception
@@ -199,11 +202,13 @@ class _LatticeLinear(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, w: LatticeTensor, bias):
-        W = w.dequantize(x.dtype)
+        from . import backend
         ctx.save_for_backward(x)
         ctx.w = w
         ctx.has_bias = bias is not None
-        return torch.nn.functional.linear(x, W, bias)
+        if backend.qualifies_fp4(x, w):
+            return backend.nvfp4_linear(x, w, bias)
+        return torch.nn.functional.linear(x, w.dequantize(x.dtype), bias)
 
     @staticmethod
     def backward(ctx, gy):

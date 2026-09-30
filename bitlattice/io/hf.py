@@ -218,7 +218,9 @@ def _quantize_dense(name: str, w: torch.Tensor, module, quant: QuantConfig | Non
     fmt = F.fit_group(fmt, cols)
     if fmt is None:
         return None
-    return LatticeTensor.from_float(w, fmt, method=cfg.method, keep=cfg.keep, keep_dtype=cfg.keep_dtype, dtype=dtype)
+    lt = LatticeTensor.from_float(w, fmt, method=cfg.method, keep=cfg.keep, keep_dtype=cfg.keep_dtype, dtype=dtype)
+    lt.compute = cfg.compute
+    return lt
 
 
 _QUANT_DTYPES = ("U8", "I8", "I32", "F8_E4M3", "F8_E5M2")

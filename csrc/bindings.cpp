@@ -21,6 +21,7 @@ Tensor bl_dequantize(Tensor packed, Tensor scales, std::optional<Tensor> global_
 Tensor bl_factored_direction(Tensor G, Tensor r, Tensor c, int64_t k, double beta2, double clip);
 std::tuple<Tensor, Tensor> bl_factored_scales(Tensor G, Tensor r, Tensor c, int64_t k, double beta2, double clip);
 Tensor bl_factored_apply(Tensor G, Tensor a, Tensor b, int64_t row0, int64_t nrows);
+std::tuple<Tensor, Tensor> bl_quantize_nvfp4(Tensor x, Tensor global_scale);
 Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::optional<Tensor> c, int64_t k, double beta2,
                     int64_t block, int64_t ns_steps, int64_t ns_dtype, int64_t sinkhorn_iters, double clip);
 
@@ -44,6 +45,7 @@ TORCH_LIBRARY(bitlattice, m) {
   m.def("factored_direction(Tensor G, Tensor(a!) r, Tensor(b!) c, int k, float beta2, float clip) -> Tensor");
   m.def("factored_scales(Tensor G, Tensor(a!) r, Tensor(b!) c, int k, float beta2, float clip) -> (Tensor, Tensor)");
   m.def("factored_apply(Tensor G, Tensor a, Tensor b, int row0, int nrows) -> Tensor");
+  m.def("quantize_nvfp4(Tensor x, Tensor global_scale) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
@@ -53,6 +55,7 @@ TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
   m.impl("factored_direction", &bl_factored_direction);
   m.impl("factored_scales", &bl_factored_scales);
   m.impl("factored_apply", &bl_factored_apply);
+  m.impl("quantize_nvfp4", &bl_quantize_nvfp4);
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CompositeExplicitAutograd, m) { m.impl("direction", &bl_direction); }

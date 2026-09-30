@@ -124,6 +124,7 @@ def quantize_(model: torch.nn.Module, config: QuantConfig | None = None, *, cali
             k = 0 if lt.hi_idx is None else lt.hi_idx.numel()
             bits = 8.0 * lt.storage_bytes() / w.numel()
             rep.layers.append(LayerReport(name, fmt.name, tuple(w.shape), k, err, bits))
+        lt.compute = cfg.compute
         mod.weight = torch.nn.Parameter(lt, requires_grad=w.requires_grad)
     return rep if report else model
 
