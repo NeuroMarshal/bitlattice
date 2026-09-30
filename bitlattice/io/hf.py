@@ -149,14 +149,85 @@ def _ignored(name: str, patterns) -> bool:
 # --------------------------------------------------------------------------------------------------------------
 # loading
 
+_DT_BYTES = {"F64": 8, "I64": 8, "U64": 8, "F32": 4, "I32": 4, "U32": 4, "F16": 2, "BF16": 2, "I16": 2, "U16": 2,
+             "F8_E4M3": 1, "F8_E5M2": 1, "F8_E8M0": 1, "I8": 1, "U8": 1, "BOOL": 1, "F4": 0.5}
+
+
+def _estimate_sizes(path: str, model, layout: dict, quant: QuantConfig | None) -> dict[str, int]:
+    """Bytes of every parameter after loading, from the safetensors headers (no tensor data is read)."""
+    from safetensors import safe_open
+    modules = dict(model.named_modules())
+    params = dict(model.named_parameters(remove_duplicate=False))
+    sizes: dict[str, int] = defaultdict(int)
+    for shard in _shards(path):
+        with safe_open(shard, framework="pt", device="cpu") as f:
+            for k in f.keys():
+                sl = f.get_slice(k)
+                shape, dt = sl.get_shape(), sl.get_dtype()
+                n = 1
+                for d in shape:
+                    n *= d
+                if ".__" in k:                                     # bitlattice checkpoint part
+                    sizes[k.split(".__", 1)[0]] += n * _DT_BYTES.get(dt, 2)
+                    continue
+                prefix, _, suffix = _rename(model, k).rpartition(".")
+                name = f"{prefix}.weight" if suffix in _PART_SUFFIXES and prefix in modules else \
+                    (f"{prefix}.{suffix}" if prefix else suffix)
+                b = n * _DT_BYTES.get(dt, 2)
+                p = params.get(name)
+                if suffix == "weight" and p is not None and quant is not None and dt in ("F32", "F16", "BF16"):
+                    b = _quantized_bytes(name, p, modules.get(prefix), quant, b)
+                elif dt == "F32" and p is not None and p.dtype != torch.float32 and p.is_floating_point():
+                    b = n * p.element_size()
+                sizes[name] += int(b)
+    return dict(sizes)
+
+
+def _quantized_bytes(name: str, p, module, quant: QuantConfig, dense_bytes: int) -> int:
+    if not isinstance(module, quant.targets) or p.dim() < 2:
+        return dense_bytes
+    cfg = quant.for_module(name.rpartition(".")[0])
+    rows, cols = p.shape[0], p.numel() // p.shape[0]
+    if cfg is None or cols < cfg.min_features:
+        return dense_bytes
+    fmt = cfg.resolved_format()
+    if fmt.kind == "native":
+        return p.numel() * fmt.dtype.itemsize
+    fmt = F.fit_group(fmt, cols)
+    if fmt is None:
+        return dense_bytes
+    keep = int(round(cfg.keep * cols))
+    return fmt.storage_bits(rows, cols - keep) // 8 + keep * rows * cfg.keep_dtype.itemsize
+
+
+def _device_plan(path, model, layout, quant, device, device_map, max_memory):
+    """(tensor name -> device, device map or None) for the weights being loaded."""
+    if device_map is None:
+        dev = torch.device(device)
+        return (lambda name: dev), None
+    from .. import parallel
+    if isinstance(device_map, str):
+        if device_map not in ("auto", "balanced"):
+            raise ValueError("device_map must be 'auto', 'balanced' or a dict")
+        sizes = _estimate_sizes(path, model, layout, quant)
+        device_map = parallel.infer_device_map(
+            model, max_memory, param_bytes=lambda n, p: sizes.get(n, p.numel() * p.element_size()))
+    device_map = {k: torch.device(f"cuda:{v}" if isinstance(v, int) else v) for k, v in device_map.items()}
+    first = next(iter(device_map.values()))
+    return (lambda name: parallel.device_of(name, device_map, first)), device_map
+
+
 @torch.no_grad()
 def load(path_or_id: str, quant: QuantConfig | None = None, *, device: str | torch.device = "cuda",
-         dtype: torch.dtype = torch.bfloat16, model_cls=None, trust_remote_code: bool = False,
-         revision: str | None = None, requantize: bool = False) -> torch.nn.Module:
+         device_map: str | dict | None = None, max_memory: dict | None = None, dtype: torch.dtype = torch.bfloat16,
+         model_cls=None, trust_remote_code: bool = False, revision: str | None = None,
+         requantize: bool = False) -> torch.nn.Module:
     """Load a model (local directory or hub id) directly into lattice formats.
 
     quant       -- QuantConfig for dense weights (None: keep dense in ``dtype``). Pre-quantized checkpoints keep
                    their stored format unless ``requantize`` (dequantize then apply ``quant``).
+    device_map  -- None (everything on ``device``), 'auto' / 'balanced' (contiguous split over the GPUs, sized from
+                   the checkpoint headers and ``max_memory``) or {module name: device}; see ``bitlattice.parallel``
     model_cls   -- transformers class to instantiate (default: from config.architectures).
     """
     from safetensors import safe_open
@@ -166,12 +237,12 @@ def load(path_or_id: str, quant: QuantConfig | None = None, *, device: str | tor
     config = AutoConfig.from_pretrained(path, trust_remote_code=trust_remote_code)
     layout = detect_layout(path, config)
     if layout["kind"] == "bitlattice":
-        return _load_bitlattice(path, config, model_cls, dtype, device, trust_remote_code)
+        return _load_bitlattice(path, config, model_cls, dtype, device, trust_remote_code, device_map, max_memory)
     model = _skeleton(config, model_cls, dtype, trust_remote_code)
     params = dict(model.named_parameters(remove_duplicate=False))
     buffers = dict(model.named_buffers())
     modules = dict(model.named_modules())
-    device = torch.device(device)
+    device, dmap = _device_plan(path, model, layout, quant, device, device_map, max_memory)
 
     for shard in _shards(path):
         with safe_open(shard, framework="pt", device="cpu") as f:
@@ -196,13 +267,20 @@ def load(path_or_id: str, quant: QuantConfig | None = None, *, device: str | tor
         missing = [n for n, p in model.named_parameters() if p.device.type == "meta"]
     if missing:
         raise RuntimeError(f"weights missing from the checkpoint: {missing[:8]}{'...' if len(missing) > 8 else ''}")
+    _finish(model, device, dmap)
+    return model
+
+
+def _finish(model, device, dmap):
     for name, b in list(model.named_buffers()):
-        if b.device != device:
+        if b.device != device(name):
             mod_name, _, attr = name.rpartition(".")
             mod = model.get_submodule(mod_name) if mod_name else model
-            mod._buffers[attr] = b.to(device)
+            mod._buffers[attr] = b.to(device(name))
+    if dmap is not None:
+        from .. import parallel
+        parallel.dispatch(model, dmap)
     model.eval()
-    return model
 
 
 def _quantize_dense(name: str, w: torch.Tensor, module, quant: QuantConfig | None, dtype):
@@ -250,16 +328,17 @@ def _load_dense(model, f, target, key, params, buffers, modules, quant, layout, 
         mod = modules.get(target.rpartition(".")[0])
         if target.endswith(".weight") and t.dtype in (torch.uint8, torch.int32, torch.float8_e4m3fn):
             raise RuntimeError(f"packed tensor {key} without the scales of layout {layout['kind']!r}")
-        w = t.to(device=device, dtype=dtype if t.is_floating_point() else t.dtype)
+        w = t.to(device=device(target), dtype=dtype if t.is_floating_point() else t.dtype)
         q = _quantize_dense(target, w, mod, quant, dtype) if target.endswith(".weight") else None
         _set(model, target, q if q is not None else w, True)
     elif target in buffers:
-        _set(model, target, t.to(device), False)
+        _set(model, target, t.to(device(target)), False)
 
 
 def _load_packed(model, f, prefix, parts, layout, quant, requantize, device, dtype):
     tensors = {suffix: f.get_tensor(k) for suffix, k in parts.items()}
     kind = layout["kind"]
+    device = device(f"{prefix}.weight")
     if kind == "ct_nvfp4":
         lt = C.from_ct_nvfp4(tensors, dtype, device)
     elif kind == "mo_nvfp4":
@@ -370,24 +449,24 @@ def save(model: torch.nn.Module, path: str, max_shard_bytes: int = 4 << 30) -> N
 
 
 @torch.no_grad()
-def _load_bitlattice(path, config, model_cls, dtype, device, trust_remote_code):
+def _load_bitlattice(path, config, model_cls, dtype, device, trust_remote_code, device_map=None, max_memory=None):
     from safetensors import safe_open
     with open(os.path.join(path, "bitlattice.json")) as f:
         meta = json.load(f)
     model = _skeleton(config, model_cls, dtype, trust_remote_code)
-    device = torch.device(device)
+    device, dmap = _device_plan(path, model, {"kind": "bitlattice"}, None, device, device_map, max_memory)
     parts: dict[str, dict[str, torch.Tensor]] = defaultdict(dict)
     buffers = dict(model.named_buffers())
     for shard in _shards(path):
-        with safe_open(shard, framework="pt", device=str(device)) as f:
+        with safe_open(shard, framework="pt", device="cpu") as f:
             for k in f.keys():
                 if ".__" in k:
                     name, part = k.split(".__", 1)
-                    parts[name][part] = f.get_tensor(k)
+                    parts[name][part] = f.get_tensor(k).to(device(name))
                 elif k in buffers:
-                    _set(model, k, f.get_tensor(k), False)
+                    _set(model, k, f.get_tensor(k).to(device(k)), False)
                 else:
-                    _set(model, k, f.get_tensor(k), True)
+                    _set(model, k, f.get_tensor(k).to(device(k)), True)
     for name, info in meta["tensors"].items():
         p = parts[name]
         lt = LatticeTensor(p["packed"], p["scales"], p.get("global_scale"), p.get("zeros"),
@@ -397,11 +476,7 @@ def _load_bitlattice(path, config, model_cls, dtype, device, trust_remote_code):
     for name, src in meta.get("tied", {}).items():
         mod_name, _, attr = name.rpartition(".")
         setattr(model.get_submodule(mod_name) if mod_name else model, attr, model.get_parameter(src))
-    for name, b in list(model.named_buffers()):
-        if b.device != device:
-            mod_name, _, attr = name.rpartition(".")
-            (model.get_submodule(mod_name) if mod_name else model)._buffers[attr] = b.to(device)
-    model.eval()
+    _finish(model, device, dmap)
     return model
 
 

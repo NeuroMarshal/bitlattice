@@ -9,6 +9,7 @@ Every option can be overridden per parameter group.
 """
 from __future__ import annotations
 
+import contextlib
 import math
 from typing import Any, Iterable
 
@@ -70,9 +71,9 @@ class Lattice(torch.optim.Optimizer):
         if state_device not in ("cuda", "cpu"):
             raise ValueError("state_device must be 'cuda' or 'cpu'")
         self.state_device = state_device
-        self._copy_stream = torch.cuda.Stream() if state_device == "cpu" and torch.cuda.is_available() else None
-        self._last_copy = None
-        self._order: list = []
+        self._copy_streams: dict = {}     # device -> side stream for host-memory state transfers
+        self._last_copy: dict = {}        # device -> event of the last write-back
+        self._order: dict = {}            # device -> parameters in update order (recorded on the first step)
         self._next: dict = {}
         self._recording = True
         self._prefetched: dict = {}
@@ -82,6 +83,7 @@ class Lattice(torch.optim.Optimizer):
                 self._pid[p] = len(self._pid)
         self._group_of = {p: g for g in self.param_groups for p in g["params"]}
         self._done: set = set()
+        self._defer = 0
         self._hooks = []
         if fused_backward:
             for p in self._pid:
@@ -90,7 +92,7 @@ class Lattice(torch.optim.Optimizer):
 
     # ------------------------------------------------------------------------------------------------------------
     def _on_grad(self, p: torch.Tensor) -> None:
-        if p.grad is None:
+        if p.grad is None or self._defer:
             return
         with torch.no_grad():
             self._update(p, self._group_of[p])
@@ -107,20 +109,41 @@ class Lattice(torch.optim.Optimizer):
             for p in g["params"]:
                 if p in self._done or p.grad is None:
                     continue
-                self._update(p, g)
+                with torch.cuda.device(p.device) if p.is_cuda else contextlib.nullcontext():
+                    self._update(p, g)
                 if self.fused_backward:
                     p.grad = None
         self._done.clear()
         if self._recording and self._order:
             self._recording = False
-            self._next = {a: b for a, b in zip(self._order, self._order[1:])}
-            self._next[self._order[-1]] = self._order[0]
+            for order in self._order.values():
+                self._next.update(zip(order, order[1:]))
+                self._next[order[-1]] = order[0]
         return loss
+
+    @contextlib.contextmanager
+    def accumulate(self):
+        """Gradient accumulation with ``fused_backward``: inside the context gradients are summed in ``.grad`` and
+        no update is applied; the next backward pass outside the context applies the update with the total."""
+        self._defer += 1
+        try:
+            yield
+        finally:
+            self._defer -= 1
 
     # ------------------------------------------------------------------------------------------------------------
     # host-memory state
 
     _OFFLOAD = ("phase", "hi_phase", "m", "mq")
+
+    def _offloading(self, p: torch.Tensor) -> bool:
+        return self.state_device == "cpu" and p.is_cuda
+
+    def _stream(self, device: torch.device) -> torch.cuda.Stream:
+        s = self._copy_streams.get(device)
+        if s is None:
+            s = self._copy_streams[device] = torch.cuda.Stream(device=device)
+        return s
 
     def _prefetch(self, q: torch.Tensor) -> None:
         st = self.state.get(q)
@@ -129,27 +152,30 @@ class Lattice(torch.optim.Optimizer):
         host = {k: st[k] for k in self._OFFLOAD if k in st and not st[k].is_cuda}
         if not host:
             return
-        with torch.cuda.stream(self._copy_stream):
+        stream = self._stream(q.device)
+        with torch.cuda.stream(stream):
             gpu = {k: v.to(q.device, non_blocking=True) for k, v in host.items()}
             ev = torch.cuda.Event()
-            ev.record(self._copy_stream)
+            ev.record(stream)
         self._prefetched[q] = (gpu, ev)
 
     def _bring(self, p: torch.Tensor, st: dict) -> None:
-        if self._copy_stream is None:
+        if not self._offloading(p):
             return
         if self._recording:
-            self._order.append(p)
+            self._order.setdefault(p.device, []).append(p)
+        cur = torch.cuda.current_stream(p.device)
         pre = self._prefetched.pop(p, None)
         if pre is not None:
             gpu, ev = pre
-            torch.cuda.current_stream().wait_event(ev)
+            cur.wait_event(ev)
             for k, t in gpu.items():
-                t.record_stream(torch.cuda.current_stream())
+                t.record_stream(cur)
                 st[k] = t
         else:
-            if self._last_copy is not None:
-                torch.cuda.current_stream().wait_event(self._last_copy)
+            last = self._last_copy.get(p.device)
+            if last is not None:
+                cur.wait_event(last)
             for k in self._OFFLOAD:
                 if k in st and not st[k].is_cuda:
                     st[k] = st[k].to(p.device, non_blocking=True)
@@ -158,26 +184,28 @@ class Lattice(torch.optim.Optimizer):
             self._prefetch(nxt)
 
     def _send_back(self, p: torch.Tensor, st: dict) -> None:
-        if self._copy_stream is None:
+        if not self._offloading(p):
             return
+        stream = self._stream(p.device)
         done = torch.cuda.Event()
-        done.record(torch.cuda.current_stream())
-        with torch.cuda.stream(self._copy_stream):
-            self._copy_stream.wait_event(done)
+        done.record(torch.cuda.current_stream(p.device))
+        with torch.cuda.stream(stream):
+            stream.wait_event(done)
             for k in self._OFFLOAD:
                 if k in st and st[k].is_cuda:
                     gpu = st[k]
                     host = torch.empty(gpu.shape, dtype=gpu.dtype, device="cpu", pin_memory=True)
                     host.copy_(gpu, non_blocking=True)
-                    gpu.record_stream(self._copy_stream)
+                    gpu.record_stream(stream)
                     st[k] = host
-            self._last_copy = torch.cuda.Event()
-            self._last_copy.record(self._copy_stream)
+            ev = torch.cuda.Event()
+            ev.record(stream)
+            self._last_copy[p.device] = ev
 
     def synchronize(self) -> None:
         """Wait for pending host-memory state transfers."""
-        if self._copy_stream is not None:
-            self._copy_stream.synchronize()
+        for s in self._copy_streams.values():
+            s.synchronize()
 
     def state_dict(self):
         self.synchronize()

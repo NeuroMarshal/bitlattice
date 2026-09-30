@@ -16,9 +16,10 @@ import torch
 
 from .tensor import LatticeTensor
 
-__all__ = ["POLICIES", "activations_in_ram", "maybe_activations_in_ram", "plan", "MemoryPlan"]
+__all__ = ["POLICIES", "activations_in_ram", "maybe_activations_in_ram", "plan", "MemoryPlan", "choose_policy"]
 
 POLICIES = ("gpu", "state_in_ram", "state_and_acts_in_ram")
+AUTO_STATE_FRACTION = 0.25
 
 
 def activations_in_ram(pin_memory: bool = True):
@@ -32,6 +33,31 @@ def maybe_activations_in_ram(policy: str):
     return activations_in_ram() if policy == "state_and_acts_in_ram" else contextlib.nullcontext()
 
 
+def _state_estimate(p: torch.Tensor, g: dict) -> int:
+    b = (p.numel() * g.get("phase_bits", 0) + 7) // 8
+    if g.get("momentum") == "fp32":
+        b += p.numel() * 4
+    elif g.get("momentum") == "ternary":
+        b += p.numel()
+    return b
+
+
+def choose_policy(groups, options: dict) -> str:
+    """'gpu' if the per-element optimizer state of every device fits in AUTO_STATE_FRACTION of its free memory,
+    else 'state_in_ram'."""
+    need: dict[torch.device, int] = {}
+    for g in groups:
+        g = {**options, **g}
+        for p in g["params"]:
+            if p.is_cuda:
+                need[p.device] = need.get(p.device, 0) + _state_estimate(p, g)
+    for dev, b in need.items():
+        free, _ = torch.cuda.mem_get_info(dev)
+        if b > AUTO_STATE_FRACTION * free:
+            return "state_in_ram"
+    return "gpu"
+
+
 @dataclass
 class MemoryPlan:
     weights_bytes: int
@@ -40,6 +66,7 @@ class MemoryPlan:
     state_host_bytes: int
     grad_peak_bytes: int
     params: int
+    weights_by_device: dict | None = None
 
     @property
     def bits_per_weight(self) -> float:
@@ -50,7 +77,10 @@ class MemoryPlan:
         return (f"parameters {self.params / 1e6:.1f}M | weights {self.weights_bytes / gib:.3f} GiB "
                 f"({self.bits_per_weight:.2f} bits/weight; dense bf16 would be {self.dense_weights_bytes / gib:.3f}) | "
                 f"optimizer state GPU {self.state_gpu_bytes / gib:.3f} GiB, host {self.state_host_bytes / gib:.3f} GiB"
-                f" | gradient peak {self.grad_peak_bytes / gib:.3f} GiB")
+                f" | gradient peak {self.grad_peak_bytes / gib:.3f} GiB"
+                + ("" if not self.weights_by_device or len(self.weights_by_device) < 2 else
+                   " | weights by device " + ", ".join(f"{d} {b / gib:.2f} GiB"
+                                                       for d, b in self.weights_by_device.items())))
 
 
 def plan(model: torch.nn.Module, optimizer=None) -> MemoryPlan:
@@ -58,13 +88,16 @@ def plan(model: torch.nn.Module, optimizer=None) -> MemoryPlan:
     weights = dense = n = 0
     largest = total_grad = 0
     seen = set()
+    by_dev: dict[str, int] = {}
     for p in model.parameters():
         if id(p) in seen:
             continue
         seen.add(id(p))
         n += p.numel()
         dense += p.numel() * 2
-        weights += p.storage_bytes() if isinstance(p, LatticeTensor) else p.numel() * p.element_size()
+        wb = p.storage_bytes() if isinstance(p, LatticeTensor) else p.numel() * p.element_size()
+        weights += wb
+        by_dev[str(p.device)] = by_dev.get(str(p.device), 0) + wb
         if p.requires_grad:
             gbytes = p.numel() * (2 if isinstance(p, LatticeTensor) else p.element_size())
             largest = max(largest, gbytes + p.numel() * 4)      # gradient + float32 direction
@@ -84,14 +117,10 @@ def plan(model: torch.nn.Module, optimizer=None) -> MemoryPlan:
         else:
             for g in optimizer.param_groups:
                 for p in g["params"]:
-                    b = (p.numel() * g["phase_bits"] + 7) // 8
-                    if g.get("momentum") == "fp32":
-                        b += p.numel() * 4
-                    elif g.get("momentum") == "ternary":
-                        b += p.numel()
+                    b = _state_estimate(p, g)
                     if on_host:
                         sh += b
                     else:
                         sg += b
     fused = getattr(optimizer, "fused_backward", False)
-    return MemoryPlan(weights, dense, sg, sh, largest if fused else total_grad + largest, n)
+    return MemoryPlan(weights, dense, sg, sh, largest if fused else total_grad + largest, n, by_dev)

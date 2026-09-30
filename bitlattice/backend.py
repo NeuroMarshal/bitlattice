@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import contextlib
-import threading
 from functools import lru_cache
 
 import torch
@@ -16,8 +15,10 @@ import torch
 __all__ = ["POLICIES", "set_compute", "get_compute", "compute", "fp4_supported", "to_blocked", "nvfp4_linear"]
 
 POLICIES = ("exact", "fp4")
-_state = threading.local()
+# process-wide rather than thread-local: the backward pass (and checkpoint recomputation) runs on autograd worker
+# threads and must see the policy of the forward pass
 _default = ["exact"]
+_context: list[str] = []
 
 
 def set_compute(policy: str) -> None:
@@ -28,9 +29,8 @@ def set_compute(policy: str) -> None:
 
 def get_compute(tensor=None) -> str:
     """Effective policy: an active ``compute(...)`` context, else the tensor's own setting, else the default."""
-    ctx = getattr(_state, "policy", None)
-    if ctx is not None:
-        return ctx
+    if _context:
+        return _context[-1]
     own = getattr(tensor, "compute", None)
     return own or _default[0]
 
@@ -39,12 +39,11 @@ def get_compute(tensor=None) -> str:
 def compute(policy: str):
     if policy not in POLICIES:
         raise ValueError(f"compute policy must be one of {POLICIES}")
-    prev = getattr(_state, "policy", None)
-    _state.policy = policy
+    _context.append(policy)
     try:
         yield
     finally:
-        _state.policy = prev
+        _context.pop()
 
 
 @lru_cache(maxsize=None)
