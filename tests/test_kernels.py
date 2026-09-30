@@ -161,3 +161,17 @@ def test_directions_match_reference(kind):
     else:
         U = G
     assert torch.allclose(D, R.clip_rms(U, 1.0), rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("shape", [(96, 200), (1, 512), (300, 4096)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fused_factored_matches_reference(shape, dtype):
+    torch.manual_seed(0)
+    r1, c1 = torch.zeros(shape[0], device=DEV), torch.zeros(shape[1], device=DEV)
+    st = {}
+    for k in range(1, 4):
+        G = (torch.randn(*shape, device=DEV) * torch.rand(shape[0], 1, device=DEV) * k).to(dtype)
+        D = _ops.direction(G, "factored", r1, c1, k)
+        U = R.clip_rms(R.factored_direction(G, st, 0.95), 1.0)
+        assert torch.allclose(r1, st["r"], rtol=1e-5) and torch.allclose(c1, st["c"], rtol=1e-5)
+        assert torch.allclose(D, U, rtol=1e-4, atol=1e-6)

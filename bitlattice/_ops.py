@@ -96,6 +96,8 @@ def step_native(w, phase, D, *, lr: float, weight_decay: float, phase_bits: int,
 def direction(G, kind: str, r=None, c=None, k: int = 1, beta2: float = 0.95, block: int = 0, ns_steps: int = 5,
               ns_dtype: str = "bf16", sinkhorn_iters: int = 2, clip: float = 1.0) -> torch.Tensor:
     """Update direction as float32 [rows, cols], RMS clipped to ``clip``."""
+    if kind == "factored" and HAVE_EXT and G.is_cuda and (G.numel() // max(1, G.shape[0] if G.dim() > 1 else 1)) % 4 == 0:
+        return torch.ops.bitlattice.factored_direction(G, r, c, int(k), float(beta2), float(clip))
     if HAVE_EXT:
         return torch.ops.bitlattice.direction(G, _DIRECTION[kind], r, c, int(k), float(beta2),
                                               int(block if kind == "muon_block" else 0), int(ns_steps),

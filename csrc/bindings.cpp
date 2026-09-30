@@ -18,6 +18,7 @@ Tensor bl_dequantize(Tensor packed, Tensor scales, std::optional<Tensor> global_
                      Tensor sorted, Tensor rank_of_code, Tensor sorted_code, int64_t kind, int64_t bits, int64_t cb,
                      int64_t qmin, int64_t qmax, int64_t zero_point, int64_t scale_dt, int64_t group, int64_t rows,
                      int64_t cols, int64_t out_dtype);
+Tensor bl_factored_direction(Tensor G, Tensor r, Tensor c, int64_t k, double beta2, double clip);
 Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::optional<Tensor> c, int64_t k, double beta2,
                     int64_t block, int64_t ns_steps, int64_t ns_dtype, int64_t sinkhorn_iters, double clip);
 
@@ -37,12 +38,14 @@ TORCH_LIBRARY(bitlattice, m) {
   m.def(
       "direction(Tensor G, int kind, Tensor(a!)? r, Tensor(b!)? c, int k, float beta2, int block, int ns_steps, "
       "int ns_dtype, int sinkhorn_iters, float clip) -> Tensor");
+  m.def("factored_direction(Tensor G, Tensor(a!) r, Tensor(b!) c, int k, float beta2, float clip) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
   m.impl("step_quantized", &bl_step_quantized);
   m.impl("step_native", &bl_step_native);
   m.impl("dequantize", &bl_dequantize);
+  m.impl("factored_direction", &bl_factored_direction);
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CompositeExplicitAutograd, m) { m.impl("direction", &bl_direction); }
