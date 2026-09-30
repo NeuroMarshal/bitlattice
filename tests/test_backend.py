@@ -17,7 +17,7 @@ def test_activation_quantizer_matches_reference():
     packed, scales = torch.ops.bitlattice.quantize_nvfp4(x, g)
     q = R.quantize(x.float(), "nvfp4", method="rtn")
     assert torch.equal(scales.view(torch.uint8), q.scales.view(torch.uint8))
-    assert (packed != q.packed).float().mean() < 1e-3
+    assert torch.equal(packed, q.packed)
 
 
 @pytest.mark.parametrize("M", [1, 7, 256])

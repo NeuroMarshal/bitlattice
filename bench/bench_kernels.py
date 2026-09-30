@@ -84,6 +84,20 @@ def bench_linear(tokens, rows, cols):
     return out
 
 
+def bench_fp4(tokens=4096, rows=4096, cols=4096):
+    if not bl.backend.fp4_supported(0):
+        return {}
+    x = torch.randn(tokens, cols, device="cuda", dtype=torch.bfloat16)
+    wd = torch.randn(rows, cols, device="cuda", dtype=torch.bfloat16) * 0.02
+    w = torch.nn.Parameter(bl.LatticeTensor.from_float(wd.float(), "nvfp4", dtype=torch.bfloat16))
+    out = {"linear_fwd_bf16_dense": timeit(lambda: torch.nn.functional.linear(x, wd))}
+    with torch.no_grad():
+        out["linear_fwd_nvfp4_exact"] = timeit(lambda: torch.nn.functional.linear(x, w))
+        with bl.compute("fp4"):
+            out["linear_fwd_nvfp4_fp4"] = timeit(lambda: torch.nn.functional.linear(x, w))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, default=4096)
@@ -93,6 +107,7 @@ def main():
     res = {"gpu": torch.cuda.get_device_name(0), "rows": a.rows, "cols": a.cols, "tokens": a.tokens}
     res.update(bench_step(a.rows, a.cols))
     res.update(bench_linear(a.tokens, a.rows, a.cols))
+    res.update(bench_fp4(a.tokens, a.rows, a.cols))
     for k, v in res.items():
         print(f"{k:40s} {v * 1e3:10.3f} ms" if isinstance(v, float) and not k.endswith("GBps") else f"{k:40s} {v}")
     print(json.dumps(res))

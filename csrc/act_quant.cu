@@ -9,9 +9,15 @@
 namespace {
 
 __device__ __forceinline__ uint32_t e2m1_code(float v) {
-  // magnitude thresholds between E2M1 levels {0, .5, 1, 1.5, 2, 3, 4, 6}; ties go to the smaller magnitude
+  // nearest E2M1 level {0, .5, 1, 1.5, 2, 3, 4, 6}; ties go to the lower value (library-wide rule), i.e. to the
+  // smaller magnitude for positive and to the larger magnitude for negative inputs
   const float a = fabsf(v);
-  uint32_t m = (a > 0.25f) + (a > 0.75f) + (a > 1.25f) + (a > 1.75f) + (a > 2.5f) + (a > 3.5f) + (a > 5.0f);
+  uint32_t m;
+  if (v >= 0.0f) {
+    m = (a > 0.25f) + (a > 0.75f) + (a > 1.25f) + (a > 1.75f) + (a > 2.5f) + (a > 3.5f) + (a > 5.0f);
+  } else {
+    m = (a >= 0.25f) + (a >= 0.75f) + (a >= 1.25f) + (a >= 1.75f) + (a >= 2.5f) + (a >= 3.5f) + (a >= 5.0f);
+  }
   return (v < 0.0f && m ? 8u : 0u) | m;
 }
 
