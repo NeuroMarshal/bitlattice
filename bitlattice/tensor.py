@@ -247,3 +247,13 @@ def to_parameter(t: LatticeTensor, requires_grad: bool = True) -> torch.nn.Param
 
 def summary(t: Any) -> str:
     return repr(t)
+
+
+def _register_safe_globals() -> None:
+    """Allow torch.load(weights_only=True) of state dicts containing LatticeTensor."""
+    add = getattr(torch.serialization, "add_safe_globals", None)
+    if add is not None:
+        add([LatticeTensor, F.TableFormat, F.UniformFormat, F.NativeFormat, F.ScaleSpec])
+
+
+_register_safe_globals()

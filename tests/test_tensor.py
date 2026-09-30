@@ -102,3 +102,15 @@ def test_dequantize_model_restores_dense():
     ref = lin.weight.dequantize()
     bl.dequantize_(lin)
     assert type(lin.weight.data) is torch.Tensor and torch.equal(lin.weight.data, ref)
+
+
+def test_torch_save_load_weights_only():
+    import io
+    lin = torch.nn.Linear(64, 32, device=DEV)
+    bl.quantize_(lin, format="nvfp4", keep=0.1)
+    buf = io.BytesIO()
+    torch.save(lin.state_dict(), buf)
+    buf.seek(0)
+    sd = torch.load(buf)
+    assert isinstance(sd["weight"], LatticeTensor)
+    assert torch.equal(sd["weight"].dequantize(), lin.weight.dequantize())
