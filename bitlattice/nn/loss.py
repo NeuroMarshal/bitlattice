@@ -62,6 +62,7 @@ class _LinearCE(torch.autograd.Function):
         scale = (g / count).float()
         coef = valid.float() * scale                                    # [n]
         vt = max(chunk, min(V, (64 << 20) // max(d, 1)))                # ~256 MB fp32 weight-gradient tile
+        vt = max(128, vt - vt % 128)                                    # aligned tiles keep the fast GEMM kernels
         for v0 in range(0, V, vt):
             v1 = min(V, v0 + vt)
             Wt = W[v0:v1]

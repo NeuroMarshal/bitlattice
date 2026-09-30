@@ -109,3 +109,32 @@ def test_fp4_all_training_learns_and_saves_fp4_inputs():
             opt.step()
             losses.append(loss.item())
     assert losses[-1] < 0.8 * losses[0]
+
+
+def test_cached_weight_operands_follow_updates():
+    torch.manual_seed(6)
+    lin = torch.nn.Linear(256, 128, bias=False).to(DEV).bfloat16()
+    bl.quantize_(lin, format="nvfp4")
+    x = torch.randn(64, 256, device=DEV, dtype=torch.bfloat16)
+    opt = bl.optim.build(lin, "muon", lr=5e-2)
+    with bl.compute("fp4_all"):
+        y1 = lin(x)
+        y1.float().square().mean().backward()
+        opt.step()
+        opt.zero_grad()
+        y2 = lin(x)
+        bl.backend._OPERANDS.clear()
+        bl.backend._OPERAND_BYTES[0] = 0
+        y3 = lin(x)
+    assert not torch.equal(y1, y2)
+    assert torch.equal(y2, y3)
+
+
+def test_transposed_requantization_matches_dense_transpose():
+    torch.manual_seed(7)
+    w = LatticeTensor.from_float(torch.randn(128, 256, device=DEV) * 0.05, "nvfp4", method="rtn")
+    p, s, g = torch.ops.bitlattice.requantize_nvfp4_t(w.packed, w.scales, w.global_scale)
+    from bitlattice import formats as F
+    wt = R.dequantize(R.Quantized(p, s, g, None, 256, 128), F.get("nvfp4"), torch.float32)
+    ref = w.dequantize(torch.float32).t()
+    assert ((wt - ref).norm() / ref.norm()).item() < 0.12

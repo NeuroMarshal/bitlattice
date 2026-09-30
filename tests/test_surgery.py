@@ -16,7 +16,7 @@ def tokenizer():
     from tokenizers import Tokenizer, models, pre_tokenizers, trainers
     tk = Tokenizer(models.BPE(unk_token="<unk>"))
     tk.pre_tokenizer = pre_tokenizers.ByteLevel()
-    text = ["int main(void) { return 0; } mov eax, 1 push rbp 55 48 89 e5 c3"] * 50
+    text = ["the quick brown fox jumps over the lazy dog 12 34 56"] * 50
     tk.train_from_iterator(text, trainers.BpeTrainer(vocab_size=400, special_tokens=["<unk>"],
                                                      initial_alphabet=pre_tokenizers.ByteLevel.alphabet()))
     return transformers.PreTrainedTokenizerFast(tokenizer_object=tk, unk_token="<unk>")
@@ -31,25 +31,25 @@ def _model(vocab):
 
 
 @pytest.mark.parametrize("quantized_head", [False, True])
-def test_extend_vocab_with_hex_tokens(tokenizer, quantized_head):
+def test_extend_vocab(tokenizer, quantized_head):
     tok = __import__("copy").deepcopy(tokenizer)
     m = _model(len(tok))
     if quantized_head:
         bl.quantize_(m, format="int8", rules=(bl.Rule("*layers*", "skip"),), min_features=16)
         assert isinstance(m.lm_head.weight, LatticeTensor)
     old_emb = m.get_input_embeddings().weight.detach().float().clone()
-    hexes = [f"<h{b:02x}>" for b in range(256)]
-    pieces = tok("<h4f>", add_special_tokens=False).input_ids
+    new_tokens = [f"<t{i:03d}>" for i in range(256)]
+    pieces = tok("<t079>", add_special_tokens=False).input_ids
     v0 = len(tok)
-    ids = bl.surgery.extend_vocab(m, tok, hexes)
+    ids = bl.surgery.extend_vocab(m, tok, new_tokens)
     assert ids == list(range(v0, v0 + 256)) and len(tok) == v0 + 256
     emb = m.get_input_embeddings().weight
     rows = -(-(v0 + 256) // 64) * 64
     assert emb.shape[0] == rows and m.lm_head.weight.shape[0] == rows and m.config.vocab_size == rows
-    assert torch.allclose(emb[ids[0x4F]].float(), old_emb[pieces].mean(0), atol=1e-3)
+    assert torch.allclose(emb[ids[79]].float(), old_emb[pieces].mean(0), atol=1e-3)
     assert torch.equal(emb[:v0].float(), old_emb[:v0])
-    assert tok.tokenize("<h55><h48>") == ["<h55>", "<h48>"]
-    x = torch.tensor([tok("mov <h55><h48><h89><he5> end").input_ids], device=DEV)
+    assert tok.tokenize("<t085><t072>") == ["<t085>", "<t072>"]
+    x = torch.tensor([tok("start <t085><t072><t137><t229> end").input_ids], device=DEV)
     assert x.max().item() >= v0
     opt = bl.optim.build(m, "muon", lr=3e-3)
     losses = []

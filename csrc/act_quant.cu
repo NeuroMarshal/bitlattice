@@ -43,6 +43,11 @@ template <> __device__ __forceinline__ float to_f<__nv_bfloat16>(__nv_bfloat16 v
 template <> __device__ __forceinline__ float to_f<__half>(__half v) { return __half2float(v); }
 template <> __device__ __forceinline__ float to_f<float>(float v) { return v; }
 
+template <typename T> __device__ __forceinline__ T from_f(float v);
+template <> __device__ __forceinline__ __nv_bfloat16 from_f<__nv_bfloat16>(float v) { return __float2bfloat16_rn(v); }
+template <> __device__ __forceinline__ __half from_f<__half>(float v) { return __float2half_rn(v); }
+template <> __device__ __forceinline__ float from_f<float>(float v) { return v; }
+
 // 16 consecutive elements with 16-byte vector loads (the block start is 32/64-byte aligned for 2/4-byte types)
 template <typename T>
 __device__ __forceinline__ void load16(const T* p, float v[16]) {
@@ -155,25 +160,11 @@ __device__ __forceinline__ void load_w_column(const uint8_t* packed, const uint8
   }
 }
 
-__global__ void amax_wt(const uint8_t* packed, const uint8_t* scales, const float* gw, int64_t N, int64_t K,
-                        float* amax) {
-  const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  float m = 0.0f;
-  if (t < (N / 16) * K) {
-    float v[16];
-    load_w_column(packed, scales, *gw, K, t % K, (t / K) * 16, v);
-#pragma unroll
-    for (int i = 0; i < 16; ++i) m = fmaxf(m, fabsf(v[i]));
-  }
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-  if ((threadIdx.x & 31) == 0) atomic_max_pos(amax, m);
-}
-
+// W^T holds the same values as W, so W's global scale bounds every block of W^T as well: no amax pass is needed
 __global__ void requantize_wt(const uint8_t* packed, const uint8_t* scales, const float* gw, int64_t N, int64_t K,
-                              const float* amax, float* global, uint8_t* out_packed, uint8_t* out_scales) {
+                              float* global, uint8_t* out_packed, uint8_t* out_scales) {
   const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const float g = fmaxf(*amax / (6.0f * 448.0f), 1e-12f);
+  const float g = *gw;
   if (t == 0) *global = g;
   if (t >= (N / 16) * K) return;
   const int64_t k = t % K, nb = t / K;
@@ -285,18 +276,57 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bl_requantize_nvfp4_t(at::Tensor 
   auto opt = packed.options();
   at::Tensor out_packed = at::empty({K, N / 2}, opt);
   at::Tensor out_scales = at::empty({K, N / 16}, opt);
-  at::Tensor amax = at::zeros({1}, opt.dtype(at::kFloat));
   at::Tensor global = at::empty({1}, opt.dtype(at::kFloat));
   at::Tensor gw = global_scale.to(at::kFloat).contiguous();
   const uint8_t* sc = reinterpret_cast<const uint8_t*>(scales.data_ptr());
   constexpr int threads = 256;
   const int blocks = static_cast<int>((n + threads - 1) / threads);
   auto stream = at::cuda::getCurrentCUDAStream();
-  amax_wt<<<blocks, threads, 0, stream>>>(packed.data_ptr<uint8_t>(), sc, gw.data_ptr<float>(), N, K,
-                                          amax.data_ptr<float>());
   requantize_wt<<<blocks, threads, 0, stream>>>(packed.data_ptr<uint8_t>(), sc, gw.data_ptr<float>(), N, K,
-                                                amax.data_ptr<float>(), global.data_ptr<float>(),
-                                                out_packed.data_ptr<uint8_t>(), out_scales.data_ptr<uint8_t>());
+                                                global.data_ptr<float>(), out_packed.data_ptr<uint8_t>(),
+                                                out_scales.data_ptr<uint8_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {out_packed, out_scales.view(at::kFloat8_e4m3fn), global};
+}
+
+namespace {
+
+// y *= alpha[0] in place; 16-byte vector accesses, alpha read on the device (no host synchronization)
+template <typename T>
+__global__ void scale_inplace(T* y, int64_t n_vec, int64_t n, const float* alpha) {
+  constexpr int per = 16 / sizeof(T);
+  const float a = *alpha;
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n_vec) {
+    uint4 raw = reinterpret_cast<uint4*>(y)[i];
+    T* e = reinterpret_cast<T*>(&raw);
+#pragma unroll
+    for (int j = 0; j < per; ++j) e[j] = from_f<T>(to_f<T>(e[j]) * a);
+    reinterpret_cast<uint4*>(y)[i] = raw;
+  }
+  const int64_t tail = n_vec * per + i;                 // leftover elements (n not a multiple of the vector)
+  if (i < per && tail < n) y[tail] = from_f<T>(to_f<T>(y[tail]) * a);
+}
+
+}  // namespace
+
+at::Tensor bl_scale_(at::Tensor y, at::Tensor alpha) {
+  TORCH_CHECK(y.is_cuda() && y.is_contiguous(), "y must be contiguous CUDA");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0, "y must be 16-byte aligned");
+  const c10::cuda::CUDAGuard guard(y.device());
+  at::Tensor a = alpha.to(at::kFloat).contiguous();
+  const int64_t n = y.numel();
+  auto stream = at::cuda::getCurrentCUDAStream();
+  constexpr int threads = 256;
+  auto launch = [&](auto* p) {
+    using T = std::remove_pointer_t<decltype(p)>;
+    const int64_t n_vec = n / (16 / sizeof(T));
+    const int blocks = static_cast<int>(std::max<int64_t>(1, (n_vec + threads - 1) / threads));
+    scale_inplace<T><<<blocks, threads, 0, stream>>>(p, n_vec, n, a.data_ptr<float>());
+  };
+  if (y.scalar_type() == at::kBFloat16) launch(reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()));
+  else if (y.scalar_type() == at::kHalf) launch(reinterpret_cast<__half*>(y.data_ptr<at::Half>()));
+  else { TORCH_CHECK(y.scalar_type() == at::kFloat, "y must be bf16, fp16 or fp32"); launch(y.data_ptr<float>()); }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return y;
 }

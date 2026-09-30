@@ -25,6 +25,7 @@ std::tuple<Tensor, Tensor> bl_quantize_nvfp4(Tensor x, Tensor global_scale, int6
 std::tuple<Tensor, Tensor, Tensor> bl_quantize_nvfp4_t(Tensor x, std::optional<Tensor> hadamard, int64_t seed,
                                                        int64_t step);
 std::tuple<Tensor, Tensor, Tensor> bl_requantize_nvfp4_t(Tensor packed, Tensor scales, Tensor global_scale);
+Tensor bl_scale_(Tensor y, Tensor alpha);
 Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::optional<Tensor> c, int64_t k, double beta2,
                     int64_t block, int64_t ns_steps, int64_t ns_dtype, int64_t sinkhorn_iters, double clip,
                     int64_t block_cols, int64_t ns_coeffs, int64_t ns_algo);
@@ -52,6 +53,7 @@ TORCH_LIBRARY(bitlattice, m) {
   m.def("quantize_nvfp4(Tensor x, Tensor global_scale, int seed=-1, int step=0) -> (Tensor, Tensor)");
   m.def("quantize_nvfp4_t(Tensor x, Tensor? hadamard, int seed=-1, int step=0) -> (Tensor, Tensor, Tensor)");
   m.def("requantize_nvfp4_t(Tensor packed, Tensor scales, Tensor global_scale) -> (Tensor, Tensor, Tensor)");
+  m.def("scale_(Tensor(a!) y, Tensor alpha) -> Tensor(a!)");
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
@@ -64,6 +66,7 @@ TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
   m.impl("quantize_nvfp4", &bl_quantize_nvfp4);
   m.impl("quantize_nvfp4_t", &bl_quantize_nvfp4_t);
   m.impl("requantize_nvfp4_t", &bl_requantize_nvfp4_t);
+  m.impl("scale_", &bl_scale_);
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CompositeExplicitAutograd, m) { m.impl("direction", &bl_direction); }

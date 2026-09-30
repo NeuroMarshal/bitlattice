@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import weakref
+from collections import OrderedDict
 from functools import lru_cache
 from typing import NamedTuple
 
@@ -91,11 +93,13 @@ def qualifies_fp4(x: torch.Tensor, w) -> bool:
 
 
 class Fp4Operand(NamedTuple):
-    """A [rows, cols] matrix in NVFP4: packed E2M1 codes, E4M3 block scales along cols, fp32 global scale."""
+    """A [rows, cols] matrix in NVFP4: packed E2M1 codes, E4M3 block scales along cols, fp32 global scale.
+    ``blocked``: the scales are already in the 128x4-tiled layout of the block-scaled GEMM."""
 
     packed: torch.Tensor
     scales: torch.Tensor
     global_scale: torch.Tensor
+    blocked: bool = False
 
 
 _sr_counter = itertools.count(1)
@@ -104,18 +108,64 @@ _sr_counter = itertools.count(1)
 def quantize_fp4(x2: torch.Tensor, stochastic: bool = False) -> Fp4Operand:
     """NVFP4 quantization along the last dimension of a contiguous 2-D tensor (round to nearest, or stochastic
     rounding with a fresh seed per call)."""
-    g = (x2.abs().amax().float() / (6.0 * 448.0)).clamp_min(1e-12).reshape(1)
+    amax = torch.linalg.vector_norm(x2, float("inf"), dtype=torch.float32)       # no |x| temporary
+    g = (amax / (6.0 * 448.0)).clamp_min(1e-12).reshape(1)
     seed = next(_sr_counter) & 0x7FFFFFFF if stochastic else -1
     packed, scales = torch.ops.bitlattice.quantize_nvfp4(x2, g, seed, 0)
     return Fp4Operand(packed, scales, g)
 
 
-def fp4_mm(a: Fp4Operand, b: Fp4Operand) -> torch.Tensor:
-    """A B^T in fp32 for NVFP4 operands A [M, K], B [N, K] (K: multiple of 32)."""
+def fp4_mm(a: Fp4Operand, b: Fp4Operand, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    """A B^T for NVFP4 operands A [M, K], B [N, K] (K: multiple of 32), fp32 accumulation, ``out_dtype`` output
+    scaled by the global scales in place."""
     fp4 = torch.float4_e2m1fn_x2
-    y = torch._scaled_mm(a.packed.view(fp4), b.packed.view(fp4).t(), scale_a=to_blocked(a.scales),
-                         scale_b=to_blocked(b.scales), out_dtype=torch.float32)
-    return y.mul_(a.global_scale * b.global_scale.float())
+    sa = a.scales if a.blocked else to_blocked(a.scales)
+    sb = b.scales if b.blocked else to_blocked(b.scales)
+    y = torch._scaled_mm(a.packed.view(fp4), b.packed.view(fp4).t(), scale_a=sa, scale_b=sb, out_dtype=out_dtype)
+    return torch.ops.bitlattice.scale_(y, a.global_scale * b.global_scale.float())
+
+
+# ---- per-weight operands, cached while the weight is unchanged ------------------------------------------------
+# A weight is used by the forward, the recomputed forward and the backward of every micro-batch before the optimizer
+# changes it (which bumps ``_bl_version``); its GEMM-layout scales and its transposed re-quantization are built once
+# per version. The cache is bounded (LRU by bytes) and holds only weak references to the weights.
+
+_OPERANDS: "OrderedDict" = OrderedDict()
+_OPERAND_BYTES = [0]
+OPERAND_CACHE_BYTES = 768 << 20
+
+
+def _cached(w, kind: str, make):
+    key = (id(w), kind)
+    ver = getattr(w, "_bl_version", 0)
+    hit = _OPERANDS.get(key)
+    if hit is not None and hit[0] == ver and hit[1]() is w:
+        _OPERANDS.move_to_end(key)
+        return hit[2]
+    if hit is not None:
+        _OPERAND_BYTES[0] -= hit[3]
+        del _OPERANDS[key]
+    val = make()
+    size = sum(t.numel() * t.element_size() for t in val if isinstance(t, torch.Tensor))
+    _OPERANDS[key] = (ver, weakref.ref(w), val, size)
+    _OPERAND_BYTES[0] += size
+    while _OPERAND_BYTES[0] > OPERAND_CACHE_BYTES and len(_OPERANDS) > 1:
+        _, old = _OPERANDS.popitem(last=False)
+        _OPERAND_BYTES[0] -= old[3]
+    return val
+
+
+def weight_operand(w) -> Fp4Operand:
+    """W [N, K] as a GEMM operand (scales in the tiled layout)."""
+    return _cached(w, "w", lambda: Fp4Operand(w.packed, to_blocked(w.scales), w.global_scale.float(), True))
+
+
+def weight_t_operand(w) -> Fp4Operand:
+    """W^T [K, N] re-quantized along N from the NVFP4 codes (for the input gradient)."""
+    def make():
+        packed, scales, g = torch.ops.bitlattice.requantize_nvfp4_t(w.packed, w.scales, w.global_scale)
+        return Fp4Operand(packed, to_blocked(scales), g, True)
+    return _cached(w, "wt", make)
 
 
 @lru_cache(maxsize=None)
@@ -145,10 +195,10 @@ def nvfp4_linear(x: torch.Tensor, w, bias: torch.Tensor | None = None) -> torch.
     x2 = x.reshape(-1, K)
     M = x2.shape[0]
     xq = quantize_fp4(_pad_rows(x2, 16).contiguous())
-    y = fp4_mm(xq, Fp4Operand(w.packed, w.scales, w.global_scale.float()))[:M]
+    y = fp4_mm(xq, weight_operand(w), x.dtype)[:M]
     if bias is not None:
-        y += bias.float()
-    return y.to(x.dtype).reshape(*x.shape[:-1], w.shape[0])
+        y += bias.to(y.dtype)
+    return y.reshape(*x.shape[:-1], w.shape[0])
 
 
 def fp4_forward_saving(x: torch.Tensor, w, bias):
@@ -156,11 +206,11 @@ def fp4_forward_saving(x: torch.Tensor, w, bias):
     K = x.shape[-1]
     x2 = _pad_rows(x.reshape(-1, K), 32).contiguous()
     M = x.numel() // K
-    y = fp4_mm(quantize_fp4(x2), Fp4Operand(w.packed, w.scales, w.global_scale.float()))[:M]
+    y = fp4_mm(quantize_fp4(x2), weight_operand(w), x.dtype)[:M]
     if bias is not None:
-        y += bias.float()
+        y += bias.to(y.dtype)
     xt = Fp4Operand(*torch.ops.bitlattice.quantize_nvfp4_t(x2, _hadamard16(x2.device, torch.float32)))
-    return y.to(x.dtype).reshape(*x.shape[:-1], w.shape[0]), xt
+    return y.reshape(*x.shape[:-1], w.shape[0]), xt
 
 
 def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool):
@@ -171,10 +221,9 @@ def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool
     g2p = _pad_rows(g2, 32).contiguous()
     gx = gw = None
     if need_x:
-        wt = Fp4Operand(*torch.ops.bitlattice.requantize_nvfp4_t(w.packed, w.scales, w.global_scale))  # [K, N]
-        gx = fp4_mm(quantize_fp4(g2p, stochastic=True), wt)[:M]
+        gx = fp4_mm(quantize_fp4(g2p, stochastic=True), weight_t_operand(w), gy.dtype)[:M]
     if need_w:
         seed = next(_sr_counter) & 0x7FFFFFFF                                          # g^T rotated, [N, Mp]
         gt = Fp4Operand(*torch.ops.bitlattice.quantize_nvfp4_t(g2p, _hadamard16(g2p.device, torch.float32), seed))
-        gw = fp4_mm(gt, xt)
+        gw = fp4_mm(gt, xt, w.dtype)
     return gx, gw

@@ -280,6 +280,7 @@ class Lattice(torch.optim.Optimizer):
                               g["sinkhorn_iters"], g["clip"], **_ns(g))
 
     def _update(self, p: torch.Tensor, g: dict) -> None:
+        p._bl_version = getattr(p, "_bl_version", 0) + 1          # invalidates cached derived operands
         st = self.state[p]
         self._bring(p, st)
         st["step"] = st.get("step", 0) + 1

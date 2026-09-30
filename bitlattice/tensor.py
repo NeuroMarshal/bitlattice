@@ -172,6 +172,7 @@ class LatticeTensor(torch.Tensor):
             return moved._map(lambda t: t, dtype=moved_dtype)
         if func is aten.copy_.default:
             dst, src = args[0], args[1]
+            dst._bl_version = getattr(dst, "_bl_version", 0) + 1        # invalidates cached derived operands
             if isinstance(src, LatticeTensor) and src.fmt == dst.fmt:
                 for k in _PARTS:
                     d, s = getattr(dst, k), getattr(src, k)
@@ -208,7 +209,7 @@ class _LatticeLinear(torch.autograd.Function):
         ctx.policy = backend.fp4_policy(x, w)
         if ctx.policy == "fp4_all":
             y, xt = backend.fp4_forward_saving(x, w, bias)
-            ctx.save_for_backward(*xt)
+            ctx.save_for_backward(xt.packed, xt.scales, xt.global_scale)
             ctx.x_meta = (x.shape, x.dtype)
             return y
         ctx.save_for_backward(x)
