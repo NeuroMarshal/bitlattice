@@ -95,6 +95,21 @@ def bench_fp4(tokens=4096, rows=4096, cols=4096):
         out["linear_fwd_nvfp4_exact"] = timeit(lambda: torch.nn.functional.linear(x, w))
         with bl.compute("fp4"):
             out["linear_fwd_nvfp4_fp4"] = timeit(lambda: torch.nn.functional.linear(x, w))
+    xg = x.clone().requires_grad_(True)
+    wdg = wd.clone().requires_grad_(True)
+    gy = torch.randn(tokens, rows, device="cuda", dtype=torch.bfloat16)
+
+    def fwd_bwd(weight):
+        def run():
+            torch.nn.functional.linear(xg, weight).backward(gy)
+            xg.grad = None
+            weight.grad = None
+        return run
+
+    out["linear_fwdbwd_bf16_dense"] = timeit(fwd_bwd(wdg))
+    for pol in ("exact", "fp4", "fp4_all"):
+        with bl.compute(pol):
+            out[f"linear_fwdbwd_nvfp4_{pol}"] = timeit(fwd_bwd(w))
     return out
 
 

@@ -99,6 +99,7 @@ Presets:
 | preset | direction | phase | use |
 |---|---|---|---|
 | `muon` | block Newton–Schulz | 2 bits | default; 4–16-bit formats |
+| `muon_fast` | Newton–Schulz on 256×1024 blocks | 2 bits | large models: ~2× cheaper orthogonalization |
 | `muon_precise` | block Newton–Schulz | 8 bits | ternary, binary, 2-bit formats |
 | `light` | factored | 1 bit | minimal state |
 | `balanced` | factored | 2 bits | |
@@ -128,9 +129,14 @@ its own device during backward. Works with generation, checkpointing and all sto
 
 ## Compute
 
-`bl.set_compute("fp4")` (or `QuantConfig(compute="fp4")` per layer, or `with bl.compute("fp4"):`) runs the forward
-GEMMs of nvfp4 layers on FP4 tensor cores (compute capability ≥ 10.0; ~3× the BF16 GEMM rate on an RTX 5070 Ti at
-8192²), with activations quantized to NVFP4 on the fly. The default `exact` dequantizes to BF16.
+`bl.set_compute(policy)` (or `QuantConfig(compute=...)` per layer, or `with bl.compute(...):`) selects how nvfp4 layers
+compute (compute capability ≥ 10.0; other layers and devices fall back to `exact`):
+
+| policy | GEMMs on FP4 tensor cores | linear layer 8192², 8192 tokens, fwd+bwd on RTX 5070 Ti |
+|---|---|---:|
+| `exact` (default) | none (dequantize to BF16) | 35.3 ms (dense BF16: 34.5 ms) |
+| `fp4` | forward | 27.3 ms |
+| `fp4_all` | forward, input gradient, weight gradient (stochastic rounding of gradients, Hadamard-rotated weight-gradient operands, layer input saved in FP4) | 16.0 ms |
 
 ## Checkpoints
 

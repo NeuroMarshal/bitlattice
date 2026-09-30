@@ -91,6 +91,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--format", default="nvfp4")
     ap.add_argument("--preset", default="muon")
+    ap.add_argument("--compute", default="exact", choices=bl.backend.POLICIES)
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--seq", type=int, default=256)
@@ -103,6 +104,7 @@ def main():
     ap.add_argument("--bytes", type=int, default=8 << 20)
     ap.add_argument("--out", default="bench/results/optimizer_ablation.jsonl")
     a = ap.parse_args()
+    bl.set_compute(a.compute)
     data = corpus(a.bytes)
     n_held = data.numel() // 20
     train, held = data[:-n_held], data[-n_held:][: 64 * a.seq + 1]
@@ -112,7 +114,7 @@ def main():
     for seed in a.seeds:
         for name, kw in variants:
             r = run(a, name, kw, seed, train, held)
-            r.update(format=a.format, preset=a.preset, steps=a.steps)
+            r.update(format=a.format, preset=a.preset, steps=a.steps, compute=a.compute)
             results.append(r)
             print(json.dumps(r), flush=True)
             with open(a.out, "a") as f:

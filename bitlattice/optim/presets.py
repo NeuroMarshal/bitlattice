@@ -12,6 +12,9 @@ __all__ = ["PRESETS", "param_groups", "build"]
 PRESETS: dict[str, dict[str, Any]] = {
     # orthogonalized (Newton-Schulz) direction, 2-bit phase: best quality on 4..16-bit formats
     "muon": dict(direction="muon_block", phase_bits=2),
+    # wide 256x1024 blocks: ~2x cheaper Newton-Schulz per weight (held-out loss within seed noise of 'muon' in the
+    # optimizer ablation); for large models where the orthogonalization dominates the step
+    "muon_fast": dict(direction="muon_block", phase_bits=2, block=(256, 1024)),
     # same with an 8-bit phase: ternary / binary / 2-bit weights
     "muon_precise": dict(direction="muon_block", phase_bits=8),
     # factored (Adafactor-like, no momentum) direction with a 1 / 2 / 8-bit phase

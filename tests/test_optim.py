@@ -40,7 +40,7 @@ def _train(student, teacher, opt, steps=400, bs=256, d_in=64, seed=2):
 
 
 @pytest.mark.parametrize("fmt", ["bf16", "int8", "nvfp4", "int4", "mxfp4"])
-@pytest.mark.parametrize("preset", ["muon", "balanced", "light"])
+@pytest.mark.parametrize("preset", ["muon", "muon_fast", "balanced", "light"])
 def test_trains_in_format(fmt, preset):
     teacher, student = _teacher_student()
     if fmt != "bf16":

@@ -159,7 +159,7 @@ def fp4_forward_saving(x: torch.Tensor, w, bias):
     y = fp4_mm(quantize_fp4(x2), Fp4Operand(w.packed, w.scales, w.global_scale.float()))[:M]
     if bias is not None:
         y += bias.float()
-    xt = quantize_fp4(rht_last(x2.t().contiguous()))
+    xt = Fp4Operand(*torch.ops.bitlattice.quantize_nvfp4_t(x2, _hadamard16(x2.device, torch.float32)))
     return y.to(x.dtype).reshape(*x.shape[:-1], w.shape[0]), xt
 
 
@@ -171,9 +171,10 @@ def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool
     g2p = _pad_rows(g2, 32).contiguous()
     gx = gw = None
     if need_x:
-        wt = quantize_fp4(w.dequantize(torch.bfloat16).t().contiguous())                 # [K, N]
+        wt = Fp4Operand(*torch.ops.bitlattice.requantize_nvfp4_t(w.packed, w.scales, w.global_scale))  # [K, N]
         gx = fp4_mm(quantize_fp4(g2p, stochastic=True), wt)[:M]
     if need_w:
-        gt = quantize_fp4(rht_last(g2p.t().contiguous()), stochastic=True)             # [N, Mp]
+        seed = next(_sr_counter) & 0x7FFFFFFF                                          # g^T rotated, [N, Mp]
+        gt = Fp4Operand(*torch.ops.bitlattice.quantize_nvfp4_t(g2p, _hadamard16(g2p.device, torch.float32), seed))
         gw = fp4_mm(gt, xt)
     return gx, gw
