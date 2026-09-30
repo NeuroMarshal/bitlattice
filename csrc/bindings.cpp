@@ -11,14 +11,16 @@ Tensor bl_step_quantized(Tensor packed, std::optional<Tensor> phase, Tensor scal
                          int64_t kind, int64_t bits, int64_t cb, int64_t qmin, int64_t qmax, int64_t zero_point,
                          int64_t scale_dt, int64_t group, int64_t rows, int64_t cols, int64_t pb, int64_t pcb,
                          double lr, double decay, int64_t rounding, int64_t seed, int64_t step, int64_t strat_j,
-                         int64_t strat_k, int64_t rule, double kappa);
+                         int64_t strat_k, int64_t rule, double kappa, int64_t offset);
 void bl_step_native(Tensor w, std::optional<Tensor> phase, Tensor D, int64_t pb, int64_t pcb, double lr, double decay,
-                    int64_t rounding, int64_t seed, int64_t step, int64_t strat_j, int64_t strat_k);
+                    int64_t rounding, int64_t seed, int64_t step, int64_t strat_j, int64_t strat_k, int64_t offset);
 Tensor bl_dequantize(Tensor packed, Tensor scales, std::optional<Tensor> global_scale, std::optional<Tensor> zeros,
                      Tensor sorted, Tensor rank_of_code, Tensor sorted_code, int64_t kind, int64_t bits, int64_t cb,
                      int64_t qmin, int64_t qmax, int64_t zero_point, int64_t scale_dt, int64_t group, int64_t rows,
                      int64_t cols, int64_t out_dtype);
 Tensor bl_factored_direction(Tensor G, Tensor r, Tensor c, int64_t k, double beta2, double clip);
+std::tuple<Tensor, Tensor> bl_factored_scales(Tensor G, Tensor r, Tensor c, int64_t k, double beta2, double clip);
+Tensor bl_factored_apply(Tensor G, Tensor a, Tensor b, int64_t row0, int64_t nrows);
 Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::optional<Tensor> c, int64_t k, double beta2,
                     int64_t block, int64_t ns_steps, int64_t ns_dtype, int64_t sinkhorn_iters, double clip);
 
@@ -27,10 +29,11 @@ TORCH_LIBRARY(bitlattice, m) {
       "step_quantized(Tensor(a!) packed, Tensor(b!)? phase, Tensor scales, Tensor? global_scale, Tensor? zeros, "
       "Tensor D, Tensor sorted, Tensor rank_of_code, Tensor sorted_code, int kind, int bits, int cb, int qmin, "
       "int qmax, int zero_point, int scale_dt, int group, int rows, int cols, int pb, int pcb, float lr, "
-      "float decay, int rounding, int seed, int step, int strat_j, int strat_k, int rule, float kappa) -> Tensor");
+      "float decay, int rounding, int seed, int step, int strat_j, int strat_k, int rule, float kappa, "
+      "int offset=0) -> Tensor");
   m.def(
       "step_native(Tensor(a!) w, Tensor(b!)? phase, Tensor D, int pb, int pcb, float lr, float decay, int rounding, "
-      "int seed, int step, int strat_j, int strat_k) -> ()");
+      "int seed, int step, int strat_j, int strat_k, int offset=0) -> ()");
   m.def(
       "dequantize(Tensor packed, Tensor scales, Tensor? global_scale, Tensor? zeros, Tensor sorted, "
       "Tensor rank_of_code, Tensor sorted_code, int kind, int bits, int cb, int qmin, int qmax, int zero_point, "
@@ -39,6 +42,8 @@ TORCH_LIBRARY(bitlattice, m) {
       "direction(Tensor G, int kind, Tensor(a!)? r, Tensor(b!)? c, int k, float beta2, int block, int ns_steps, "
       "int ns_dtype, int sinkhorn_iters, float clip) -> Tensor");
   m.def("factored_direction(Tensor G, Tensor(a!) r, Tensor(b!) c, int k, float beta2, float clip) -> Tensor");
+  m.def("factored_scales(Tensor G, Tensor(a!) r, Tensor(b!) c, int k, float beta2, float clip) -> (Tensor, Tensor)");
+  m.def("factored_apply(Tensor G, Tensor a, Tensor b, int row0, int nrows) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
@@ -46,6 +51,8 @@ TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
   m.impl("step_native", &bl_step_native);
   m.impl("dequantize", &bl_dequantize);
   m.impl("factored_direction", &bl_factored_direction);
+  m.impl("factored_scales", &bl_factored_scales);
+  m.impl("factored_apply", &bl_factored_apply);
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CompositeExplicitAutograd, m) { m.impl("direction", &bl_direction); }

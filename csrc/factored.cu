@@ -117,12 +117,20 @@ __global__ void scale_out(const T* G, int64_t rows, int64_t cols, const float* a
 
 }  // namespace
 
-at::Tensor bl_factored_direction(at::Tensor G, at::Tensor r, at::Tensor c, int64_t k, double beta2, double clip) {
-  TORCH_CHECK(G.is_cuda(), "G must be CUDA");
-  const c10::cuda::CUDAGuard guard(G.device());
+namespace {
+at::Tensor as2d(const at::Tensor& G) {
   at::Tensor g2 = (G.dim() == 1 ? G.reshape({1, -1}) : G.reshape({G.size(0), -1}));
   if (g2.scalar_type() != at::kBFloat16 && g2.scalar_type() != at::kFloat) g2 = g2.to(at::kFloat);
-  g2 = g2.contiguous();
+  return g2.contiguous();
+}
+}  // namespace
+
+// Row factors a (incl. 1/max|G| and the RMS clip) and column factors b such that D = G * a_i * b_j.
+std::tuple<at::Tensor, at::Tensor> bl_factored_scales(at::Tensor G, at::Tensor r, at::Tensor c, int64_t k,
+                                                      double beta2, double clip) {
+  TORCH_CHECK(G.is_cuda(), "G must be CUDA");
+  const c10::cuda::CUDAGuard guard(G.device());
+  at::Tensor g2 = as2d(G);
   const int64_t rows = g2.size(0), cols = g2.size(1);
   TORCH_CHECK(cols % kColsPerThread == 0, "factored kernel needs cols % 4 == 0");
   auto f32 = g2.options().dtype(at::kFloat);
@@ -162,15 +170,34 @@ at::Tensor bl_factored_direction(at::Tensor G, at::Tensor r, at::Tensor c, int64
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   at::Tensor rms = ((a * a * row_w).sum() / static_cast<double>(rows * cols)).sqrt();
   a = a / at::clamp_min(rms / clip, 1.0);
-  at::Tensor D = at::empty({rows, cols}, f32);
+  return {a, b};
+}
+
+// D rows [row0, row0 + nrows) of G * a_i * b_j as float32
+at::Tensor bl_factored_apply(at::Tensor G, at::Tensor a, at::Tensor b, int64_t row0, int64_t nrows) {
+  const c10::cuda::CUDAGuard guard(G.device());
+  at::Tensor g2 = as2d(G).slice(0, row0, row0 + nrows).contiguous();
+  const int64_t rows = g2.size(0), cols = g2.size(1);
+  at::Tensor as = a.slice(0, row0, row0 + nrows).contiguous();
+  const dim3 grid(static_cast<unsigned>((cols / kColsPerThread + kThreads - 1) / kThreads),
+                  static_cast<unsigned>((rows + kTileRows - 1) / kTileRows));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const bool bf = g2.scalar_type() == at::kBFloat16;
+  at::Tensor D = at::empty({rows, cols}, g2.options().dtype(at::kFloat));
   if (bf) {
     scale_out<__nv_bfloat16><<<grid, kThreads, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(g2.data_ptr<at::BFloat16>()), rows, cols, a.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(g2.data_ptr<at::BFloat16>()), rows, cols, as.data_ptr<float>(),
         b.data_ptr<float>(), D.data_ptr<float>());
   } else {
-    scale_out<float><<<grid, kThreads, 0, stream>>>(g2.data_ptr<float>(), rows, cols, a.data_ptr<float>(),
+    scale_out<float><<<grid, kThreads, 0, stream>>>(g2.data_ptr<float>(), rows, cols, as.data_ptr<float>(),
                                                     b.data_ptr<float>(), D.data_ptr<float>());
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return D;
+}
+
+at::Tensor bl_factored_direction(at::Tensor G, at::Tensor r, at::Tensor c, int64_t k, double beta2, double clip) {
+  auto [a, b] = bl_factored_scales(G, r, c, k, beta2, clip);
+  const int64_t rows = G.dim() == 1 ? 1 : G.size(0);
+  return bl_factored_apply(G, a, b, 0, rows);
 }

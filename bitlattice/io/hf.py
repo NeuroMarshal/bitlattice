@@ -64,7 +64,11 @@ def detect_layout(path: str, config) -> dict[str, Any]:
     qc = qc if isinstance(qc, dict) else qc.to_dict()
     method = str(qc.get("quant_method", "")).lower()
     if method == "compressed-tensors":
-        fmt = str(qc.get("format", ""))
+        groups = qc.get("config_groups") or {}
+        group_formats = {g.get("format") for g in groups.values() if isinstance(g, dict) and g.get("format")}
+        fmt = str(qc.get("format") or "")
+        if fmt in ("", "mixed-precision") and len(group_formats) == 1:
+            fmt = group_formats.pop()
         ignore = qc.get("ignore", [])
         if "nvfp4" in fmt:
             return {"kind": "ct_nvfp4", "ignore": ignore}

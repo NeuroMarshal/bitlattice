@@ -33,9 +33,11 @@ struct RoundParams {
   uint32_t step;
   int strat_j;     // bit-reversed step for stratified rounding
   int strat_k;     // number of strata (power of two)
+  uint64_t offset; // index of the first element (row tiles of a larger tensor)
 };
 
 __device__ __forceinline__ float rounding_u(const RoundParams& rp, uint64_t idx) {
+  idx += rp.offset;
   if (rp.mode == kSR) return hash_uniform(idx, rp.seed, rp.step);
   if (rp.mode == kStrat) {
     float v = (static_cast<float>(rp.strat_j) + hash_uniform(idx, rp.seed, 0u)) / static_cast<float>(rp.strat_k);

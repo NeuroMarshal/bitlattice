@@ -379,7 +379,8 @@ bl::Lattice make_lattice(const Tensor& scales_in, const Tensor& scales_out, cons
 }
 
 bl::StepParams make_params(double lr, double decay, int64_t pb, int64_t pcb, int64_t rule, double kappa,
-                           int64_t rounding, int64_t seed, int64_t step, int64_t strat_j, int64_t strat_k) {
+                           int64_t rounding, int64_t seed, int64_t step, int64_t strat_j, int64_t strat_k,
+                           int64_t offset) {
   bl::StepParams P{};
   P.lr = static_cast<float>(lr);
   P.decay = static_cast<float>(decay);
@@ -395,6 +396,7 @@ bl::StepParams make_params(double lr, double decay, int64_t pb, int64_t pcb, int
   P.rp.step = static_cast<uint32_t>(step & 0xFFFFFFFFll);
   P.rp.strat_j = static_cast<int>(strat_j);
   P.rp.strat_k = static_cast<int>(strat_k);
+  P.rp.offset = static_cast<uint64_t>(offset);
   return P;
 }
 
@@ -410,14 +412,14 @@ Tensor bl_step_quantized(Tensor packed, std::optional<Tensor> phase, Tensor scal
                          int64_t kind, int64_t bits, int64_t cb, int64_t qmin, int64_t qmax, int64_t zero_point,
                          int64_t scale_dt, int64_t group, int64_t rows, int64_t cols, int64_t pb, int64_t pcb,
                          double lr, double decay, int64_t rounding, int64_t seed, int64_t step, int64_t strat_j,
-                         int64_t strat_k, int64_t rule, double kappa) {
+                         int64_t strat_k, int64_t rule, double kappa, int64_t offset) {
   TORCH_CHECK(packed.is_cuda() && packed.is_contiguous(), "packed codes must be contiguous CUDA");
   TORCH_CHECK(D.scalar_type() == at::kFloat && D.is_contiguous() && D.numel() == rows * cols, "D: float32 [rows*cols]");
   const c10::cuda::CUDAGuard guard(packed.device());
   Tensor scales_out = scales.clone();
   bl::Lattice L = make_lattice(scales, scales_out, global_scale, zeros, sorted, rank_of_code, sorted_code, kind, bits,
                                cb, qmin, qmax, zero_point, scale_dt, group, rows, cols);
-  bl::StepParams P = make_params(lr, decay, pb, pcb, rule, kappa, rounding, seed, step, strat_j, strat_k);
+  bl::StepParams P = make_params(lr, decay, pb, pcb, rule, kappa, rounding, seed, step, strat_j, strat_k, offset);
   uint8_t* codes = static_cast<uint8_t*>(packed.data_ptr());
   uint8_t* ph = phase.has_value() && pb > 0 ? static_cast<uint8_t*>(phase->data_ptr()) : nullptr;
   const float* d = D.data_ptr<float>();
@@ -440,11 +442,11 @@ Tensor bl_step_quantized(Tensor packed, std::optional<Tensor> phase, Tensor scal
 }
 
 void bl_step_native(Tensor w, std::optional<Tensor> phase, Tensor D, int64_t pb, int64_t pcb, double lr, double decay,
-                    int64_t rounding, int64_t seed, int64_t step, int64_t strat_j, int64_t strat_k) {
+                    int64_t rounding, int64_t seed, int64_t step, int64_t strat_j, int64_t strat_k, int64_t offset) {
   TORCH_CHECK(w.is_cuda() && w.is_contiguous(), "weights must be contiguous CUDA");
   TORCH_CHECK(D.scalar_type() == at::kFloat && D.is_contiguous() && D.numel() == w.numel(), "D: float32, same numel");
   const c10::cuda::CUDAGuard guard(w.device());
-  bl::StepParams P = make_params(lr, decay, pb, pcb, bl::kFixed, 0.0, rounding, seed, step, strat_j, strat_k);
+  bl::StepParams P = make_params(lr, decay, pb, pcb, bl::kFixed, 0.0, rounding, seed, step, strat_j, strat_k, offset);
   uint8_t* ph = phase.has_value() && pb > 0 ? static_cast<uint8_t*>(phase->data_ptr()) : nullptr;
   const int64_t n = w.numel();
   constexpr int threads = 256;

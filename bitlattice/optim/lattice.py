@@ -30,7 +30,7 @@ SCALE_RULES = ("fit", "fit_latent", "fixed")
 DEFAULTS: dict[str, Any] = dict(
     lr=3e-3, direction="muon_block", vector_direction="factored", phase_bits=2, rounding="sr", scale_rule="fit",
     momentum="none", beta1=0.9, beta2=0.95, weight_decay=0.0, clip=1.0, block=512, ns_steps=5, ns_dtype="bf16",
-    sinkhorn_iters=2, trust=0.01, trust_lr=1.0, strata=16,
+    sinkhorn_iters=2, trust=0.01, trust_lr=1.0, strata=16, tile_elems=1 << 24,
 )
 
 
@@ -238,6 +238,10 @@ class Lattice(torch.optim.Optimizer):
         seed = (self.seed + 7919 * pid) & 0xFFFFFFFF
         G = p.grad
         matrix = p.dim() >= 2 and min(p.shape[0], p.numel() // p.shape[0]) > 1
+        if matrix and self._tileable(p, g):
+            self._update_tiled(p, G, st, g, seed)
+            self._send_back(p, st)
+            return
         G = self._momentum(G, st, g, pid)
         D = self._direction(G, st, g, matrix)
         kw = dict(lr=g["lr"], weight_decay=g["weight_decay"], phase_bits=g["phase_bits"], rounding=g["rounding"],
@@ -247,6 +251,64 @@ class Lattice(torch.optim.Optimizer):
         else:
             self._update_native(p, p.data, D, st, "phase", kw)
         self._send_back(p, st)
+
+    # ------------------------------------------------------------------------------------------------------------
+    # row tiles: bounded transient memory for large matrices (same result as the untiled update)
+
+    def _tileable(self, p: torch.Tensor, g: dict) -> bool:
+        if p.numel() <= g["tile_elems"] or g["momentum"] != "none" or not (p.is_cuda and _ops.HAVE_EXT):
+            return False
+        if g["direction"] not in ("factored", "muon_block", "sign", "raw"):
+            return False
+        cols = p.numel() // p.shape[0]
+        if isinstance(p, LatticeTensor):
+            return p.hi_idx is None and p.fmt.scale.group != 0 and _ops.cuda_ok(p.fmt, p.rows, cols, p.packed.device)
+        return p.dtype in (torch.bfloat16, torch.float16, torch.float32) and p.is_contiguous() and cols % 8 == 0
+
+    def _update_tiled(self, p: torch.Tensor, G: torch.Tensor, st: dict, g: dict, seed: int) -> None:
+        rows = p.shape[0]
+        cols = p.numel() // rows
+        G2 = G.reshape(rows, cols)
+        kind = g["direction"]
+        step_rows = max(1, g["tile_elems"] // cols)
+        if kind == "muon_block":
+            step_rows = max(g["block"], step_rows - step_rows % g["block"])
+        if kind == "factored":
+            if "r" not in st:
+                st["r"] = torch.zeros(rows, device=G.device)
+                st["c"] = torch.zeros(cols, device=G.device)
+                st["k"] = 0
+            st["k"] += 1
+            a, b = torch.ops.bitlattice.factored_scales(G2, st["r"], st["c"], st["k"], g["beta2"], g["clip"])
+        bits = g["phase_bits"]
+        cb = _ops.phase_container(bits)
+        kw = dict(lr=g["lr"], weight_decay=g["weight_decay"], phase_bits=bits, rounding=g["rounding"], seed=seed,
+                  step=st["step"], strata=g["strata"])
+        quant = isinstance(p, LatticeTensor)
+        if bits and "phase" not in st:
+            st["phase"] = (torch.zeros(rows, packed_cols(cols, cb), dtype=torch.uint8, device=p.device) if quant else
+                           torch.zeros(_ops.phase_numel(p.numel()) * cb // 8, dtype=torch.uint8, device=p.device))
+        new_scales = []
+        for r0 in range(0, rows, step_rows):
+            n = min(step_rows, rows - r0)
+            if kind == "factored":
+                D = torch.ops.bitlattice.factored_apply(G2, a, b, r0, n)
+            else:
+                D = _ops.direction(G2[r0:r0 + n], kind, block=g["block"], ns_steps=g["ns_steps"],
+                                   ns_dtype=g["ns_dtype"], clip=g["clip"])
+            if quant:
+                zeros = p.zeros[r0:r0 + n] if p.zeros is not None else None
+                sc = _ops.step_quantized(p.packed[r0:r0 + n], st["phase"][r0:r0 + n] if bits else None,
+                                         p.scales[r0:r0 + n], p.global_scale, zeros, D, p.fmt, n, cols, phase_cb=cb,
+                                         scale_rule=g["scale_rule"], trust=g["trust"], trust_lr=g["trust_lr"],
+                                         offset=r0 * cols, **kw)
+                new_scales.append(sc)
+            else:
+                w = p.data.view(rows, cols)[r0:r0 + n]
+                ph = st["phase"][r0 * cols * cb // 8:(r0 + n) * cols * cb // 8] if bits else None
+                _ops.step_native(w, ph, D, phase_cb=cb, offset=r0 * cols, **kw)
+        if quant:
+            p.scales.copy_(torch.cat(new_scales, 0))
 
     def _update_native(self, p, w: torch.Tensor, D: torch.Tensor, st: dict, key: str, kw: dict) -> None:
         bits = kw["phase_bits"]

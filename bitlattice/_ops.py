@@ -74,7 +74,7 @@ def kappa(trust: float, trust_lr: float, lr: float) -> float:
 
 def step_quantized(packed, phase, scales, global_scale, zeros, D, fmt, rows: int, cols: int, *, lr: float,
                    weight_decay: float, phase_bits: int, phase_cb: int, rounding: str, seed: int, step: int,
-                   strata: int, scale_rule: str, trust: float, trust_lr: float) -> torch.Tensor:
+                   strata: int, scale_rule: str, trust: float, trust_lr: float, offset: int = 0) -> torch.Tensor:
     """In-place update of ``packed`` (and ``phase``); returns the new scales tensor."""
     tables, args = lattice_args(fmt, packed.device)
     j, k = strat_args(rounding, step, strata)
@@ -82,15 +82,16 @@ def step_quantized(packed, phase, scales, global_scale, zeros, D, fmt, rows: int
         packed, phase if phase_bits > 0 else None, scales, global_scale, zeros, D.reshape(-1).float().contiguous(),
         *tables, *args, rows, cols, phase_bits, phase_cb, float(lr), float(1.0 - lr * weight_decay),
         _ROUNDING[rounding], int(seed) & 0xFFFFFFFF, int(step) & 0xFFFFFFFF, j, k, _RULE[scale_rule],
-        float(kappa(trust, trust_lr, lr)))
+        float(kappa(trust, trust_lr, lr)), int(offset))
 
 
 def step_native(w, phase, D, *, lr: float, weight_decay: float, phase_bits: int, phase_cb: int, rounding: str,
-                seed: int, step: int, strata: int) -> None:
+                seed: int, step: int, strata: int, offset: int = 0) -> None:
     j, k = strat_args(rounding, step, strata)
     torch.ops.bitlattice.step_native(w, phase if phase_bits > 0 else None, D.reshape(-1).float().contiguous(),
                                      phase_bits, phase_cb, float(lr), float(1.0 - lr * weight_decay),
-                                     _ROUNDING[rounding], int(seed) & 0xFFFFFFFF, int(step) & 0xFFFFFFFF, j, k)
+                                     _ROUNDING[rounding], int(seed) & 0xFFFFFFFF, int(step) & 0xFFFFFFFF, j, k,
+                                     int(offset))
 
 
 def direction(G, kind: str, r=None, c=None, k: int = 1, beta2: float = 0.95, block: int = 0, ns_steps: int = 5,

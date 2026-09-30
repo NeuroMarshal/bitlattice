@@ -165,3 +165,26 @@ def test_plan_reports_compression():
     opt = bl.optim.build(student, "muon", fused_backward=True)
     p = bl.plan(student, opt)
     assert p.bits_per_weight < 8 and p.state_gpu_bytes > 0 and "weights" in str(p)
+
+
+@pytest.mark.parametrize("fmt", ["nvfp4", "int4", "bf16"])
+def test_row_tiles_match_untiled(fmt):
+    torch.manual_seed(0)
+    w = torch.randn(96, 256, device=DEV) * 0.05
+    def make():
+        if fmt == "bf16":
+            return torch.nn.Parameter(w.to(torch.bfloat16).clone())
+        return torch.nn.Parameter(LatticeTensor.from_float(w, fmt, dtype=torch.bfloat16))
+    p1, p2 = make(), make()
+    o1 = bl.Lattice([p1], lr=1e-2, direction="factored")
+    o2 = bl.Lattice([p2], lr=1e-2, direction="factored", tile_elems=40 * 256)     # tiles of 40 rows
+    for s in range(3):
+        G = (torch.randn(96, 256, device=DEV) * (s + 1)).to(torch.bfloat16)
+        p1.grad, p2.grad = G.clone(), G.clone()
+        o1.step()
+        o2.step()
+    if fmt == "bf16":
+        assert torch.equal(p1.data, p2.data)
+    else:
+        assert torch.equal(p1.packed, p2.packed) and torch.equal(p1.scales, p2.scales)
+    assert torch.equal(o1.state[p1]["phase"], o2.state[p2]["phase"])

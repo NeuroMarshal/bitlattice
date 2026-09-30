@@ -214,3 +214,20 @@ def test_export_compressed_tensors_roundtrip(dense_dir, tmp_path):
     for (n, a), (_, b) in zip(m.named_parameters(), back.named_parameters()):
         if isinstance(a, LatticeTensor):
             assert torch.equal(a.packed, b.packed) and torch.equal(a.scales, b.scales), n
+
+
+def test_generate_and_gradient_checkpointing(dense_dir):
+    m = bl.io.load(dense_dir, bl.quant.presets.default("nvfp4"), device=DEV)
+    ids = _ids()
+    out = m.generate(ids[:1, :4], max_new_tokens=5, do_sample=False)
+    assert out.shape == (1, 9)
+    m.gradient_checkpointing_enable()
+    m.config.use_cache = False
+    m.train()
+    opt = bl.optim.build(m, "muon", lr=3e-3, fused_backward=True)
+    with bl.storage.activations_in_ram():
+        loss = m(ids, labels=ids).loss
+    loss.backward()
+    opt.step()
+    assert all(p.grad is None for p in m.parameters())
+    assert torch.isfinite(m(ids, labels=ids).loss)
