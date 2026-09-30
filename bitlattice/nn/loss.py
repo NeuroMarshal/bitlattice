@@ -43,34 +43,50 @@ class _LinearCE(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, g):
+        """Vocabulary tiles outer, token chunks inner: each weight-gradient tile is accumulated in fp32 once and
+        written in the weight dtype, so no fp32 buffer of the full [vocab, hidden] gradient is needed."""
         hidden, lse, ysafe, valid, count = ctx.saved_tensors
         weight, bias, chunk, dtype = ctx.weight, ctx.bias, ctx.chunk, ctx.dtype
         h = hidden.reshape(-1, hidden.shape[-1])
         W = _dense(weight, dtype)
+        V, d = W.shape
+        n = h.shape[0]
         need_h, need_w = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
-        gh = torch.empty_like(h) if need_h else None
-        gw = torch.zeros(W.shape, dtype=torch.float32, device=h.device) if need_w else None
-        gb = torch.zeros(W.shape[0], dtype=torch.float32, device=h.device) if bias is not None and \
-            ctx.needs_input_grad[2] else None
+        need_b = bias is not None and ctx.needs_input_grad[2]
+        gh = torch.zeros(n, d, dtype=torch.float32, device=h.device) if need_h else None
+        gw = torch.empty(V, d, dtype=weight.dtype, device=h.device) if need_w else None
+        gb = torch.empty(V, dtype=bias.dtype, device=h.device) if need_b else None
         scale = (g / count).float()
-        for s in range(0, h.shape[0], chunk):
-            hc = h[s:s + chunk].to(dtype)
-            logits = (hc @ W.t()).float()
-            if bias is not None:
-                logits += bias.float()
-            p = logits.sub_(lse[s:s + chunk, None]).exp_()                     # softmax in place
-            p[torch.arange(p.shape[0], device=p.device), ysafe[s:s + chunk]] -= 1.0
-            p.mul_(valid[s:s + chunk, None] * scale)
-            pd = p.to(dtype)
-            if need_h:
-                gh[s:s + chunk] = (pd @ W).to(gh.dtype)
+        coef = valid.float() * scale                                    # [n]
+        vt = max(chunk, min(V, (64 << 20) // max(d, 1)))                # ~256 MB fp32 weight-gradient tile
+        for v0 in range(0, V, vt):
+            v1 = min(V, v0 + vt)
+            Wt = W[v0:v1]
+            gwt = torch.zeros(v1 - v0, d, dtype=torch.float32, device=h.device) if need_w else None
+            gbt = torch.zeros(v1 - v0, dtype=torch.float32, device=h.device) if need_b else None
+            for s in range(0, n, chunk):
+                hc = h[s:s + chunk].to(dtype)
+                logits = (hc @ Wt.t()).float()
+                if bias is not None:
+                    logits += bias[v0:v1].float()
+                p = logits.sub_(lse[s:s + chunk, None]).exp_()                 # softmax restricted to the tile
+                y = ysafe[s:s + chunk]
+                inside = (y >= v0) & (y < v1)
+                rows = torch.nonzero(inside).squeeze(1)
+                p[rows, y[rows] - v0] -= 1.0
+                p.mul_(coef[s:s + chunk, None])
+                pd = p.to(dtype)
+                if need_h:
+                    gh[s:s + chunk] += pd @ Wt
+                if need_w:
+                    gwt += pd.t() @ hc
+                if need_b:
+                    gbt += p.sum(0)
             if need_w:
-                gw.addmm_(pd.t().float(), hc.float())
-            if gb is not None:
-                gb += p.sum(0)
-        gh = gh.reshape(hidden.shape) if need_h else None
-        gw = gw.to(weight.dtype) if need_w else None
-        gb = gb.to(bias.dtype) if gb is not None else None
+                gw[v0:v1] = gwt.to(gw.dtype)
+            if need_b:
+                gb[v0:v1] = gbt.to(gb.dtype)
+        gh = gh.to(hidden.dtype).reshape(hidden.shape) if need_h else None
         return gh, gw, gb, None, None, None, None
 
 
