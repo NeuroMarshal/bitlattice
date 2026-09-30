@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bitlattice"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "Training and fine-tuning of PyTorch models directly in low-bit and arbitrary number formats."
 readme = "README.md"
 license = { text = "MIT" }

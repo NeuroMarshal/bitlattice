@@ -92,6 +92,14 @@ GPUs, minimizing the largest ratio of assigned bytes to the device budget; tied 
 autograd, generation and the optimizer work unchanged; updates stay local to each device. `bl.io.load(...,
 device_map="auto")` sizes the split from the checkpoint headers and loads every tensor directly onto its GPU.
 
+## Pipeline (one process per GPU)
+
+`bl.parallel.init` + `bl.io.load(..., device_map="interleaved")`: every process loads only its blocks.
+`bl.parallel.train_step` cuts the model into segments (maximal runs of embedding / blocks / head on one GPU). It runs
+them block-major over the micro-batches, forward and backward, sending each micro-batch on as soon as it is done.
+There is one NCCL process group per direction, because NCCL P2P streams are in order. A segment's gradients are
+accumulated over the micro-batches (`Lattice.accumulate`) and applied by the fused update after the last one.
+
 ## Loading
 
 `bl.io.load` builds the model with `accelerate.init_empty_weights(include_buffers=False)`, groups checkpoint
@@ -100,11 +108,12 @@ module at a time.
 
 ## Planned
 
-1. Full FP4 training path: dgrad and wgrad GEMMs on FP4 tensor cores (2-D 16×16 weight blocks so that `W` and `Wᵀ`
-   share codes, random Hadamard transform on the wgrad operands, stochastic rounding of gradients), following the
-   public NVFP4 pre-training recipe.
+1. 2-D 16×16 weight blocks, so that `W` and `Wᵀ` share codes in `fp4_all`. Today the input-gradient GEMM uses a
+   1×16 re-quantization of `Wᵀ`.
 2. Fused dequantize-GEMM for formats without a hardware path (level table in shared memory); FP8 path for int4/int5.
-3. Pipeline schedule (micro-batches) over the layer split.
-4. Symmetric GEMM kernels for Newton–Schulz (`XXᵀ`, `R²` at half the FLOPs).
-5. GGUF loading.
-6. Kernels for linear-attention layers of hybrid models.
+3. Symmetric GEMM kernels for Newton–Schulz (`XXᵀ`, `R²` at half the FLOPs).
+4. Pipeline:
+   - a split backward (input gradient first, weight gradient in the bubbles);
+   - a copy-engine transport without head-of-line blocking (~18 GB/s instead of ~5 GB/s).
+5. Kernels for linear-attention layers of hybrid models.
+6. GGUF loading.

@@ -9,7 +9,7 @@ from .quant import QuantConfig, Rule, dequantize_, quantize_
 from .storage import plan
 from .tensor import LatticeTensor, is_lattice
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"
 
 __all__ = ["backend", "compute", "set_compute", "formats", "io", "nn", "optim", "parallel", "quant", "storage", "plan",
            "dispatch", "infer_device_map", "Lattice", "LatticeTensor", "is_lattice", "QuantConfig", "Rule",

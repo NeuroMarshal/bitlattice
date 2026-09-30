@@ -118,14 +118,42 @@ Presets:
 
 ## Several GPUs
 
+**Pipeline, one process per GPU** (fastest; for decoder-only Hugging Face models):
+
+```python
+# torchrun --nproc-per-node 2 train.py      (every process runs this script on the same batches)
+rank, world = bl.parallel.init()
+model = bl.io.load("Qwen/Qwen3-8B", bl.quant.presets.default("nvfp4"), device_map="interleaved")
+model.gradient_checkpointing_enable()
+opt = bl.optim.build(model, "muon_fast", lr=2e-5, fused_backward=True)
+for batch in data:
+    loss = bl.parallel.train_step(model, batch, micro=4, optimizer=opt)   # forward + backward + update
+```
+
+Blocks alternate between the GPUs, and each process loads only its own. Every block processes all micro-batches
+before the next one, forward and backward, so one GPU works on block i of micro-batch m while the other works on
+block i+1 of micro-batch m−1. Each block's gradient is accumulated over the micro-batches and applied at once:
+one block of gradients in memory, the same update as the full batch.
+
+Qwen3-8B NVFP4, 8 × 1024 tokens per step, two RTX 5070 Ti:
+
+| layout | tokens/s |
+|---|---:|
+| one GPU | 1 086 |
+| contiguous split, one process | 818 |
+| pipeline, two processes, 4 micro-batches | 1 729 |
+| same with `fp4_all` compute | 1 953 |
+
+**Single process** (any model, simplest):
+
 ```python
 model = bl.io.load("Qwen/Qwen3-8B", bl.quant.presets.default("nvfp4"), device_map="auto",
                    max_memory={0: "13GiB", 1: "11GiB"})       # contiguous layer split, loaded directly per GPU
 # or for a model in memory:  bl.dispatch(model, bl.infer_device_map(model, {0: "12GiB", 1: "12GiB"}))
 ```
 
-Each GPU holds a contiguous run of layers; activations cross the split points, and every parameter is updated on
-its own device during backward. Works with generation, checkpointing and all storage policies.
+Each GPU holds a contiguous run of layers, and the GPUs work one after the other. Use it to fit a model, not for
+speed. Works with generation, checkpointing and all storage policies.
 
 ## Compute
 
@@ -153,11 +181,18 @@ forward, derivative of the expectation), `expect_det`, `ste`, `true`.
 
 ## Status
 
-Version 0.1 (development). Implemented: formats, CUDA step, dequantization and fused factored-direction kernels,
-tensor subclass, quantization API, optimizer (fused backward, row tiles, sparse embeddings, gradient accumulation),
-storage policies, chunked output layer, token-chunked modules, layer split over GPUs, NVFP4 forward on FP4 tensor
-cores, checkpoint IO for dense and pre-quantized layouts. Planned: FP4 backward GEMMs, fused dequantize-GEMM for
-other formats, pipeline schedule, GGUF. See `docs/DESIGN.md`.
+Version 0.1.0. Implemented:
+- formats; CUDA kernels for the step, dequantization, fused factored direction and NVFP4 activation quantization;
+- tensor subclass and quantization API;
+- optimizer with presets: fused backward, row tiles, sparse embeddings, gradient accumulation, Newton–Schulz
+  variants;
+- storage policies; chunked output layer; token-chunked modules;
+- layer split and one-process-per-GPU pipeline;
+- FP4 training path (`fp4`, `fp4_all`);
+- checkpoint IO for dense and pre-quantized layouts.
+
+Verified by fine-tuning Qwen3-0.6B and Qwen3-8B checkpoints. Planned: fused dequantize-GEMM for formats without a
+hardware path, kernels for linear-attention layers of hybrid models, GGUF. See `docs/DESIGN.md`.
 
 ## Tests
 
