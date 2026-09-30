@@ -75,7 +75,7 @@ def main():
     for step in range(1, a.steps + 1):
         x = next(it).cuda()
         with bl.storage.maybe_activations_in_ram(a.storage):
-            loss = model(x[:, :-1], labels=x[:, 1:].contiguous()).loss
+            loss = bl.nn.causal_lm_loss(model, x)                # chunked head + cross-entropy, no full logits
         loss.backward()
         opt.step()
         opt.zero_grad()

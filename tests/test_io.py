@@ -231,3 +231,11 @@ def test_generate_and_gradient_checkpointing(dense_dir):
     opt.step()
     assert all(p.grad is None for p in m.parameters())
     assert torch.isfinite(m(ids, labels=ids).loss)
+
+
+def test_causal_lm_loss_matches_hf(dense_dir):
+    m = bl.io.load(dense_dir, bl.quant.presets.default("int8"), device=DEV, dtype=torch.float32)
+    ids = _ids()
+    ref = m(ids, labels=ids).loss
+    loss = bl.nn.causal_lm_loss(m, ids, chunk=7)
+    assert torch.allclose(loss, ref, rtol=1e-4)
