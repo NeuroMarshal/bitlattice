@@ -366,26 +366,40 @@ class _Stop(Exception):
     pass
 
 
-def _block_inputs(backbone: torch.nn.Module, first_block: torch.nn.Module, input_ids: torch.Tensor, kwargs: dict):
-    """(hidden, block kwargs) as the backbone passes them to its first block (embedding, masks, positions and
-    rotary tables prepared by the model itself); the forward is stopped there."""
-    box = {}
+def _block_inputs(backbone: torch.nn.Module, blocks, input_ids: torch.Tensor | None, kwargs: dict,
+                  inputs_embeds: torch.Tensor | None = None):
+    """(hidden entering the first block, [kwargs of every block]) exactly as the backbone passes them: embedding,
+    per-block masks (hybrid models mix attention types), positions and rotary tables are prepared by the model
+    itself. The blocks are replaced by pass-throughs while recording, so nothing but the preparation runs."""
+    box, saved = {"kwargs": []}, []
 
-    def grab(module, args, kw):
-        box["hidden"], box["kwargs"] = args[0] if args else kw.pop("hidden_states"), dict(kw)
-        raise _Stop
+    def recorder(i):
+        def fwd(*args, **kw):
+            h = args[0] if args else kw.pop("hidden_states")
+            if i == 0:
+                box["hidden"] = h
+            kw.pop("hidden_states", None)
+            box["kwargs"].append(dict(kw))
+            return h
+        return fwd
 
-    h = first_block.register_forward_pre_hook(grab, with_kwargs=True, prepend=True)
+    for i, b in enumerate(blocks):
+        saved.append(b.__dict__.get("forward"))
+        b.forward = recorder(i)
     try:
-        backbone(input_ids=input_ids, use_cache=False, **kwargs)
-    except _Stop:
-        pass
+        if inputs_embeds is not None:
+            backbone(inputs_embeds=inputs_embeds, use_cache=False, **kwargs)
+        else:
+            backbone(input_ids=input_ids, use_cache=False, **kwargs)
     finally:
-        h.remove()
-    if "hidden" not in box:
-        raise RuntimeError("the backbone did not call its first block")
-    box["kwargs"].pop("hidden_states", None)
-    return box["hidden"], box["kwargs"]
+        for b, f in zip(blocks, saved):
+            if f is None:
+                del b.forward
+            else:
+                b.forward = f
+    if len(box["kwargs"]) != len(blocks):
+        raise RuntimeError("the backbone did not call every block once")
+    return box.get("hidden"), box["kwargs"]
 
 
 _NORM_NAMES = ("norm", "final_layernorm", "ln_f", "final_norm", "norm_f")
@@ -399,32 +413,27 @@ def pipelined_causal_lm_loss(model: torch.nn.Module, input_ids: torch.Tensor, la
     (:func:`interleaved_device_map`) one GPU works on block i for micro-batch m while the other works on block i+1
     for micro-batch m-1, forward and backward. Because the backward also runs block-major, a block's gradient is
     complete after its last micro-batch and the fused optimizer update applies it at once: one block of gradients
-    in memory, no stale weights, the same result as the full batch. Requires all blocks to take the same inputs
-    (one attention type)."""
+    in memory, no stale weights, the same result as the full batch."""
     from .nn.loss import linear_cross_entropy
     labels = input_ids if labels is None else labels
     backbone = model.get_decoder() if hasattr(model, "get_decoder") else model.model
     blocks = backbone.layers
-    types = {getattr(b, "attention_type", None) for b in blocks}
-    if len(types) > 1:
-        raise NotImplementedError("blocks with different attention types")
     norm = next((getattr(backbone, n) for n in _NORM_NAMES if hasattr(backbone, n)), None)
     head = model.get_output_embeddings()
     ids_mb, lab_mb = input_ids.chunk(micro, 0), labels.chunk(micro, 0)
     states, per_dev = [], []
     for ids in ids_mb:
-        h, kw = _block_inputs(backbone, blocks[0], ids, kwargs)
+        h, kws = _block_inputs(backbone, blocks, ids, kwargs)
         states.append(h)
-        per_dev.append({h.device: kw})
+        per_dev.append(kws)
     devs = [next(b.parameters()).device for b in blocks]
     tail_dev = head.weight.device
     for i, block in enumerate(blocks):
         dev = devs[i]
         nxt = devs[i + 1] if i + 1 < len(blocks) else tail_dev
         for m in range(len(states)):
-            kw = per_dev[m].get(dev)
-            if kw is None:
-                kw = per_dev[m][dev] = _move(next(iter(per_dev[m].values())), dev)
+            kw = per_dev[m][i]
+            kw = per_dev[m][i] = _move(kw, dev)
             out = block(states[m], **kw)
             out = out[0] if isinstance(out, tuple) else out
             # send each micro-batch on as soon as it is computed, so the next device starts on it while this one

@@ -117,7 +117,15 @@ def _skeleton(config, model_cls, dtype, trust_remote_code):
     return model
 
 
-def _rename(model, name: str) -> str:
+def _rename(model, name: str) -> str | None:
+    """Checkpoint key -> parameter name: user key map (``load(key_map=...)``; a None replacement drops the key),
+    then the model's own conversion mapping."""
+    for pat, rep in (getattr(model, "_bl_key_map", None) or {}).items():
+        if re.search(pat, name):
+            if rep is None:
+                return None
+            name = re.sub(pat, rep, name)
+            break
     mapping = getattr(model, "_checkpoint_conversion_mapping", None) or {}
     for pat, rep in mapping.items():
         new, n = re.subn(pat, rep, name)
@@ -170,7 +178,10 @@ def _estimate_sizes(path: str, model, layout: dict, quant: QuantConfig | None) -
                 if ".__" in k:                                     # bitlattice checkpoint part
                     sizes[k.split(".__", 1)[0]] += n * _DT_BYTES.get(dt, 2)
                     continue
-                prefix, _, suffix = _rename(model, k).rpartition(".")
+                renamed = _rename(model, k)
+                if renamed is None:
+                    continue
+                prefix, _, suffix = renamed.rpartition(".")
                 name = f"{prefix}.weight" if suffix in _PART_SUFFIXES and prefix in modules else \
                     (f"{prefix}.{suffix}" if prefix else suffix)
                 b = n * _DT_BYTES.get(dt, 2)
@@ -225,7 +236,7 @@ def _device_plan(path, model, layout, quant, device, device_map, max_memory):
 def load(path_or_id: str, quant: QuantConfig | None = None, *, device: str | torch.device = "cuda",
          device_map: str | dict | None = None, max_memory: dict | None = None, dtype: torch.dtype = torch.bfloat16,
          model_cls=None, trust_remote_code: bool = False, revision: str | None = None,
-         requantize: bool = False) -> torch.nn.Module:
+         requantize: bool = False, config=None, key_map: dict | None = None) -> torch.nn.Module:
     """Load a model (local directory or hub id) directly into lattice formats.
 
     quant       -- QuantConfig for dense weights (None: keep dense in ``dtype``). Pre-quantized checkpoints keep
@@ -234,16 +245,21 @@ def load(path_or_id: str, quant: QuantConfig | None = None, *, device: str | tor
                    the checkpoint headers and ``max_memory``), 'interleaved[:chunk]' (blocks round-robin over the GPUs
                    for ``bitlattice.parallel.pipelined_causal_lm_loss``) or {module name: device}
     model_cls   -- transformers class to instantiate (default: from config.architectures).
+    config      -- model config to use instead of the checkpoint's (e.g. the text part of a multimodal model).
+    key_map     -- {regex: replacement or None} applied to checkpoint keys; None drops the tensor (e.g.
+                   ``{r"^model\.visual\.": None, r"^model\.language_model\.": "model."}``).
     """
     from safetensors import safe_open
     from transformers import AutoConfig
 
     path = _resolve(path_or_id, revision)
-    config = AutoConfig.from_pretrained(path, trust_remote_code=trust_remote_code)
-    layout = detect_layout(path, config)
+    full_config = AutoConfig.from_pretrained(path, trust_remote_code=trust_remote_code)
+    layout = detect_layout(path, full_config)
+    config = config or full_config
     if layout["kind"] == "bitlattice":
         return _load_bitlattice(path, config, model_cls, dtype, device, trust_remote_code, device_map, max_memory)
     model = _skeleton(config, model_cls, dtype, trust_remote_code)
+    model._bl_key_map = dict(key_map or {})
     params = dict(model.named_parameters(remove_duplicate=False))
     buffers = dict(model.named_buffers())
     modules = dict(model.named_modules())
@@ -255,7 +271,10 @@ def load(path_or_id: str, quant: QuantConfig | None = None, *, device: str | tor
         with safe_open(shard, framework="pt", device="cpu") as f:
             by_prefix: dict[str, dict[str, str]] = defaultdict(dict)
             for k in f.keys():
-                prefix, _, suffix = _rename(model, k).rpartition(".")
+                renamed = _rename(model, k)
+                if renamed is None:
+                    continue
+                prefix, _, suffix = renamed.rpartition(".")
                 by_prefix[prefix][suffix] = k
             for prefix, sfx in by_prefix.items():
                 packed = _packed_parts(f, sfx, layout["kind"]) if prefix in modules else None

@@ -99,27 +99,14 @@ def _plan(model) -> list[_Segment]:
     return segs
 
 
-def _block_kwargs(backbone, first_block, ids, embed: bool, width: int, dtype, device):
-    """(hidden or None, kwargs) for the first block, prepared by the model on this process's device."""
+def _block_kwargs(backbone, blocks, ids, embed: bool, width: int, dtype, device):
+    """(hidden or None, [kwargs per block]) prepared by the model on this process's device."""
     if embed:
-        return P._block_inputs(backbone, first_block, ids, {})
+        return P._block_inputs(backbone, blocks, ids, {})
     dummy = torch.empty(*ids.shape, width, dtype=dtype, device=device)
-    box = {}
-
-    def grab(module, args, kw):
-        box["kwargs"] = dict(kw)
-        raise P._Stop
-
-    h = first_block.register_forward_pre_hook(grab, with_kwargs=True, prepend=True)
-    try:
-        with torch.no_grad():
-            backbone(inputs_embeds=dummy, use_cache=False)
-    except P._Stop:
-        pass
-    finally:
-        h.remove()
-    box["kwargs"].pop("hidden_states", None)
-    return None, box["kwargs"]
+    with torch.no_grad():
+        _, kws = P._block_inputs(backbone, blocks, None, {}, inputs_embeds=dummy)
+    return None, kws
 
 
 class _RunAhead:
@@ -170,7 +157,7 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
     ins, outs, losses, keep = {}, {}, {}, []
     ahead = _RunAhead(max(1, run_ahead))
     with grad:
-        prep = [_block_kwargs(backbone, blocks[0], ids, embed_here, width, dtype, dev) for ids in ids_mb]
+        prep = [_block_kwargs(backbone, blocks, ids, embed_here, width, dtype, dev) for ids in ids_mb]
         for s, seg in enumerate(segs):
             if seg.owner != me:
                 continue
@@ -188,7 +175,7 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                     if item[0] == "embed":
                         y = prep[m][0]
                     elif item[0] == "block":
-                        out = blocks[item[1]](y, **prep[m][1])
+                        out = blocks[item[1]](y, **prep[m][1][item[1]])
                         y = out[0] if isinstance(out, tuple) else out
                     else:
                         from .nn.loss import linear_cross_entropy
