@@ -131,12 +131,19 @@ def accuracy(model, input_ids: torch.Tensor, hidden: torch.Tensor | None = None,
     return out
 
 
-def mtp_extra_loss(weight: float = 0.3, pos_offset: int = 1, chunk: int = 1024):
-    """``extra_loss`` for :func:`bitlattice.parallel.train_step`: the MTP head trained jointly with the model."""
+def mtp_extra_loss(weight: float = 0.3, pos_offset: int = 1, chunk: int = 1024, checkpoint: bool = True):
+    """``extra_loss`` for :func:`bitlattice.parallel.train_step`: the MTP head trained jointly with the model.
+    ``checkpoint``: recompute the MTP block in backward (its loss over the vocabulary is not recomputed)."""
+    from torch.utils.checkpoint import checkpoint as ckpt
+
     from ..nn.loss import linear_cross_entropy
 
     def fn(model, hidden, input_ids, labels, next_embeds):
-        m = mtp_hidden(model, hidden, input_ids, pos_offset, next_embeds)
+        if checkpoint and torch.is_grad_enabled():
+            m = ckpt(lambda h, e: mtp_hidden(model, h, input_ids, pos_offset, e), hidden, next_embeds,
+                     use_reentrant=False)
+        else:
+            m = mtp_hidden(model, hidden, input_ids, pos_offset, next_embeds)
         head = model.get_output_embeddings()
         return weight * linear_cross_entropy(m[:, :-1], head.weight, labels[:, 2:].to(head.weight.device), None,
                                              chunk)

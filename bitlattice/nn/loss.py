@@ -4,6 +4,12 @@
 processed in chunks, the forward keeps only per-token log-sum-exp values, and the backward recomputes each chunk's
 logits to form d(hidden) and d(weight). The weight gradient is accumulated in one dense buffer (or returned per
 chunk to a callback for fused updates).
+
+With a frozen output layer (no gradient for the weight and bias) the gradient for ``hidden`` is formed in the forward
+pass instead: one pass over vocabulary tiles with an online softmax (running maximum and sum, as in flash
+attention) accumulates both the log-sum-exp and softmax-weighted rows of the weight, so each tile costs two GEMMs,
+nothing is recomputed in backward and only the [tokens, hidden] gradient is kept. Checkpointing such a head is
+unnecessary (and would repeat the work).
 """
 from __future__ import annotations
 
@@ -18,9 +24,63 @@ def _dense(w: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return w.dequantize(dtype) if isinstance(w, LatticeTensor) else w.to(dtype)
 
 
+_VOCAB_TILE_BYTES = 128 << 20          # fp32 logits per vocabulary tile in the gradient-in-forward pass
+
+
+def _grad_in_forward(h, W, bias, y, valid, chunk, dtype):
+    """(lse, target logit, d loss_sum / d h) per token with one pass over vocabulary tiles."""
+    n, d = h.shape
+    V = W.shape[0]
+    lse = torch.empty(n, dtype=torch.float32, device=h.device)
+    tgt = torch.empty(n, dtype=torch.float32, device=h.device)
+    gh = torch.empty(n, d, dtype=h.dtype if h.dtype in (torch.bfloat16, torch.float16) else torch.float32,
+                     device=h.device)
+    for s in range(0, n, chunk):
+        hc = h[s:s + chunk].to(dtype)
+        c = hc.shape[0]
+        vt = max(128, min(V, _VOCAB_TILE_BYTES // (4 * c)))
+        vt -= vt % 128 if vt < V else 0
+        m = torch.full((c,), float("-inf"), device=h.device)
+        z = torch.zeros(c, device=h.device)
+        acc = torch.zeros(c, d, device=h.device)
+        yc = y[s:s + chunk]
+        tg = torch.zeros(c, device=h.device)
+        for v0 in range(0, V, vt):
+            v1 = min(V, v0 + vt)
+            L = (hc @ W[v0:v1].t()).float()
+            if bias is not None:
+                L += bias[v0:v1].float()
+            inside = (yc >= v0) & (yc < v1)
+            tg += torch.where(inside, L.gather(1, (yc - v0).clamp(0, v1 - v0 - 1)[:, None]).squeeze(1), 0.0)
+            m_new = torch.maximum(m, L.amax(1))
+            r = torch.exp(m - m_new)                                    # rescale of the previous tiles
+            P = L.sub_(m_new[:, None]).exp_()
+            z = z * r + P.sum(1)
+            acc.mul_(r[:, None]).add_((P.to(dtype) @ W[v0:v1].to(dtype)).float())
+            m = m_new
+        lse[s:s + chunk] = m + z.log()
+        tgt[s:s + chunk] = tg
+        g = acc / z[:, None] - W[yc].float()                           # softmax rows minus the target row
+        gh[s:s + chunk] = (g * valid[s:s + chunk, None]).to(gh.dtype)
+    return lse, tgt, gh
+
+
 class _LinearCE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, weight, bias, labels, chunk: int, ignore_index: int, dtype):
+        ctx.in_forward = (ctx.needs_input_grad[0] and not ctx.needs_input_grad[1]
+                          and not (bias is not None and ctx.needs_input_grad[2]))
+        if ctx.in_forward:
+            h = hidden.reshape(-1, hidden.shape[-1])
+            y = labels.reshape(-1)
+            valid = y != ignore_index
+            ysafe = torch.where(valid, y, torch.zeros_like(y))
+            lse, tgt, gh = _grad_in_forward(h, _dense(weight, dtype), bias, ysafe, valid.float(), chunk, dtype)
+            count = valid.sum().clamp_min(1)
+            loss = ((lse - tgt) * valid).sum() / count
+            ctx.save_for_backward(gh, count)
+            ctx.shape, ctx.hdtype = hidden.shape, hidden.dtype
+            return loss
         h = hidden.reshape(-1, hidden.shape[-1])
         y = labels.reshape(-1)
         W = _dense(weight, dtype)
@@ -45,6 +105,10 @@ class _LinearCE(torch.autograd.Function):
     def backward(ctx, g):
         """Vocabulary tiles outer, token chunks inner: each weight-gradient tile is accumulated in fp32 once and
         written in the weight dtype, so no fp32 buffer of the full [vocab, hidden] gradient is needed."""
+        if ctx.in_forward:
+            gh, count = ctx.saved_tensors
+            out = (gh.float() * (g / count).float()).to(ctx.hdtype).reshape(ctx.shape)
+            return out, None, None, None, None, None, None
         hidden, lse, ysafe, valid, count = ctx.saved_tensors
         weight, bias, chunk, dtype = ctx.weight, ctx.bias, ctx.chunk, ctx.dtype
         h = hidden.reshape(-1, hidden.shape[-1])

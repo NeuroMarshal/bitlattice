@@ -52,3 +52,28 @@ def test_peak_memory_below_full_logits():
     torch.nn.functional.cross_entropy(torch.nn.functional.linear(h, w).float(), y).backward()
     dense = torch.cuda.max_memory_allocated() - base
     assert peak < 0.35 * dense, (peak, dense)
+
+
+@pytest.mark.parametrize("bias", [False, True])
+def test_gradient_in_forward_for_frozen_head(bias):
+    torch.manual_seed(3)
+    n, d, V = 300, 64, 1000
+    h = torch.randn(n, d, device="cuda", dtype=torch.bfloat16)
+    W = torch.randn(V, d, device="cuda", dtype=torch.bfloat16) * 0.1
+    b = torch.randn(V, device="cuda", dtype=torch.bfloat16) * 0.1 if bias else None
+    y = torch.randint(0, V, (n,), device="cuda")
+    y[::7] = -100
+    h1 = h.clone().requires_grad_(True)
+    ref = torch.nn.functional.cross_entropy((h1.float() @ W.float().t() + (b.float() if bias else 0)), y)
+    ref.backward()
+    h2 = h.clone().requires_grad_(True)
+    import bitlattice.nn.loss as L
+    old = L._VOCAB_TILE_BYTES
+    L._VOCAB_TILE_BYTES = 4 * 128 * 128                      # several vocabulary tiles
+    try:
+        got = bl.nn.linear_cross_entropy(h2, W, y, b, chunk=128)
+        (2.0 * got).backward()
+    finally:
+        L._VOCAB_TILE_BYTES = old
+    assert abs(got.item() - ref.item()) < 2e-2 * abs(ref.item())
+    assert ((h2.grad.float() / 2 - h1.grad.float()).norm() / h1.grad.float().norm()).item() < 2e-2

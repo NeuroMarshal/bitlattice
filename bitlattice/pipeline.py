@@ -224,7 +224,7 @@ class _RunAhead:
 
 def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = None, *, micro: int = 4,
                optimizer=None, backward: bool = True, chunk: int = 1024, run_ahead: int = 3,
-               extra_loss=None, offload_activations: bool = False, checkpoint_head: bool = True) -> torch.Tensor:
+               extra_loss=None, offload_activations: bool = False, checkpoint_head="auto") -> torch.Tensor:
     """Forward (and backward) of a causal LM batch over all processes; returns the mean next-token loss (the same
     value on every process). Every process must call it with the same ``input_ids`` / ``labels``.
 
@@ -240,7 +240,8 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                  checkpointed blocks) in pinned host memory: GPU memory then no longer grows with the number of
                  tokens per step beyond one unit's working set.
     checkpoint_head -- recompute the head (final norm, loss over the vocabulary, extra heads) in backward instead of
-                 keeping its activations."""
+                 keeping its activations; 'auto': only when the output layer is trained (a frozen one gets its input
+                 gradient in forward, so extra heads should checkpoint their own blocks)."""
     me = dist.get_rank()
     dev = model.bl_local_device
     segs = getattr(model, "_bl_pipeline_plan", None)
@@ -316,8 +317,11 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                                                extra_loss)
                         # the head (final norm, vocabulary-wide loss, extra heads) is recomputed in backward, so only
                         # its input lives from forward to backward
-                        loss = (checkpoint(fn, y, e, use_reentrant=False) if backward and checkpoint_head
-                                else fn(y, e))
+                        # with a frozen output layer the loss forms its input gradient in forward and keeps only
+                        # that: recomputing it would repeat the vocabulary-wide work for nothing
+                        ckpt = (checkpoint_head if checkpoint_head != "auto" else
+                                getattr(getattr(head, "weight", None), "requires_grad", True))
+                        loss = (checkpoint(fn, y, e, use_reentrant=False) if backward and ckpt else fn(y, e))
                         losses[m] = loss * (n_tok[m] / sum(n_tok))
                         y = None
                     if offload is not None and (s, j, m) in ins and item[0] == "block":
