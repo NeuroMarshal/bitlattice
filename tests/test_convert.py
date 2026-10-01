@@ -106,3 +106,25 @@ def test_checkpointed_decoder_layers_keep_their_attributes_and_gradients():
     assert torch.equal(la, lb)
     for (n, pa), (_, pb) in zip(a.named_parameters(), b.named_parameters()):
         assert torch.allclose(pa.grad, pb.grad, atol=1e-3, rtol=1e-2), n
+
+
+def test_unfit_modules_are_skipped_with_a_reason_when_asked(caplog):
+    class OddRMSNorm(torch.nn.Module):            # an RMSNorm by name, but not a convention the library implements
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(16))
+            self.eps = 1e-6
+
+        def forward(self, x):
+            return x * self.weight + 1
+
+    m = torch.nn.Sequential(OddRMSNorm(), torch.nn.Linear(16, 16)).to(DEV)
+    with torch.device("meta"):                    # a module another pipeline process holds
+        m.append(OddRMSNorm())
+    with pytest.raises(ValueError, match="not an RMSNorm convention"):
+        bl.surgery.convert_(m, OddRMSNorm, "rms_norm")
+    with caplog.at_level("INFO", logger="bitlattice"):
+        assert bl.surgery.convert_(m, OddRMSNorm, "rms_norm", skip_unfit=True) == []
+    assert "not an RMSNorm convention" in caplog.text and "meta" in caplog.text
+    with pytest.raises(TypeError):                # invalid options are never skipped
+        bl.surgery.convert_(m, "1", "token_chunks", chunk=4, colour="red", skip_unfit=True)

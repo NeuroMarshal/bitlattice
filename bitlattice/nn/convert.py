@@ -34,6 +34,7 @@ Conversions:
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import Callable
@@ -235,14 +236,19 @@ class CompressedSaves(Converted):
 
 @dataclass(frozen=True)
 class Conversion:
-    """``applies(module)``: whether the module can be converted; ``make(module, **options)``: the new module;
-    ``probe(module)``: inputs for the agreement check (None for lossy conversions, which are not checked)."""
+    """``applies(module)``: whether the module can be converted; ``make(module, **options)``: the new module (raises
+    :class:`Unfit` with the reason when it finds that the module does not fit); ``probe(module)``: inputs for the
+    agreement check (None for lossy conversions, which are not checked)."""
 
     describe: str
     applies: Callable[[torch.nn.Module], bool]
     make: Callable[..., torch.nn.Module]
     probe: Callable[[torch.nn.Module], tuple] | None
     tol: float = 2e-2
+
+
+class Unfit(ValueError):
+    """Raised by a conversion's ``make``: the module cannot be converted; the message says why."""
 
 
 def _eps(m) -> float | None:
@@ -263,12 +269,16 @@ def _device(m) -> torch.device:
     return p.device if p is not None else torch.device("cuda")
 
 
-def _make_rms(m, **_):
+def _make_rms(m):
     from .norm import _convention
     eps = _eps(m)
-    conv = _convention(m, eps) if eps is not None else None
+    if eps is None:
+        raise Unfit("no eps / variance_epsilon attribute")
+    if m.weight.device.type == "meta":
+        raise Unfit("parameters not materialized (meta): the normalization convention cannot be checked")
+    conv = _convention(m, eps)
     if conv is None:
-        raise ValueError(f"{type(m).__name__}: not an RMSNorm convention this library implements")
+        raise Unfit("not an RMSNorm convention this library implements")
     return RMSNorm(m, eps, conv[1], conv[2])
 
 
@@ -291,36 +301,41 @@ _CONVERSIONS: dict[str, Conversion] = {
     "gated_rms_norm": Conversion(
         "lean normalize-then-gate (SiLU) RMSNorm",
         lambda m: type(m).__name__.endswith("RMSNormGated") and _eps(m) is not None,
-        lambda m, **_: GatedRMSNorm(m, _eps(m)),
+        lambda m: GatedRMSNorm(m, _eps(m)),
         lambda m: (torch.randn(4, m.weight.shape[0], device=_device(m), dtype=_wdtype(m)),
                    torch.randn(4, m.weight.shape[0], device=_device(m), dtype=_wdtype(m)))),
     "gated_delta_net": Conversion(
         "GatedDeltaNet: fused convolution, q / k in their own heads, optional seq_chunk pieces",
         lambda m: all(hasattr(m, k) for k in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "conv1d",
                                               "A_log", "dt_bias", "norm", "out_proj")),
-        lambda m, seq_chunk=0, **_: GatedDeltaNet(m, seq_chunk),
+        lambda m, seq_chunk=0: GatedDeltaNet(m, seq_chunk),
         lambda m: (torch.randn(1, 128, m.hidden_size, device=_device(m), dtype=_wdtype(m)) * 0.5,)),
     "token_chunks": Conversion(
         "position-wise module over pieces of `chunk` tokens, each recomputed in backward",
         lambda m: _width(m) is not None,
-        lambda m, chunk=2048, dim=-2, checkpoint=True, **_: TokenChunks(m, chunk, dim, checkpoint),
+        lambda m, *, chunk, dim=-2, checkpoint=True: TokenChunks(m, chunk, dim, checkpoint),
         lambda m: (torch.randn(2, 96, _width(m), device=_device(m), dtype=_wdtype(m)),)),
     "checkpoint": Conversion(
         "recompute in backward (inputs kept); `saved` packs the recomputed saved tensors ('fp8' / 'nvfp4')",
         lambda m: True,
-        lambda m, saved=None, min_numel=1 << 16, **_: Checkpointed(m, saved, min_numel),
+        lambda m, saved=None, min_numel=1 << 16: Checkpointed(m, saved, min_numel),
         None),
     "compressed_saves": Conversion(
         "tensors saved for backward inside the module stored as `fmt` ('fp8' / 'nvfp4'; lossy, not checked)",
         lambda m: True,
-        lambda m, fmt="fp8", min_numel=1 << 16, **_: CompressedSaves(m, fmt, min_numel),
+        lambda m, fmt="fp8", min_numel=1 << 16: CompressedSaves(m, fmt, min_numel),
         None),
 }
 
 
+def _options(conv: Conversion) -> str:
+    params = list(inspect.signature(conv.make).parameters.values())[1:]
+    return ", ".join(str(p) for p in params) or "none"
+
+
 def conversions() -> dict[str, str]:
-    """Available conversions and what they do."""
-    return {k: c.describe for k, c in _CONVERSIONS.items()}
+    """Available conversions: what each does and its options."""
+    return {k: f"{c.describe}; options: {_options(c)}" for k, c in _CONVERSIONS.items()}
 
 
 def register_conversion(name: str, conversion: Conversion) -> None:
@@ -353,6 +368,10 @@ def convert_(model: torch.nn.Module, target: Selector, to: str, *, check: bool =
     if to not in _CONVERSIONS:
         raise ValueError(f"unknown conversion {to!r}; available: {sorted(_CONVERSIONS)}")
     conv = _CONVERSIONS[to]
+    try:
+        inspect.signature(conv.make).bind(None, **options)
+    except TypeError as e:
+        raise TypeError(f"conversion {to!r}: {e}; its options: {_options(conv)}") from None
     chosen = select(model, target, outermost=True)
     if not chosen:
         raise ValueError(f"no module matches {target!r}")
@@ -374,7 +393,10 @@ def _refusal(conv: Conversion, to: str, m: torch.nn.Module, options: dict, check
     """The converted module, or the reason why ``m`` cannot be converted."""
     if not conv.applies(m):
         return f"cannot be converted to {to!r}"
-    new = conv.make(m, **options)
+    try:
+        new = conv.make(m, **options)
+    except Unfit as e:
+        return str(e)
     if check and conv.probe is not None and next(m.parameters(), torch.empty(0)).device.type != "meta":
         inputs = conv.probe(m)
         with torch.no_grad():
