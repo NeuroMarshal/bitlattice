@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import logging
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -26,9 +27,12 @@ import torch
 
 from . import formats as F
 
+log = logging.getLogger("bitlattice")
+
 __all__ = ["Fp4Recipe", "FP4_RECIPES", "Fp4Operand", "Mx8Operand", "is_nvfp4", "fp4_supported", "mxfp8_supported",
            "fp4_unfit", "mx_unfit", "to_blocked", "quantize_fp4", "fp4_mm", "mx_mm", "rht_last", "nvfp4_linear",
            "defer_wgrad", "flush_wgrad", "pending_wgrad", "clear_shared", "drop_cached"]
+
 
 @dataclass(frozen=True)
 class Fp4Recipe:
@@ -129,7 +133,8 @@ def mxfp8_supported(device_index: int) -> bool:
         s = torch.full((128 * 4,), 127, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
         torch._scaled_mm(a, a.t(), scale_a=s, scale_b=s, out_dtype=torch.bfloat16)
         return True
-    except Exception:
+    except (RuntimeError, NotImplementedError) as e:
+        log.info("cuda:%d: no MXFP8 GEMM through PyTorch (%s)", device_index, str(e).splitlines()[0][:200])
         return False
 
 
@@ -222,7 +227,9 @@ def _two_level(device_index: int) -> bool:
         one = torch.ones((), device=dev)
         _scaled_mm_2l(a, a, s, s, one, one, torch.bfloat16)
         return True
-    except Exception:                                    # older torch / unsupported device: GEMM + scale kernel
+    except (RuntimeError, NotImplementedError, TypeError) as e:   # older torch / device: GEMM + scale kernel
+        log.info("cuda:%d: no two-level NVFP4 GEMM (%s); the global scale is applied after the GEMM",
+                 device_index, str(e).splitlines()[0][:200])
         return False
 
 

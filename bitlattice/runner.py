@@ -81,12 +81,12 @@ class Runner:
         input_ids, labels = self._on_input_device(input_ids, labels)
         labels = input_ids if labels is None else labels
         ids_mb, lab_mb = input_ids.chunk(self.micro, 0), labels.chunk(self.micro, 0)
-        counts = [int((lab[:, 1:] != -100).sum()) for lab in lab_mb]
-        total = max(1, sum(counts))
+        counts = torch.stack([(lab[:, 1:] != -100).sum() for lab in lab_mb])     # weights stay on the GPU: no sync
+        share = counts / counts.sum().clamp_min(1)
         loss_sum = None
         for i, (ids, lab) in enumerate(zip(ids_mb, lab_mb)):
             with activations_in_ram() if self.memory.activations == "ram" else contextlib.nullcontext():
-                loss = causal_lm_loss(self.model, ids, lab, chunk=self.loss_chunk) * (counts[i] / total)
+                loss = causal_lm_loss(self.model, ids, lab, chunk=self.loss_chunk) * share[i]
             accumulate = self.optimizer.accumulate() if self._fused and i < len(ids_mb) - 1 else \
                 contextlib.nullcontext()
             with accumulate, backend.defer_wgrad() if self.defer_wgrad else contextlib.nullcontext():
