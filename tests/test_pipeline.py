@@ -41,7 +41,7 @@ def test_two_process_pipeline_matches_single_gpu(dense_dir, tmp_path, offload):
     m.config.use_cache = False
     m.gradient_checkpointing_enable()
     m.train()
-    opt = bl.optim.build(m, "muon", lr=3e-3, fused_backward=True, seed=0)
+    opt = bl.optim.Lattice(m, "muon", lr=3e-3, fused_backward=True, seed=0)
     x = torch.randint(0, 128, (4, 13), generator=torch.Generator().manual_seed(1000)).cuda()
     ref = []
     for _ in range(8):

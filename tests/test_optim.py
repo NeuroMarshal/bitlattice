@@ -44,12 +44,12 @@ def _train(student, teacher, opt, steps=400, bs=256, d_in=64, seed=2):
 def test_trains_in_format(fmt, preset):
     teacher, student = _teacher_student()
     if fmt != "bf16":
-        bl.quantize_(student, format=fmt, min_features=16, targets=(torch.nn.Linear,))
+        bl.surgery.quantize_(student, "*", fmt, min_features=16, targets=(torch.nn.Linear,))
         assert isinstance(student[0].weight, LatticeTensor)
     else:
         student.to(torch.bfloat16)
         teacher.to(torch.bfloat16)
-    opt = bl.optim.build(student, preset, lr=1e-2)
+    opt = bl.optim.Lattice(student, preset, lr=1e-2)
     losses = _train(student, teacher, opt)
     start, end = sum(losses[:10]) / 10, sum(losses[-20:]) / 20
     assert end < 0.35 * start, (start, end)
@@ -61,9 +61,9 @@ def test_fused_backward_matches_step():
     teacher, s1 = _teacher_student(seed=3)
     _, s2 = _teacher_student(seed=3)
     for s in (s1, s2):
-        bl.quantize_(s, format="int4", min_features=16)
-    o1 = bl.optim.build(s1, "muon", lr=5e-3)
-    o2 = bl.optim.build(s2, "muon", lr=5e-3, fused_backward=True)
+        bl.surgery.quantize_(s, "*", "int4", min_features=16)
+    o1 = bl.optim.Lattice(s1, "muon", lr=5e-3)
+    o2 = bl.optim.Lattice(s2, "muon", lr=5e-3, fused_backward=True)
     l1 = _train(s1, teacher, o1, steps=30)
     l2 = _train(s2, teacher, o2, steps=30)
     assert l1 == l2
@@ -73,14 +73,14 @@ def test_fused_backward_matches_step():
 
 def test_state_accounting_and_state_dict():
     teacher, student = _teacher_student()
-    bl.quantize_(student, format="nvfp4", min_features=16)
-    opt = bl.optim.build(student, "muon", lr=1e-2)
+    bl.surgery.quantize_(student, "*", "nvfp4", min_features=16)
+    opt = bl.optim.Lattice(student, "muon", lr=1e-2)
     _train(student, teacher, opt, steps=3)
     bits = opt.state_bits()
     n = sum(p.numel() for p in student.parameters())
     assert bits["phase"] == 2 * n and bits["momentum"] == 0
     sd = opt.state_dict()
-    opt2 = bl.optim.build(student, "muon", lr=1e-2)
+    opt2 = bl.optim.Lattice(student, "muon", lr=1e-2)
     opt2.load_state_dict(sd)
     k = next(iter(opt.state))
     assert torch.equal(opt2.state[k]["phase"], opt.state[k]["phase"])
@@ -96,9 +96,9 @@ def test_options_validated():
 
 def test_keep_columns_train():
     teacher, student = _teacher_student()
-    bl.quantize_(student, format="int3", keep=0.1, min_features=16)
+    bl.surgery.quantize_(student, "*", "int3", keep=0.1, min_features=16)
     before = student[0].weight.hi_val.clone()
-    opt = bl.optim.build(student, "muon", lr=1e-2)
+    opt = bl.optim.Lattice(student, "muon", lr=1e-2)
     losses = _train(student, teacher, opt, steps=200)
     assert not torch.equal(student[0].weight.hi_val, before)
     assert sum(losses[-20:]) / 20 < 0.5 * sum(losses[:10]) / 10
@@ -108,8 +108,8 @@ def test_discrete_activation_trains():
     torch.manual_seed(0)
     net = torch.nn.Sequential(torch.nn.Linear(32, 64), bl.nn.DiscreteAct("sign", "expect"),
                               torch.nn.Linear(64, 1)).to(DEV)
-    bl.quantize_(net, format="int4", min_features=16)
-    opt = bl.optim.build(net, "muon", lr=1e-2)
+    bl.surgery.quantize_(net, "*", "int4", min_features=16)
+    opt = bl.optim.Lattice(net, "muon", lr=1e-2)
     g = torch.Generator(device=DEV).manual_seed(0)
     w = torch.randn(32, device=DEV, generator=g)
     losses = []
@@ -129,9 +129,9 @@ def test_state_in_ram_matches_gpu_state(fused):
     teacher, s1 = _teacher_student(seed=5)
     _, s2 = _teacher_student(seed=5)
     for s in (s1, s2):
-        bl.quantize_(s, format="nvfp4", min_features=16)
-    o1 = bl.optim.build(s1, "muon", lr=5e-3, fused_backward=fused)
-    o2 = bl.optim.build(s2, "muon", lr=5e-3, fused_backward=fused, storage="state_in_ram")
+        bl.surgery.quantize_(s, "*", "nvfp4", min_features=16)
+    o1 = bl.optim.Lattice(s1, "muon", lr=5e-3, fused_backward=fused)
+    o2 = bl.optim.Lattice(s2, "muon", lr=5e-3, fused_backward=fused, state="ram")
     l1 = _train(s1, teacher, o1, steps=25)
     l2 = _train(s2, teacher, o2, steps=25)
     assert l1 == l2
@@ -145,7 +145,7 @@ def test_state_in_ram_matches_gpu_state(fused):
 
 def test_activations_in_ram_same_gradients():
     teacher, s1 = _teacher_student(seed=6)
-    bl.quantize_(s1, format="int4", min_features=16)
+    bl.surgery.quantize_(s1, "*", "int4", min_features=16)
     x = torch.randn(64, 64, device=DEV)
     y = teacher(x).detach()
     torch.nn.functional.mse_loss(s1(x), y).backward()
@@ -161,8 +161,8 @@ def test_activations_in_ram_same_gradients():
 
 def test_plan_reports_compression():
     _, student = _teacher_student()
-    bl.quantize_(student, format="nvfp4", min_features=16)
-    opt = bl.optim.build(student, "muon", fused_backward=True)
+    bl.surgery.quantize_(student, "*", "nvfp4", min_features=16)
+    opt = bl.optim.Lattice(student, "muon", fused_backward=True)
     p = bl.plan(student, opt)
     assert p.bits_per_weight < 8 and p.state_gpu_bytes > 0 and "weights" in str(p)
 
@@ -197,7 +197,7 @@ def test_sparse_embedding_updates_only_referenced_rows(fmt):
     if fmt == "bf16":
         emb.to(torch.bfloat16)
     else:
-        bl.quantize_(emb, format=fmt, targets=(torch.nn.Embedding,), min_features=16)
+        bl.surgery.quantize_(emb, "*", fmt, targets=(torch.nn.Embedding,), min_features=16)
     before = (emb.weight.dequantize(torch.float32) if fmt != "bf16" else emb.weight.detach().float()).clone()
     opt = bl.Lattice(emb.parameters(), lr=0.1, direction="factored")
     idx = torch.tensor([[3, 7, 7, 900]], device=DEV)
@@ -216,7 +216,7 @@ def test_tied_dense_and_sparse_gradients_accumulate():
     torch.manual_seed(0)
     emb = torch.nn.Embedding(128, 64, device=DEV)
     head = torch.nn.Linear(64, 128, bias=False, device=DEV)
-    bl.quantize_(emb, format="nvfp4", targets=(torch.nn.Embedding,), min_features=16)
+    bl.surgery.quantize_(emb, "*", "nvfp4", targets=(torch.nn.Embedding,), min_features=16)
     head.weight = emb.weight
     idx = torch.tensor([[1, 2, 3]], device=DEV)
     head(emb(idx)).sum().backward()
@@ -252,7 +252,7 @@ def test_row_normalization_matches_reference_and_tiles():
         o2.step()
     assert torch.allclose(o1.state[p1]["nv"], o2.state[p2]["nv"], rtol=1e-3)
     lin = torch.nn.Linear(16, 8).to(DEV)
-    opt = bl.optim.build(lin, "normuon")
+    opt = bl.optim.Lattice(lin, "normuon")
     lin(torch.randn(4, 16, device=DEV)).square().mean().backward()
     opt.step()
     assert opt.state[lin.weight]["nv"].shape == (8,) and "nv" not in opt.state[lin.bias]
@@ -261,8 +261,8 @@ def test_row_normalization_matches_reference_and_tiles():
 @pytest.mark.parametrize("momentum", ["fp32", "bf16", "int8", "fp8", "nvfp4"])
 def test_low_precision_momentum_trains(momentum):
     teacher, student = _teacher_student()
-    bl.quantize_(student, format="nvfp4", min_features=16, targets=(torch.nn.Linear,))
-    opt = bl.optim.build(student, "normuon", lr=1e-2, momentum=momentum, beta1=0.9)
+    bl.surgery.quantize_(student, "*", "nvfp4", min_features=16, targets=(torch.nn.Linear,))
+    opt = bl.optim.Lattice(student, "normuon", lr=1e-2, momentum=momentum, beta1=0.9)
     losses = _train(student, teacher, opt)
     start, end = sum(losses[:10]) / 10, sum(losses[-20:]) / 20
     assert end < 0.35 * start, (momentum, start, end)
@@ -291,7 +291,7 @@ def test_low_precision_momentum_in_host_memory_matches_gpu(momentum):
     w = torch.randn(64, 256, device=DEV) * 0.05
     ps = [torch.nn.Parameter(LatticeTensor.from_float(w, "nvfp4", dtype=torch.bfloat16)) for _ in range(2)]
     opts = [bl.Lattice([ps[0]], lr=1e-2, momentum=momentum, normalize="row"),
-            bl.Lattice([ps[1]], lr=1e-2, momentum=momentum, normalize="row", state_device="cpu")]
+            bl.Lattice([ps[1]], lr=1e-2, momentum=momentum, normalize="row", state="ram")]
     for s in range(4):
         g = (torch.randn(64, 256, device=DEV) * (s + 1)).to(torch.bfloat16)
         for p, o in zip(ps, opts):

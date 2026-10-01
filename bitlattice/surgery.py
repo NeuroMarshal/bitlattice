@@ -10,24 +10,32 @@ rounding to nearest, so untouched entries keep their values up to that re-quanti
     select_(model, name, index, dim) keep / reorder slices (pruning channels, permutations)
     set_parameter(model, name, t)    swap the Parameter object itself (tied references follow)
 
-Module level: drop_modules, replace_module, insert_module, sync_shapes_ (module attributes such as in_features or
-num_embeddings from the actual weights). Parameters on the meta device (owned by another pipeline process) are
-edited in shape only.
+Module level (``target`` is a selector, see :mod:`bitlattice.select`):
 
-Task-level edits are compositions of these, e.g. :func:`extend_vocab`.
+    quantize_(model, target, fmt)    weights of the selected layers into a lattice format    / dequantize_
+    convert_(model, target, to)      layers into Bitlattice modules (same parameter objects)  / revert_
+    set_compute_(model, target, c)   how the selected layers compute
+    freeze_(model, target)           no gradients for their parameters                       / unfreeze_
+    drop_, replace_, insert_         remove, swap or add modules
+    sync_shapes_                     module attributes (in_features, num_embeddings) from the actual weights
+
+Parameters on the meta device (owned by another pipeline process) are edited in shape only. Task-level edits are
+compositions of these, e.g. :func:`extend_vocab`.
 """
 from __future__ import annotations
 
-import fnmatch
-import re
 from typing import Callable
 
 import torch
 
+from .nn.convert import Conversion, conversions, convert_, register_conversion, revert_
+from .select import Selector, select
 from .tensor import LatticeTensor
 
 __all__ = ["values", "assign_", "update_", "resize_", "select_", "set_parameter", "train_rows_", "sync_shapes_",
-           "drop_modules", "replace_module", "insert_module", "sparse_embeddings_", "extend_vocab", "mean_of_pieces"]
+           "quantize_", "dequantize_", "convert_", "revert_", "conversions", "register_conversion", "Conversion",
+           "set_compute_", "freeze_", "unfreeze_", "drop_", "replace_", "insert_", "sparse_embeddings_",
+           "extend_vocab", "mean_of_pieces"]
 
 Init = str | torch.Tensor | Callable[[torch.Tensor, int, int], torch.Tensor]
 
@@ -170,19 +178,18 @@ def sync_shapes_(module: torch.nn.Module) -> None:
             m.normalized_shape = (w.shape[0],)
 
 
-def _match(pattern: str):
-    if pattern.startswith("re:"):
-        rx = re.compile(pattern[3:])
-        return lambda n: rx.search(n) is not None
-    return lambda n: fnmatch.fnmatchcase(n, pattern)
+def _chosen(model: torch.nn.Module, target: Selector, outermost: bool = True) -> list:
+    """The selected (name, module) pairs; a selector that selects nothing is an error (it was asked for)."""
+    chosen = select(model, target, outermost=outermost)
+    if not chosen:
+        raise ValueError(f"no module matches {target!r}")
+    return chosen
 
 
-def drop_modules(model: torch.nn.Module, pattern: str) -> list[str]:
-    """Remove every submodule whose name matches ``pattern`` (glob or ``re:`` regex); entries of a ModuleList become
-    ``Identity``. Returns the removed names. The caller makes sure nothing calls a removed child."""
-    match = _match(pattern)
-    names = [n for n, _ in model.named_modules() if n and match(n)]
-    names = [n for n in names if not any(n.startswith(o + ".") for o in names if o != n)]
+def drop_(model: torch.nn.Module, target: Selector) -> list[str]:
+    """Remove the selected submodules; entries of a ModuleList become ``Identity``. Returns the removed names. The
+    caller makes sure nothing calls a removed child."""
+    names = [n for n, _ in _chosen(model, target) if n]                      # never the model itself
     for n in names:
         parent, _, attr = n.rpartition(".")
         mod = model.get_submodule(parent) if parent else model
@@ -193,7 +200,65 @@ def drop_modules(model: torch.nn.Module, pattern: str) -> list[str]:
     return names
 
 
-def replace_module(model: torch.nn.Module, name: str, new: torch.nn.Module) -> torch.nn.Module:
+def freeze_(model: torch.nn.Module, target: Selector) -> list[str]:
+    """No gradients for the parameters of the selected modules. Returns the parameter names."""
+    return _requires_grad(model, target, False)
+
+
+def unfreeze_(model: torch.nn.Module, target: Selector) -> list[str]:
+    """Gradients again for the (floating-point) parameters of the selected modules. Returns the parameter names."""
+    return _requires_grad(model, target, True)
+
+
+def _requires_grad(model: torch.nn.Module, target: Selector, on: bool) -> list[str]:
+    done = []
+    for name, mod in _chosen(model, target):
+        for pname, p in mod.named_parameters():
+            if p.is_floating_point() or isinstance(p, LatticeTensor):
+                p.requires_grad_(on)
+                done.append(f"{name}.{pname}")
+    return done
+
+
+def quantize_(model: torch.nn.Module, target: Selector, fmt="nvfp4", *, calibration: dict | None = None,
+              measure: bool = False, **options):
+    """Weights of the selected layers (and of layers inside them) into a lattice format. ``fmt``: a format name or
+    Format, or a :class:`bitlattice.QuantConfig`; ``options`` override QuantConfig fields (method, keep, ...);
+    ``calibration``: :func:`bitlattice.quant.calibrate` statistics (``saliency='activation'``); ``measure``: record
+    each weight's quantization error. Returns the report (quantized layers with bits per weight, skipped layers)."""
+    from dataclasses import replace
+
+    from .quant.api import quantize_layers_
+    from .quant.config import QuantConfig
+    config = fmt if isinstance(fmt, QuantConfig) else QuantConfig(format=fmt)
+    if options:
+        config = replace(config, **options)
+    return quantize_layers_(model, [n for n, _ in _chosen(model, target)], config, calibration, measure)
+
+
+def dequantize_(model: torch.nn.Module, target: Selector, dtype: torch.dtype | None = None) -> list[str]:
+    """Lattice weights of the selected layers back to dense tensors. Returns the parameter names."""
+    done = []
+    for name, mod in _chosen(model, target):
+        for sub_name, sub in mod.named_modules():
+            for pname, p in list(sub.named_parameters(recurse=False)):
+                if isinstance(p, LatticeTensor):
+                    setattr(sub, pname, torch.nn.Parameter(p.dequantize(dtype or p.dtype),
+                                                           requires_grad=p.requires_grad))
+                    done.append(".".join(x for x in (name, sub_name, pname) if x))
+    return done
+
+
+def set_compute_(model: torch.nn.Module, target: Selector, compute, *, skip_unfit: bool = False) -> list[str]:
+    """How the lattice layers among the selected modules compute: a :class:`bitlattice.Compute`, a preset name
+    (``bitlattice.COMPUTE_PRESETS``) or 'auto' (back to the default, exact). A layer that cannot honour the setting
+    raises ValueError naming it and why; with ``skip_unfit`` such layers keep their setting and are logged. Returns
+    the names of the weights set."""
+    from .compute_policy import assign_compute_
+    return assign_compute_(model, _chosen(model, target, outermost=False), compute, skip_unfit)
+
+
+def replace_(model: torch.nn.Module, name: str, new: torch.nn.Module) -> torch.nn.Module:
     """Put ``new`` in place of submodule ``name`` (moved to the old module's device); returns the old module."""
     parent, _, attr = name.rpartition(".")
     mod = model.get_submodule(parent) if parent else model
@@ -208,7 +273,7 @@ def replace_module(model: torch.nn.Module, name: str, new: torch.nn.Module) -> t
     return old
 
 
-def insert_module(model: torch.nn.Module, list_name: str, index: int, new: torch.nn.Module) -> None:
+def insert_(model: torch.nn.Module, list_name: str, index: int, new: torch.nn.Module) -> None:
     """Insert ``new`` into the ModuleList ``list_name`` at ``index`` (e.g. an extra decoder block)."""
     ml = model.get_submodule(list_name)
     if not isinstance(ml, torch.nn.ModuleList):

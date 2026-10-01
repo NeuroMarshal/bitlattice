@@ -42,8 +42,7 @@ class LatticeTensor(torch.Tensor):
         t.packed, t.scales, t.global_scale, t.zeros = packed, scales, global_scale, zeros
         t.hi_idx, t.hi_val = hi_idx, hi_val
         t.fmt = F.get(fmt)
-        t.compute = None          # per-tensor compute policy ('exact', 'fp4'); None follows bitlattice.backend
-        t.fp4_recipe = None       # per-tensor FP4 recipe (name or Fp4Recipe); None follows bitlattice.backend
+        t.compute = None          # bitlattice.Compute set by surgery.set_compute_; None: exact (see bitlattice.compute)
         return t
 
     def __init__(self, *args, **kwargs):  # state is set in __new__
@@ -136,7 +135,6 @@ class LatticeTensor(torch.Tensor):
         t = LatticeTensor(p["packed"], p["scales"], p["global_scale"], p["zeros"], self.fmt, kw.get("shape", self.shape),
                           kw.get("dtype", self.dtype), p["hi_idx"], p["hi_val"])
         t.compute = self.compute
-        t.fp4_recipe = getattr(self, "fp4_recipe", None)
         return t
 
     # ------------------------------------------------------------------------------------------------------------
@@ -200,20 +198,31 @@ class LatticeTensor(torch.Tensor):
 # --------------------------------------------------------------------------------------------------------------
 # autograd paths
 
+def _kernels(ctx):
+    from .backend import reference_kernels
+    return reference_kernels(ctx.reference)
+
+
 class _LatticeLinear(torch.autograd.Function):
     """y = x W^T + b with W dequantized on the fly (forward and backward); no dense W is kept between them."""
 
     @staticmethod
     def forward(ctx, x, w: LatticeTensor, bias):
-        from . import backend
+        from .compute_policy import route
         ctx.w = w
         ctx.has_bias = bias is not None
-        ctx.policy = backend.fp4_policy(x, w)
+        ctx.policy, comp = route(x, w)
+        ctx.recipe = comp.nvfp4                         # the backward runs on other threads: keep the forward's
+        ctx.reference = comp.kernels == "reference"
+        with _kernels(ctx):
+            return _LatticeLinear._forward(ctx, x, w, bias)
+
+    @staticmethod
+    def _forward(ctx, x, w, bias):
+        from . import backend
         # the input is kept only for the weight gradient: not when the weight is frozen, and not in the no-grad
         # first pass of a checkpointed block (its recomputation saves it)
         need_w = ctx.needs_input_grad[1]
-        if ctx.policy != "exact":
-            ctx.recipe = backend.get_fp4_recipe(w)      # the backward runs on other threads: keep the forward's
         if ctx.policy == "fp4_all":
             ctx.x_meta = (x.shape, x.dtype)
             if need_w:
@@ -242,6 +251,11 @@ class _LatticeLinear(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, gy):
+        with _kernels(ctx):
+            return _LatticeLinear._backward(ctx, gy)
+
+    @staticmethod
+    def _backward(ctx, gy):
         w = ctx.w
         gb = gy.reshape(-1, gy.shape[-1]).sum(0) if ctx.has_bias and ctx.needs_input_grad[2] else None
         if ctx.policy == "fp4_all":

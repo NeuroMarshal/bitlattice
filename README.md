@@ -28,16 +28,26 @@ import bitlattice as bl
 # load a Hugging Face model straight into NVFP4, keeping 5% of input channels of every layer in BF16
 model = bl.io.load("Qwen/Qwen3-0.6B", bl.quant.presets.default("nvfp4", keep=0.05), device="cuda")
 
-# or quantize an existing model in place
-bl.quantize_(model, format="int4", keep=0.1, method="mse")
+# or quantize layers of an existing model in place
+bl.surgery.quantize_(model, "*", bl.QuantConfig(format="int4", keep=0.1, method="mse"))
 
-opt = bl.optim.build(model, "muon", lr=3e-3, fused_backward=True, storage="auto")
+opt = bl.optim.Lattice(model, "muon", lr=3e-3, fused_backward=True)
+runner = bl.Runner(model, opt, micro=2)
 for batch in data:
-    loss = bl.nn.causal_lm_loss(model, batch["input_ids"])   # chunked head + cross-entropy, no full logits
-    loss.backward()                                         # parameters are updated during backward
-    opt.step()
+    loss = runner.step(batch["input_ids"])   # micro-batches, chunked head + cross-entropy, update during backward
 
-bl.io.save(model, "out/")                           # native format, reload with bl.io.load("out/")
+bl.io.save(model, "out/")                    # native format, reload with bl.io.load("out/")
+```
+
+Every change to a model is an explicit call; nothing converts or compresses on its own (`docs/API.md`):
+
+```python
+S = bl.surgery
+S.convert_(model, "*norm", "rms_norm", skip_unfit=True)            # lean RMSNorm where it reproduces the original
+S.convert_(model, "*.mlp", "token_chunks", chunk=2048)              # MLPs over slices of the sequence
+S.convert_(model, "re:layers\.\d+$", "checkpoint", saved="fp8")   # recompute layers, recomputed saves in FP8
+S.set_compute_(model, "*", "fp4_all", skip_unfit=True)              # FP4 tensor cores where the layer fits
+print(bl.explain(model))                                            # format, compute, conversions, memory per layer
 ```
 
 ## Formats
@@ -91,8 +101,8 @@ projections; BF16 channel budget). Groups adapt to layer width where the format 
 `fused_backward=True` applies each parameter update as soon as its gradient is accumulated and frees the gradient;
 `with opt.accumulate(): loss.backward()` sums gradients over micro-batches instead, and the next backward outside
 the context applies the update. Matrices larger than `tile_elems` are updated in row tiles.
-`bl.optim.build(model, preset)` groups parameters automatically (embeddings and output heads use the factored
-direction, vectors are exempt from weight decay).
+`bl.optim.Lattice(model, preset)` groups parameters automatically (embeddings and output heads use the factored
+direction, vectors are exempt from weight decay); options given next to the preset override it.
 
 Presets:
 
@@ -110,10 +120,12 @@ Presets:
 
 | tool | effect |
 |---|---|
-| `build(..., storage=...)` | `gpu`; `state_in_ram` (optimizer state in pinned host memory, prefetched per layer); `state_and_acts_in_ram` (also run the forward in `bl.storage.activations_in_ram()`); `auto` |
+| `Lattice(..., state=...)` | optimizer state: `gpu`; `ram` (pinned host memory, prefetched per layer); `auto` |
+| `Runner(..., memory=bl.Memory(activations="ram"))` | tensors kept for backward live in pinned host memory |
 | `bl.nn.causal_lm_loss`, `bl.nn.linear_cross_entropy` | output layer + cross-entropy in chunks: no logits, no fp32 head gradient |
-| `bl.nn.token_chunked_(model, "*mlp", chunk=2048)` | MLPs run on checkpointed sequence slices (long contexts) |
-| `model.gradient_checkpointing_enable()` | Hugging Face checkpointing, compatible with all of the above |
+| `convert_(model, sel, "checkpoint", saved=None \| "fp8" \| "nvfp4")` | recompute the selected modules in backward; tensors saved during recomputation optionally packed |
+| `convert_(model, "*.mlp", "token_chunks", chunk=2048)` | MLPs run on checkpointed sequence slices (long contexts) |
+| `convert_(model, "*.linear_attn", "gated_delta_net", seq_chunk=4096)` | Gated DeltaNet without copies of q/k per value head; recurrence over sequence pieces |
 | `bl.plan(model, opt)` | weights, optimizer state (GPU / host), gradient peak, weights per device |
 
 ## Several GPUs
@@ -124,10 +136,11 @@ Presets:
 # torchrun --nproc-per-node 2 train.py      (every process runs this script on the same batches)
 rank, world = bl.parallel.init()
 model = bl.io.load("Qwen/Qwen3-8B", bl.quant.presets.default("nvfp4"), device_map="interleaved")
-model.gradient_checkpointing_enable()
-opt = bl.optim.build(model, "muon_fast", lr=2e-5, fused_backward=True)
+bl.surgery.convert_(model, "re:layers\.\d+$", "checkpoint")
+opt = bl.optim.Lattice(model, "muon_fast", lr=2e-5, fused_backward=True)
+runner = bl.Runner(model, opt, micro=4)        # with a process group: the pipeline below
 for batch in data:
-    loss = bl.parallel.train_step(model, batch, micro=4, optimizer=opt)   # forward + backward + update
+    loss = runner.step(batch)                  # forward + backward + update
 ```
 
 Blocks alternate between the GPUs, and each process loads only its own. Every block processes all micro-batches
@@ -153,12 +166,15 @@ model = bl.io.load("Qwen/Qwen3-8B", bl.quant.presets.default("nvfp4"), device_ma
 ```
 
 Each GPU holds a contiguous run of layers, and the GPUs work one after the other. Use it to fit a model, not for
-speed. Works with generation, checkpointing and all storage policies.
+speed. Works with generation, checkpointing and every memory placement.
 
 ## Compute
 
-`bl.set_compute(policy)` (or `QuantConfig(compute=...)` per layer, or `with bl.compute(...):`) selects how nvfp4 layers
-compute (compute capability ≥ 10.0; other layers and devices fall back to `exact`):
+How a quantized layer computes is a property of the layer: `bl.surgery.set_compute_(model, selector, compute)` with
+a preset name (`bl.COMPUTE_PRESETS`) or a `bl.Compute(gemm=..., backward=..., nvfp4=bl.backend.Fp4Recipe(...),
+kernels=...)`; `with bl.compute(...):` overrides it temporarily. A setting the layer cannot honour (no FP4 tensor
+cores, dimensions that do not fit) is an error; `skip_unfit=True` sets it where possible and logs the rest. Layers
+without a setting compute exactly, on the fastest kernels that give the same result.
 
 | policy | GEMMs on FP4 tensor cores | linear layer 8192², 8192 tokens, fwd+bwd on RTX 5070 Ti |
 |---|---|---:|
@@ -186,7 +202,7 @@ Version 0.1.0. Implemented:
 - tensor subclass and quantization API;
 - optimizer with presets: fused backward, row tiles, sparse embeddings, gradient accumulation, Newton–Schulz
   variants;
-- storage policies; chunked output layer; token-chunked modules;
+- optimizer state and activation placement; chunked output layer; module conversions (operating table);
 - layer split and one-process-per-GPU pipeline;
 - FP4 training path (`fp4`, `fp4_all`);
 - checkpoint IO for dense and pre-quantized layouts.

@@ -13,7 +13,8 @@ Every option can be overridden per parameter group.
 from __future__ import annotations
 
 import contextlib
-from typing import Any, Iterable
+import logging
+from typing import Any
 
 import torch
 
@@ -22,6 +23,8 @@ from .. import formats as F
 from .. import reference as R
 from ..packing import pack, packed_cols, sign_extend, unpack
 from ..tensor import LatticeTensor
+
+log = logging.getLogger("bitlattice")
 
 __all__ = ["Lattice", "DEFAULTS", "DIRECTIONS", "MOMENTA", "ROUNDINGS", "SCALE_RULES"]
 
@@ -86,29 +89,50 @@ def _row_norm(g: dict, st: dict, rows: int, device, sl=None) -> dict:
 
 
 class Lattice(torch.optim.Optimizer):
-    """``params``: iterable of tensors or param-group dicts (any key of ``DEFAULTS`` can be set per group).
+    """The Lattice optimizer.
 
-    ``fused_backward=True`` applies each parameter's update as soon as its gradient is accumulated and frees the
-    gradient (the optimizer step then only advances the step counter); peak memory holds one gradient at a time.
-
-    ``state_device='cpu'`` keeps per-element state (phase, momentum) in pinned host memory. The state of a parameter
-    is copied to the GPU on a side stream before its update (prefetched in the update order recorded on the first
-    step) and copied back afterwards; at most two parameters' state reside on the GPU.
+    ``params``     a model (its trainable parameters, grouped by :func:`bitlattice.optim.param_groups`: embeddings
+                   and output heads get a factored direction, vectors no weight decay) or an iterable of tensors /
+                   param-group dicts (any key of ``DEFAULTS`` can be set per group)
+    ``preset``     a name in ``bitlattice.optim.PRESETS``: a set of options; options given here override it
+    ``state``      where per-element state (phase, momentum) lives: 'gpu', 'ram' (pinned host memory: copied to the
+                   GPU on a side stream before a parameter's update, prefetched in the update order recorded on
+                   the first step, copied back afterwards; at most two parameters' state on the GPU) or 'auto'
+                   ('ram' when the state would take more than ``bitlattice.storage.AUTO_STATE_FRACTION`` of the free
+                   memory of a device; the choice is logged and kept in ``self.state_placement``)
+    ``fused_backward``  apply each parameter's update as soon as its gradient is accumulated and free the gradient
+                   (the optimizer step then only advances the step counter); peak memory holds one gradient
     """
 
-    def __init__(self, params: Iterable, lr: float = DEFAULTS["lr"], *, seed: int = 0, fused_backward: bool = False,
-                 state_device: str = "cuda", **options):
+    def __init__(self, params, preset: str | None = None, *, lr: float = DEFAULTS["lr"], state: str = "gpu",
+                 fused_backward: bool = False, seed: int = 0, weight_decay: float = 0.0, **options):
+        from .presets import PRESETS, param_groups
+        if preset is not None:
+            if preset not in PRESETS:
+                raise KeyError(f"unknown preset {preset!r}; known: {sorted(PRESETS)}")
+            options = {**PRESETS[preset], **options}
+        head_momentum = options.pop("head_momentum", "none")
         unknown = set(options) - set(DEFAULTS)
         if unknown:
             raise TypeError(f"unknown options {sorted(unknown)}")
-        defaults = {**DEFAULTS, **options, "lr": lr}
+        if isinstance(params, torch.nn.Module):
+            direction = options.get("direction", DEFAULTS["direction"])
+            params = param_groups(params, head_direction="factored" if direction.startswith("muon") else direction,
+                                  head_momentum=head_momentum, weight_decay=weight_decay)
+        defaults = {**DEFAULTS, **options, "lr": lr, "weight_decay": options.get("weight_decay", weight_decay)}
         super().__init__(params, defaults)
         for g in self.param_groups:
             _validate(g)
+        if state not in ("gpu", "ram", "auto"):
+            raise ValueError("state must be 'gpu', 'ram' or 'auto'")
+        if state == "auto":
+            from ..storage import choose_placement
+            state = choose_placement(self.param_groups)
+            log.info("optimizer state placed in %s memory", "host" if state == "ram" else "GPU")
+        self.state_placement = state
+        state_device = "cpu" if state == "ram" else "cuda"
         self.seed = int(seed)
         self.fused_backward = fused_backward
-        if state_device not in ("cuda", "cpu"):
-            raise ValueError("state_device must be 'cuda' or 'cpu'")
         self.state_device = state_device
         self._copy_streams: dict = {}     # device -> side stream for host-memory state transfers
         self._last_copy: dict = {}        # device -> event of the last write-back
@@ -352,6 +376,8 @@ class Lattice(torch.optim.Optimizer):
 
     def _update(self, p: torch.Tensor, g: dict) -> None:
         p._bl_version = getattr(p, "_bl_version", 0) + 1          # invalidates cached derived operands
+        from ..backend import drop_cached
+        drop_cached(p)                                            # and frees them now
         st = self.state[p]
         self._bring(p, st)
         st["step"] = st.get("step", 0) + 1

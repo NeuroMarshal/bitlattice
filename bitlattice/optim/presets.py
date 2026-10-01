@@ -1,13 +1,13 @@
-"""Presets and automatic parameter grouping."""
+"""Optimizer presets (named option sets for :class:`bitlattice.optim.Lattice`) and the default parameter grouping of
+a model."""
 from __future__ import annotations
 
 from typing import Any
 
 import torch
 
-from .lattice import Lattice
 
-__all__ = ["PRESETS", "param_groups", "build"]
+__all__ = ["PRESETS", "param_groups"]
 
 PRESETS: dict[str, dict[str, Any]] = {
     # orthogonalized (Newton-Schulz) direction, 2-bit phase: best quality on 4..16-bit formats
@@ -61,28 +61,3 @@ def param_groups(model: torch.nn.Module, head_direction: str = "factored", head_
     if vectors:
         groups.append({"params": vectors, "weight_decay": 0.0 if no_decay_vectors else weight_decay})
     return groups
-
-
-def build(model: torch.nn.Module, preset: str = "muon", lr: float = 3e-3, *, fused_backward: bool = False,
-          seed: int = 0, weight_decay: float = 0.0, storage: str = "gpu", **overrides) -> Lattice:
-    """Lattice optimizer for ``model`` from a preset; ``overrides`` replace preset options. ``storage`` selects
-    where optimizer state lives ('gpu', 'state_in_ram', 'state_and_acts_in_ram', or 'auto': on the GPU when it
-    takes at most ``bitlattice.storage.AUTO_STATE_FRACTION`` of the free memory of every device, else in host
-    memory); for 'state_and_acts_in_ram' also run the forward pass inside ``bitlattice.storage.activations_in_ram()``.
-    The chosen policy is ``optimizer.storage``."""
-    if preset not in PRESETS:
-        raise KeyError(f"unknown preset {preset!r}; known: {sorted(PRESETS)}")
-    opts = {**PRESETS[preset], **overrides}
-    head_momentum = opts.pop("head_momentum", "none")
-    groups = param_groups(model, head_direction="factored" if opts.get("direction", "").startswith("muon")
-                          else opts.get("direction", "factored"), head_momentum=head_momentum,
-                          weight_decay=weight_decay)
-    from ..storage import POLICIES, choose_policy
-    if storage == "auto":
-        storage = choose_policy(groups, opts)
-    if storage not in POLICIES:
-        raise ValueError(f"storage must be one of {POLICIES} or 'auto'")
-    state_device = "cpu" if storage in ("state_in_ram", "state_and_acts_in_ram") else "cuda"
-    opt = Lattice(groups, lr=lr, seed=seed, fused_backward=fused_backward, state_device=state_device, **opts)
-    opt.storage = storage
-    return opt

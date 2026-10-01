@@ -1,26 +1,16 @@
-"""Compute policy for layers with lattice weights.
+"""GEMM back ends of lattice linear layers: NVFP4 on FP4 tensor cores and MXFP8 on FP8 tensor cores, with their
+operand quantization; :mod:`bitlattice.compute` decides which one a layer uses.
 
-    'exact'    dequantize to the activation dtype and use a dense GEMM (default; every device)
-    'fp4'      nvfp4 weights: activations are quantized to NVFP4 and the forward GEMM runs on FP4 tensor cores
-               (block-scaled MMA, compute capability >= 10.0); the backward stays exact (dense), i.e. the
-               activation quantizer is passed straight through.
-    'fp4_all'  forward, input-gradient and weight-gradient GEMMs on FP4 tensor cores: output gradients are
-               quantized with stochastic rounding, the weight-gradient operands are rotated along the token axis
-               by a random-sign 16x16 Hadamard transform, the transposed weight is re-quantized (1x16 blocks) for
-               the input gradient; the layer input is saved for backward in its transposed FP4 form (0.56 instead
-               of 2 bytes per element)
-    'mxfp8'    any lattice format: activations and the weight (dequantized and re-quantized once per weight version)
-               in MXFP8 (E4M3 elements, power-of-two scales per 32) on FP8 tensor cores, forward only
-    'mxfp8_all' forward, input-gradient and weight-gradient GEMMs in MXFP8 (the layer input saved as MXFP8 x^T)
-    'auto'     per layer: NVFP4-layout weights 'fp4_all', other formats 'mxfp8_all' where supported, else 'exact'
-Layers or devices that do not qualify use 'exact'.
+NVFP4 routes ('fp4': forward only, 'fp4_all': forward, input- and weight-gradient GEMMs) quantize the operands
+according to an :class:`Fp4Recipe`: 'nvidia' (the NVFP4 training recipe: round-to-nearest activations,
+stochastically rounded gradients, a 16-point Hadamard rotation of the weight-gradient operands, the transposed
+weight re-quantized for the input gradient; the layer input saved as transposed NVFP4, 0.56 bytes per value),
+'4over6' (four-over-six activation block scales), 'quartet2' and variants (four-over-six forward; MS-EDEN, an
+unbiased estimator with a lower error than stochastic rounding, on 128-point randomized Hadamard rotations of both
+backward GEMMs). Any NVFP4-layout weight format qualifies (:func:`is_nvfp4`).
 
-How the FP4 policies quantize the operands is a recipe (:class:`Fp4Recipe`): 'nvidia' (the default; the NVFP4
-training recipe described above), '4over6' (four-over-six block scales for the activations), 'quartet2'
-(four-over-six forward; MS-EDEN, an unbiased estimator with lower error than stochastic rounding, on 128-point
-randomized Hadamard rotations of the inner dimension of both backward GEMMs). Set it with :func:`set_fp4_recipe`,
-the :func:`fp4_recipe` context, or per weight (``w.fp4_recipe``). Any NVFP4-layout format qualifies
-(:func:`is_nvfp4`: E2M1 values, E4M3 scales per 16, a global scale), e.g. 'nvfp4' and 'nvfp4_4o6'.
+MXFP8 routes ('mxfp8', 'mxfp8_all') take any lattice format: the weight is dequantized and re-quantized to MXFP8
+once per weight version, activations and gradients are quantized to MXFP8 (E4M3, power-of-two scales per 32).
 """
 from __future__ import annotations
 
@@ -36,45 +26,9 @@ import torch
 
 from . import formats as F
 
-__all__ = ["POLICIES", "set_compute", "get_compute", "compute", "fp4_supported", "mxfp8_supported", "explain",
-           "to_blocked", "nvfp4_linear", "mx_mm", "Mx8Operand",
-           "fp4_policy", "quantize_fp4", "fp4_mm", "rht_last", "Fp4Operand", "Fp4Recipe", "FP4_RECIPES",
-           "set_fp4_recipe", "get_fp4_recipe", "fp4_recipe", "is_nvfp4", "defer_wgrad", "flush_wgrad",
-           "pending_wgrad", "clear_shared"]
-
-POLICIES = ("exact", "fp4", "fp4_all", "mxfp8", "mxfp8_all", "auto")
-# process-wide rather than thread-local: the backward pass (and checkpoint recomputation) runs on autograd worker
-# threads and must see the policy of the forward pass
-_default = ["exact"]
-_context: list[str] = []
-
-
-def set_compute(policy: str) -> None:
-    if policy not in POLICIES:
-        raise ValueError(f"compute policy must be one of {POLICIES}")
-    _default[0] = policy
-
-
-def get_compute(tensor=None) -> str:
-    """Effective policy: an active ``compute(...)`` context, else the tensor's own setting, else the default."""
-    if _context:
-        return _context[-1]
-    own = getattr(tensor, "compute", None)
-    return own or _default[0]
-
-
-@contextlib.contextmanager
-def compute(policy: str):
-    """Compute policy inside the block. With activation checkpointing the forward is recomputed during backward:
-    run the backward inside the block too (or use :func:`set_compute`); the same holds for :func:`fp4_recipe`."""
-    if policy not in POLICIES:
-        raise ValueError(f"compute policy must be one of {POLICIES}")
-    _context.append(policy)
-    try:
-        yield
-    finally:
-        _context.pop()
-
+__all__ = ["Fp4Recipe", "FP4_RECIPES", "Fp4Operand", "Mx8Operand", "is_nvfp4", "fp4_supported", "mxfp8_supported",
+           "fp4_unfit", "mx_unfit", "to_blocked", "quantize_fp4", "fp4_mm", "mx_mm", "rht_last", "nvfp4_linear",
+           "defer_wgrad", "flush_wgrad", "pending_wgrad", "clear_shared", "drop_cached"]
 
 @dataclass(frozen=True)
 class Fp4Recipe:
@@ -145,38 +99,13 @@ FP4_RECIPES: dict[str, Fp4Recipe] = {
     "quartet2_delayed": Fp4Recipe(activations="4over6", gradients="eden", rotation=128, rotate_dgrad=True,
                                   dgrad_weight="cached", scale_source="delayed"),
 }
-_recipe_default = [FP4_RECIPES["nvidia"]]
-_recipe_context: list[Fp4Recipe] = []
-
-
-def _as_recipe(r) -> Fp4Recipe:
+def as_recipe(r) -> Fp4Recipe:
+    """A recipe from its name in ``FP4_RECIPES`` (or the recipe itself)."""
     if isinstance(r, Fp4Recipe):
         return r
     if r not in FP4_RECIPES:
         raise ValueError(f"unknown FP4 recipe {r!r}; known: {sorted(FP4_RECIPES)}")
     return FP4_RECIPES[r]
-
-
-def set_fp4_recipe(recipe) -> None:
-    """Process-wide default recipe (a name from ``FP4_RECIPES`` or an :class:`Fp4Recipe`)."""
-    _recipe_default[0] = _as_recipe(recipe)
-
-
-def get_fp4_recipe(tensor=None) -> Fp4Recipe:
-    """Effective recipe: an active ``fp4_recipe(...)`` context, else the tensor's own, else the default."""
-    if _recipe_context:
-        return _recipe_context[-1]
-    own = getattr(tensor, "fp4_recipe", None)
-    return _as_recipe(own) if own is not None else _recipe_default[0]
-
-
-@contextlib.contextmanager
-def fp4_recipe(recipe):
-    _recipe_context.append(_as_recipe(recipe))
-    try:
-        yield
-    finally:
-        _recipe_context.pop()
 
 
 def is_nvfp4(fmt) -> bool:
@@ -223,44 +152,36 @@ def to_blocked(s: torch.Tensor) -> torch.Tensor:
     return b.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
 
 
-def _fp4_ok(x: torch.Tensor, w) -> bool:
-    return (x.is_cuda and is_nvfp4(w.fmt) and w.hi_idx is None and w.dim() == 2 and w.shape[1] % 32 == 0
-            and w.shape[0] % 16 == 0 and fp4_supported(x.device.index or 0))
+def fp4_unfit(w, device_index: int | None, backward: bool) -> str | None:
+    """Why the lattice weight ``w`` cannot use the NVFP4 GEMMs (None: it can)."""
+    if not is_nvfp4(w.fmt):
+        return f"format {w.fmt.name} is not NVFP4-layout"
+    if w.hi_idx is not None:
+        return "it keeps high-precision columns"
+    if w.dim() != 2:
+        return "the weight is not a matrix"
+    if w.shape[1] % 32:
+        return f"in_features {w.shape[1]} is not a multiple of 32"
+    if w.shape[0] % (32 if backward else 16):
+        return f"out_features {w.shape[0]} is not a multiple of {32 if backward else 16}"
+    if device_index is None:
+        return "the weight is not on a CUDA device"
+    if not fp4_supported(device_index):
+        return f"GPU {device_index} has no FP4 tensor cores reachable from this PyTorch"
+    return None
 
 
-def _mx_ok(x: torch.Tensor, w) -> bool:
-    return (x.is_cuda and w.dim() == 2 and w.shape[0] % 128 == 0 and w.shape[1] % 128 == 0
-            and mxfp8_supported(x.device.index or 0))
-
-
-def fp4_policy(x: torch.Tensor, w) -> str:
-    """The route of this layer call: 'fp4_all', 'fp4', 'mxfp8_all', 'mxfp8' or 'exact'."""
-    pol = get_compute(w)
-    if pol == "auto":
-        pol = "fp4_all" if _fp4_ok(x, w) else "mxfp8_all" if _mx_ok(x, w) else "exact"
-    if pol in ("fp4", "fp4_all"):
-        if not _fp4_ok(x, w):
-            return "exact"
-        return "fp4_all" if pol == "fp4_all" and w.shape[0] % 32 == 0 else "fp4"
-    if pol in ("mxfp8", "mxfp8_all"):
-        return pol if _mx_ok(x, w) else "exact"
-    return "exact"
-
-
-def explain(model: torch.nn.Module, tokens: int = 128) -> list[tuple[str, str, str]]:
-    """(parameter name, format, route) for every lattice weight of ``model`` under the current policy, for an input
-    of ``tokens`` rows on the weight's device."""
-    from .tensor import LatticeTensor
-    out = []
-    for name, p in model.named_parameters():
-        if isinstance(p, LatticeTensor) and p.dim() == 2 and p.device.type != "meta":
-            x = torch.empty(tokens, p.shape[1], device=p.device, dtype=p.dtype)
-            out.append((name, p.fmt.name, fp4_policy(x, p)))
-    return out
-
-
-def qualifies_fp4(x: torch.Tensor, w) -> bool:
-    return fp4_policy(x, w) != "exact"
+def mx_unfit(w, device_index: int | None) -> str | None:
+    """Why the lattice weight ``w`` cannot use the MXFP8 GEMMs (None: it can)."""
+    if w.dim() != 2:
+        return "the weight is not a matrix"
+    if w.shape[0] % 128 or w.shape[1] % 128:
+        return f"shape {tuple(w.shape)} is not made of 128 x 128 tiles"
+    if device_index is None:
+        return "the weight is not on a CUDA device"
+    if not mxfp8_supported(device_index):
+        return f"GPU {device_index} has no MXFP8 GEMMs reachable from this PyTorch"
+    return None
 
 
 class Fp4Operand(NamedTuple):
@@ -313,13 +234,26 @@ def _scaled_mm_2l(a, b, sa, sb, ga, gb, out_dtype):
     return Fn.scaled_mm(a, b.t(), [sa, ga], rec, [sb, gb], rec, swizzle_a=sw, swizzle_b=sw, output_dtype=out_dtype)
 
 
+_REFERENCE = [0]          # > 0 inside a layer computing with reference kernels (see reference_kernels)
+
+
+@contextlib.contextmanager
+def reference_kernels(on: bool = True):
+    """The plain kernels for the GEMM operands and epilogues inside the block (Compute(kernels='reference'))."""
+    _REFERENCE[0] += int(on)
+    try:
+        yield
+    finally:
+        _REFERENCE[0] -= int(on)
+
+
 def fp4_mm(a: Fp4Operand, b: Fp4Operand, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
     """A B^T for NVFP4 operands A [M, K], B [N, K] (K: multiple of 32), fp32 accumulation, ``out_dtype`` output.
     The global scales are applied in the GEMM epilogue where supported, else by an in-place scale kernel."""
     fp4 = torch.float4_e2m1fn_x2
     sa = a.scales if a.blocked else to_blocked(a.scales)
     sb = b.scales if b.blocked else to_blocked(b.scales)
-    if _two_level(a.packed.device.index or 0):
+    if not _REFERENCE[0] and _two_level(a.packed.device.index or 0):
         return _scaled_mm_2l(a.packed.view(fp4), b.packed.view(fp4), sa, sb, a.global_scale.float().reshape(()),
                              b.global_scale.float().reshape(()), out_dtype)
     y = torch._scaled_mm(a.packed.view(fp4), b.packed.view(fp4).t(), scale_a=sa, scale_b=sb, out_dtype=out_dtype)
@@ -354,6 +288,13 @@ def _cached(w, kind: str, make):
         _, old = _OPERANDS.popitem(last=False)
         _OPERAND_BYTES[0] -= old[3]
     return val
+
+
+def drop_cached(w) -> None:
+    """Forget the cached operands of ``w`` (called when the optimizer changes it: old versions are never used again,
+    and at long context their memory matters)."""
+    for key in [k for k in _OPERANDS if k[0] == id(w)]:
+        _OPERAND_BYTES[0] -= _OPERANDS.pop(key)[3]
 
 
 def weight_operand(w) -> Fp4Operand:
@@ -472,10 +413,9 @@ def _pad_to(recipe: Fp4Recipe) -> int:
     return 128 if recipe.rotation == 128 else 32
 
 
-def nvfp4_linear(x: torch.Tensor, w, bias: torch.Tensor | None = None, recipe: Fp4Recipe | None = None
+def nvfp4_linear(x: torch.Tensor, w, bias: torch.Tensor | None = None, recipe: Fp4Recipe = Fp4Recipe()
                  ) -> torch.Tensor:
     """y = Q(x) W^T (+ bias) with x quantized to NVFP4 on the fly; W must be an NVFP4 LatticeTensor."""
-    recipe = recipe or get_fp4_recipe(w)
     K = x.shape[-1]
     M = x.numel() // K
 
@@ -494,13 +434,12 @@ def nvfp4_linear(x: torch.Tensor, w, bias: torch.Tensor | None = None, recipe: F
 # the consumers share the operands (and the saved x^T: less activation memory as well). Sharing one random rotation
 # and one stochastic draw between consumers keeps every gradient estimate unbiased.
 
-SHARE_INPUTS = True
 _SHARED: "OrderedDict" = OrderedDict()
 _SHARED_MAX = 4
 
 
 def _shared(x: torch.Tensor, recipe: Fp4Recipe, kind: str, make):
-    if not SHARE_INPUTS:
+    if _REFERENCE[0]:
         return make()
     key = (id(x), x._version, recipe, kind, tuple(x.shape))
     hit = _SHARED.get(key)
@@ -520,9 +459,8 @@ def clear_shared() -> None:
     _SHARED.clear()
 
 
-def fp4_forward_saving(x: torch.Tensor, w, bias, recipe: Fp4Recipe | None = None):
+def fp4_forward_saving(x: torch.Tensor, w, bias, recipe: Fp4Recipe = Fp4Recipe()):
     """Forward of 'fp4_all': returns (y, saved), where saved holds x^T (rotated, NVFP4) for the weight gradient."""
-    recipe = recipe or get_fp4_recipe(w)
     K = x.shape[-1]
     M = x.numel() // K
     xq, xt = _shared(x, recipe, "fwd+t", lambda: _input_operands(x, recipe, _site(w, "x")))
@@ -565,9 +503,8 @@ def _input_operands(x: torch.Tensor, recipe: Fp4Recipe, site: dict | None = None
 
 
 def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool,
-                 recipe: Fp4Recipe | None = None):
+                 recipe: Fp4Recipe = Fp4Recipe()):
     """Input and weight gradients of y = x W^T on FP4 tensor cores."""
-    recipe = recipe or get_fp4_recipe(w)
     N = gy.shape[-1]
     g2 = gy.reshape(-1, N)
     M = g2.shape[0]

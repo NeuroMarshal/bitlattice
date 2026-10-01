@@ -25,13 +25,16 @@ def _compare(ref_mod, new_mod, d):
     g = torch.randn_like(x)
     y0 = ref_mod(x)
     gx0, gw0 = torch.autograd.grad(y0, (x, ref_mod.weight), g)
-    bl.nn.fuse_rmsnorm_(torch.nn.ModuleList([new_mod]))
+    holder = torch.nn.ModuleList([new_mod])
+    bl.surgery.convert_(holder, "0", "rms_norm")
+    new_mod = holder[0]
     y1 = new_mod(x)
     gx1, gw1 = torch.autograd.grad(y1, (x, new_mod.weight), g)
     assert torch.allclose(y0.float(), y1.float(), atol=2e-2, rtol=2e-2)
     assert torch.allclose(gx0.float(), gx1.float(), atol=3e-2, rtol=3e-2)
     # the reference accumulates the weight gradient from the bf16-rounded normalized input
     assert ((gw0.float() - gw1.float()).norm() / gw0.float().norm()).item() < 1e-2
+    return new_mod
 
 
 def test_llama_convention():
@@ -41,8 +44,7 @@ def test_llama_convention():
     a.weight.data = torch.randn(256, device=DEV, dtype=torch.bfloat16) * 0.5 + 1
     b = Qwen3RMSNorm(256).to(DEV, torch.bfloat16)
     b.weight.data = a.weight.data.clone()
-    _compare(a, b, 256)
-    assert "forward" in b.__dict__
+    assert isinstance(_compare(a, b, 256), bl.nn.RMSNorm)
 
 
 def test_offset_convention_and_memory():
@@ -50,7 +52,7 @@ def test_offset_convention_and_memory():
     a = OffsetRMSNorm(512).to(DEV)
     b = OffsetRMSNorm(512).to(DEV)
     b.weight.data = a.weight.data.clone()
-    _compare(a, b, 512)
+    b = _compare(a, b, 512)
     x = torch.randn(4096, 512, device=DEV, dtype=torch.bfloat16, requires_grad=True)
 
     def saved(mod):
@@ -70,8 +72,8 @@ def test_fuse_on_a_model():
     m = transformers.Qwen2ForCausalLM(cfg).to(DEV, torch.bfloat16)
     x = torch.randint(0, 100, (1, 16), device=DEV)
     ref = m(x).logits
-    changed = bl.nn.fuse_rmsnorm_(m)
-    assert changed == {"Qwen2RMSNorm": 5}
+    changed = bl.surgery.convert_(m, "*norm", "rms_norm")
+    assert len(changed) == 5 and all(old == "Qwen2RMSNorm" and new == "RMSNorm" for _, old, new in changed)
     assert torch.allclose(m(x).logits.float(), ref.float(), atol=5e-2, rtol=5e-2)
 
 
@@ -102,7 +104,9 @@ def test_gated_rmsnorm_matches_reference():
     ref = GatedRMSNormGated(128).cuda().bfloat16()
     lean = GatedRMSNormGated(128).cuda().bfloat16()
     lean.load_state_dict(ref.state_dict())
-    assert bl.nn.fuse_rmsnorm_(lean) == {"GatedRMSNormGated": 1}
+    holder = torch.nn.ModuleList([lean])
+    assert bl.surgery.convert_(holder, "0", "gated_rms_norm") == [("0", "GatedRMSNormGated", "GatedRMSNorm")]
+    lean = holder[0]
     x = torch.randn(3, 300, 128, device="cuda", dtype=torch.bfloat16)
     g = torch.randn(3, 300, 128, device="cuda", dtype=torch.bfloat16)
     outs = []

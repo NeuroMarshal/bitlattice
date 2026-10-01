@@ -54,17 +54,17 @@ def model_for(a, seed: int):
     with torch.device("cuda"):
         m = transformers.Qwen3ForCausalLM(cfg).to(torch.bfloat16)
     if a.format != "bf16":
-        bl.quantize_(m, bl.quant.presets.default(a.format))
+        bl.surgery.quantize_(m, "*", bl.quant.presets.default(a.format))
+        bl.surgery.set_compute_(m, "*", a.compute, skip_unfit=True)
     m.config.use_cache = False
     return m.train()
 
 
 def run(a, name: str, kw: dict, seed: int, train: torch.Tensor, held: torch.Tensor) -> dict:
     m = model_for(a, seed)
-    opt = bl.optim.build(m, a.preset, lr=a.lr, fused_backward=True, seed=seed, **kw)
+    opt = bl.optim.Lattice(m, a.preset, lr=a.lr, fused_backward=True, seed=seed, **kw)
     g = torch.Generator().manual_seed(1000 + seed)
     warm = max(1, a.steps // 20)
-    t_opt = 0.0
     t0 = time.perf_counter()
     for step in range(a.steps):
         lr = a.lr * min(1.0, (step + 1) / warm) * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * step / a.steps)))
@@ -91,7 +91,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--format", default="nvfp4")
     ap.add_argument("--preset", default="muon")
-    ap.add_argument("--compute", default="exact", choices=bl.backend.POLICIES)
+    ap.add_argument("--compute", default="exact", choices=sorted(bl.COMPUTE_PRESETS))
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--seq", type=int, default=256)
@@ -104,7 +104,6 @@ def main():
     ap.add_argument("--bytes", type=int, default=8 << 20)
     ap.add_argument("--out", default="bench/results/optimizer_ablation.jsonl")
     a = ap.parse_args()
-    bl.set_compute(a.compute)
     data = corpus(a.bytes)
     n_held = data.numel() // 20
     train, held = data[:-n_held], data[-n_held:][: 64 * a.seq + 1]

@@ -1,36 +1,48 @@
-"""Storage policies and memory accounting.
+"""Memory placement and accounting.
 
-Policies:
-    'gpu'                    weights, optimizer state and saved activations on the GPU
-    'state_in_ram'           per-element optimizer state in pinned host memory (``Lattice(state_device='cpu')``)
-    'state_and_acts_in_ram'  additionally, tensors saved for backward are kept in pinned host memory
-                             (``activations_in_ram()``); combine with gradient checkpointing so that only layer
-                             inputs are saved
+Optimizer state: ``Lattice(..., state='gpu' | 'ram' | 'auto')``. Activations: :class:`bitlattice.Memory` given to a
+:class:`bitlattice.Runner` ('ram': layer inputs kept in host memory between forward and backward). :func:`plan`
+reports where the memory goes before training.
 """
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 
 import torch
 
 from .tensor import LatticeTensor
 
-__all__ = ["POLICIES", "activations_in_ram", "maybe_activations_in_ram", "plan", "MemoryPlan", "choose_policy"]
+__all__ = ["activations_in_ram", "plan", "MemoryPlan", "choose_placement"]
 
-POLICIES = ("gpu", "state_in_ram", "state_and_acts_in_ram")
 AUTO_STATE_FRACTION = 0.25
 
 
 def activations_in_ram(pin_memory: bool = True):
-    """Context manager: tensors saved for backward are moved to host memory and brought back on use."""
-    return torch.autograd.graph.save_on_cpu(pin_memory=pin_memory)
+    """Context manager: CUDA tensors saved for backward are moved to host memory and brought back on use, with their
+    layout (some kernels require the strides they were saved with, e.g. padded attention masks); broadcast
+    dimensions (stride 0) are stored once and expanded again."""
 
+    def pack(t: torch.Tensor):
+        if not t.is_cuda or type(t) is not torch.Tensor:
+            return t
+        broadcast = [d for d in range(t.dim()) if t.stride(d) == 0 and t.size(d) > 1]
+        base = t
+        for d in broadcast:
+            base = base.narrow(d, 0, 1)
+        pin = pin_memory and torch.cuda.is_available()
+        host = torch.empty_strided(base.size(), base.stride(), dtype=t.dtype, device="cpu", pin_memory=pin)
+        host.copy_(base, non_blocking=pin)
+        return t.device, host, tuple(t.size()) if broadcast else None
 
-def maybe_activations_in_ram(policy: str):
-    if policy not in POLICIES:
-        raise ValueError(f"policy must be one of {POLICIES}")
-    return activations_in_ram() if policy == "state_and_acts_in_ram" else contextlib.nullcontext()
+    def unpack(p):
+        if isinstance(p, torch.Tensor):
+            return p
+        device, host, size = p
+        g = torch.empty_strided(host.size(), host.stride(), dtype=host.dtype, device=device)  # .to() would densify
+        g.copy_(host, non_blocking=pin_memory)
+        return g.expand(size) if size is not None else g
+
+    return torch.autograd.graph.saved_tensors_hooks(pack, unpack)
 
 
 def _state_estimate(p: torch.Tensor, g: dict) -> int:
@@ -42,19 +54,18 @@ def _state_estimate(p: torch.Tensor, g: dict) -> int:
     return b
 
 
-def choose_policy(groups, options: dict) -> str:
+def choose_placement(groups) -> str:
     """'gpu' if the per-element optimizer state of every device fits in AUTO_STATE_FRACTION of its free memory,
-    else 'state_in_ram'."""
+    else 'ram'."""
     need: dict[torch.device, int] = {}
     for g in groups:
-        g = {**options, **g}
         for p in g["params"]:
             if p.is_cuda:
                 need[p.device] = need.get(p.device, 0) + _state_estimate(p, g)
     for dev, b in need.items():
         free, _ = torch.cuda.mem_get_info(dev)
         if b > AUTO_STATE_FRACTION * free:
-            return "state_in_ram"
+            return "ram"
     return "gpu"
 
 

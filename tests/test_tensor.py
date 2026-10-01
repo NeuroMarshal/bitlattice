@@ -63,7 +63,7 @@ def test_embedding_rows_and_grad():
 def test_conv_falls_back_with_autograd():
     torch.manual_seed(1)
     conv = torch.nn.Conv2d(8, 16, 3, padding=1, device=DEV)
-    bl.quantize_(conv, bl.QuantConfig(format="int8", targets=(torch.nn.Conv2d,), min_features=8))
+    bl.surgery.quantize_(conv, "*", bl.QuantConfig(format="int8", targets=(torch.nn.Conv2d,), min_features=8))
     assert isinstance(conv.weight, LatticeTensor)
     x = torch.randn(2, 8, 10, 10, device=DEV)
     y = conv(x)
@@ -75,11 +75,11 @@ def test_conv_falls_back_with_autograd():
 
 def test_module_to_and_state_dict_roundtrip():
     lin = torch.nn.Linear(128, 64, device=DEV)
-    bl.quantize_(lin, format="nvfp4")
+    bl.surgery.quantize_(lin, "*", "nvfp4")
     sd = lin.state_dict()
     assert isinstance(sd["weight"], LatticeTensor)
     lin2 = torch.nn.Linear(128, 64, device=DEV)
-    bl.quantize_(lin2, format="nvfp4")
+    bl.surgery.quantize_(lin2, "*", "nvfp4")
     lin2.load_state_dict(sd)
     assert torch.equal(lin2.weight.dequantize(), lin.weight.dequantize())
     cpu = lin.to("cpu")
@@ -91,7 +91,7 @@ def test_module_to_and_state_dict_roundtrip():
 def test_load_dense_into_lattice_requantizes():
     lin = torch.nn.Linear(128, 64, device=DEV)
     dense = {k: v.clone() for k, v in lin.state_dict().items()}
-    bl.quantize_(lin, format="int8")
+    bl.surgery.quantize_(lin, "*", "int8")
     lin.load_state_dict(dense)
     err = (lin.weight.dequantize(torch.float32) - dense["weight"]).norm() / dense["weight"].norm()
     assert err < 0.02
@@ -99,16 +99,16 @@ def test_load_dense_into_lattice_requantizes():
 
 def test_dequantize_model_restores_dense():
     lin = torch.nn.Linear(128, 64, device=DEV)
-    bl.quantize_(lin, format="int4")
+    bl.surgery.quantize_(lin, "*", "int4")
     ref = lin.weight.dequantize()
-    bl.dequantize_(lin)
+    bl.surgery.dequantize_(lin, "*")
     assert type(lin.weight.data) is torch.Tensor and torch.equal(lin.weight.data, ref)
 
 
 def test_torch_save_load_weights_only():
     import io
     lin = torch.nn.Linear(64, 32, device=DEV)
-    bl.quantize_(lin, format="nvfp4", keep=0.1)
+    bl.surgery.quantize_(lin, "*", "nvfp4", keep=0.1)
     buf = io.BytesIO()
     torch.save(lin.state_dict(), buf)
     buf.seek(0)

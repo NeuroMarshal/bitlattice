@@ -35,7 +35,7 @@ def test_extend_vocab(tokenizer, quantized_head):
     tok = __import__("copy").deepcopy(tokenizer)
     m = _model(len(tok))
     if quantized_head:
-        bl.quantize_(m, format="int8", rules=(bl.Rule("*layers*", "skip"),), min_features=16)
+        bl.surgery.quantize_(m, "*", "int8", rules=(bl.Rule("*layers*", "skip"),), min_features=16)
         assert isinstance(m.lm_head.weight, LatticeTensor)
     old_emb = m.get_input_embeddings().weight.detach().float().clone()
     new_tokens = [f"<t{i:03d}>" for i in range(256)]
@@ -51,7 +51,7 @@ def test_extend_vocab(tokenizer, quantized_head):
     assert tok.tokenize("<t085><t072>") == ["<t085>", "<t072>"]
     x = torch.tensor([tok("start <t085><t072><t137><t229> end").input_ids], device=DEV)
     assert x.max().item() >= v0
-    opt = bl.optim.build(m, "muon", lr=3e-3)
+    opt = bl.optim.Lattice(m, "muon", lr=3e-3)
     losses = []
     for _ in range(20):
         loss = m(x, labels=x).loss
@@ -64,15 +64,15 @@ def test_extend_vocab(tokenizer, quantized_head):
 
 def test_drop_and_replace_modules():
     m = _model(1000)
-    removed = bl.surgery.drop_modules(m, "model.layers.1")
+    removed = bl.surgery.drop_(m, "model.layers.1")
     assert removed == ["model.layers.1"] and isinstance(m.model.layers[1], torch.nn.Identity)
-    old = bl.surgery.replace_module(m, "model.norm", torch.nn.Identity())
+    old = bl.surgery.replace_(m, "model.norm", torch.nn.Identity())
     assert old is not None and isinstance(m.model.norm, torch.nn.Identity)
 
 
 def test_primitives_on_dense_and_lattice():
     m = _model(1000)
-    bl.quantize_(m, format="int8", min_features=16, rules=(bl.Rule("*lm_head"),))
+    bl.surgery.quantize_(m, "*", "int8", min_features=16, rules=(bl.Rule("*lm_head"),))
     name = "model.layers.0.mlp.up_proj.weight"
     before = bl.surgery.values(m.get_parameter(name))
     bl.surgery.resize_(m, name, 160, dim=0, init="zeros")                 # grow output channels
@@ -86,7 +86,7 @@ def test_primitives_on_dense_and_lattice():
     assert m.model.layers[0].mlp.up_proj.out_features == 128
     x = torch.randint(0, 1000, (1, 8), device=DEV)
     assert torch.isfinite(m(x).logits).all()
-    bl.surgery.insert_module(m, "model.layers", 1, torch.nn.Identity())
+    bl.surgery.insert_(m, "model.layers", 1, torch.nn.Identity())
     assert len(m.model.layers) == 3
 
 
@@ -102,7 +102,7 @@ def test_train_rows_limits_updates_and_head_gradient():
             p.requires_grad_(False)
     before_h = m.lm_head.weight.detach().clone()
     before_e = m.model.embed_tokens.weight.detach().clone()
-    opt = bl.optim.build(m, "muon", lr=1e-2, fused_backward=True)
+    opt = bl.optim.Lattice(m, "muon", lr=1e-2, fused_backward=True)
     x = torch.randint(490, 512, (2, 16), device=DEV)
     for _ in range(3):
         bl.nn.causal_lm_loss(m, x).backward()

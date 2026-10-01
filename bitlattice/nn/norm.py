@@ -4,8 +4,9 @@ Reference implementations normalize in float32 and keep several float32 copies o
 per element). :class:`_RMSNorm` keeps the input in its own dtype plus one float32 value per row and recomputes the
 rest in backward, in row chunks so that the float32 temporaries stay bounded.
 
-:func:`fuse_rmsnorm_` swaps the forward of the RMSNorm modules of a model in place (parameters and names unchanged).
-Two conventions are recognized by comparing against the original on a random input:
+The ``rms_norm`` conversion (``bl.surgery.convert_``) puts a lean norm in place of a model's RMSNorm modules
+(parameters and names unchanged). Two conventions are recognized by comparing against the original on a random
+input:
     'llama'  y = w * cast(x * rstd)              (Llama, Qwen2/3, Mistral, ...)
     'offset' y = cast(x * rstd * (1 + w))        (Gemma, Qwen3.5, ...)
 Modules whose output matches neither are left alone.
@@ -14,7 +15,7 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["rms_norm", "rms_norm_gated", "fuse_rmsnorm_"]
+__all__ = ["rms_norm", "rms_norm_gated"]
 
 _ROWS = 4096
 
@@ -139,71 +140,3 @@ def _convention(mod, eps: float):
             if out.shape == ref.shape and torch.allclose(out.float(), ref.float(), atol=1e-2, rtol=1e-2):
                 return name, offset, cast_first
     return None
-
-
-def fuse_rmsnorm_(model: torch.nn.Module) -> dict[str, int]:
-    """Use the lean RMSNorm in every module named ``*RMSNorm`` whose output it reproduces, and the lean gated
-    RMSNorm in every ``*RMSNormGated`` (normalize, then gate with SiLU); the convention is decided once per class on
-    a materialized instance. Returns {class name: modules changed}."""
-    by_class: dict[type, object] = {}
-    changed: dict[str, int] = {}
-    for mod in model.modules():
-        cls = type(mod)
-        if not cls.__name__.endswith("RMSNorm") or not isinstance(getattr(mod, "weight", None), torch.Tensor):
-            continue
-        if mod.weight.dim() != 1:
-            continue
-        eps = _eps(mod)
-        if eps is None:
-            continue
-        if cls not in by_class or by_class[cls] is None:
-            conv = _convention(mod, eps)
-            if conv is None and mod.weight.device.type == "meta":
-                continue                                   # decide on a materialized instance
-            by_class[cls] = conv
-        conv = by_class[cls]
-        if conv is None:
-            continue
-        _, offset, cast_first = conv
-
-        def forward(x, _m=mod, _eps=eps, _o=offset, _c=cast_first):
-            return rms_norm(x, _m.weight, _eps, _o, _c)
-
-        mod.forward = forward
-        changed[cls.__name__] = changed.get(cls.__name__, 0) + 1
-    for mod in model.modules():
-        cls = type(mod)
-        if not cls.__name__.endswith("RMSNormGated") or getattr(mod, "_bl_gated", False):
-            continue
-        w, eps = getattr(mod, "weight", None), _eps(mod)
-        if not isinstance(w, torch.Tensor) or w.dim() != 1 or eps is None or w.device.type == "meta":
-            continue
-        if cls not in by_class:
-            by_class[cls] = _gated_matches(mod, eps)
-        if not by_class[cls]:
-            continue
-
-        def gated(x, gate=None, _m=mod, _eps=eps, _orig=mod.forward):
-            if gate is None:
-                return _orig(x)
-            return rms_norm_gated(x, gate, _m.weight, _eps)
-
-        mod.forward = gated
-        mod._bl_gated = True
-        changed[cls.__name__] = changed.get(cls.__name__, 0) + 1
-    return changed
-
-
-def _gated_matches(mod, eps: float) -> bool:
-    """Whether ``mod(x, gate)`` is normalize-then-gate with SiLU (the convention :func:`rms_norm_gated` implements)."""
-    w = mod.weight
-    dt = w.dtype if w.is_floating_point() else torch.bfloat16
-    x = torch.randn(4, w.shape[0], device=w.device, dtype=dt)
-    g = torch.randn(4, w.shape[0], device=w.device, dtype=dt)
-    try:
-        with torch.no_grad():
-            ref = mod(x, g)
-            out = rms_norm_gated(x, g, w, eps)
-    except TypeError:
-        return False
-    return out.shape == ref.shape and torch.allclose(out.float(), ref.float(), atol=1e-2, rtol=1e-2)

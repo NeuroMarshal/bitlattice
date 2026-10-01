@@ -10,7 +10,7 @@ from .. import formats as F
 from ..tensor import LatticeTensor
 from .config import QuantConfig
 
-__all__ = ["quantize_", "dequantize_", "calibrate", "QuantReport"]
+__all__ = ["calibrate", "QuantReport"]
 
 
 @dataclass
@@ -80,17 +80,17 @@ def calibrate(model: torch.nn.Module, batches: Iterable, targets=(torch.nn.Linea
 
 
 @torch.no_grad()
-def quantize_(model: torch.nn.Module, config: QuantConfig | None = None, *, calibration: dict | None = None,
-              report: bool = False, **overrides):
-    """Replace the weights of target modules by LatticeTensor parameters in place.
-
-    ``calibration`` -- output of :func:`calibrate`, required for ``saliency='activation'``.
-    Keyword overrides are applied to ``config`` (e.g. ``quantize_(model, format='int4', keep=0.05)``).
-    """
-    from dataclasses import replace
-    config = replace(config or QuantConfig(), **overrides) if overrides else (config or QuantConfig())
+def quantize_layers_(model: torch.nn.Module, names, config: QuantConfig, calibration: dict | None = None,
+                     measure: bool = False) -> QuantReport:
+    """Quantize the weights of the target modules (``config.targets``, rules and minimum width) that are among the
+    modules ``names`` or inside them. ``calibration``: output of :func:`calibrate`, needed for
+    ``saliency='activation'``; ``measure``: record the relative error of every quantized weight."""
+    chosen = set(names)
     rep = QuantReport()
     for name, mod in model.named_modules():
+        parts = name.split(".")
+        if "" not in chosen and not any(".".join(parts[:i]) in chosen for i in range(1, len(parts) + 1)):
+            continue
         if not isinstance(mod, config.targets):
             continue
         w = getattr(mod, "weight", None)
@@ -118,22 +118,13 @@ def quantize_(model: torch.nn.Module, config: QuantConfig | None = None, *, cali
             sal = calibration[name].to(w.device) * w.detach().float().reshape(w.shape[0], -1).square().sum(0)
         lt = LatticeTensor.from_float(w.detach(), fmt, method=cfg.method, keep=cfg.keep, keep_dtype=cfg.keep_dtype,
                                       saliency=sal, dtype=w.dtype)
-        if report:
+        err = float("nan")
+        if measure:
             ref = w.detach().float().reshape(w.shape[0], -1)
             err = ((lt.dequantize(torch.float32).reshape_as(ref) - ref).norm() / ref.norm().clamp_min(1e-30)).item()
-            k = 0 if lt.hi_idx is None else lt.hi_idx.numel()
-            bits = 8.0 * lt.storage_bytes() / w.numel()
-            rep.layers.append(LayerReport(name, fmt.name, tuple(w.shape), k, err, bits))
-        lt.compute = cfg.compute
+        k = 0 if lt.hi_idx is None else lt.hi_idx.numel()
+        rep.layers.append(LayerReport(name, fmt.name, tuple(w.shape), k, err, 8.0 * lt.storage_bytes() / w.numel()))
         mod.weight = torch.nn.Parameter(lt, requires_grad=w.requires_grad)
-    return rep if report else model
+    return rep
 
 
-@torch.no_grad()
-def dequantize_(model: torch.nn.Module, dtype: torch.dtype | None = None) -> torch.nn.Module:
-    """Replace every LatticeTensor parameter by its dense value."""
-    for mod in model.modules():
-        for pname, p in list(mod.named_parameters(recurse=False)):
-            if isinstance(p, LatticeTensor):
-                setattr(mod, pname, torch.nn.Parameter(p.dequantize(dtype or p.dtype), requires_grad=p.requires_grad))
-    return model

@@ -18,7 +18,7 @@ def run(x, p, gy, policy, recipe):
     between optimizer steps)."""
     p.grad = None
     xi = x.detach().requires_grad_(True)
-    with bl.compute(policy), bl.fp4_recipe(recipe):
+    with bl.compute(bl.Compute("exact") if policy == "exact" else bl.Compute("nvfp4", nvfp4=recipe)):
         y = torch.nn.functional.linear(xi, p)
         y.backward(gy)
     return y, xi.grad, p.grad

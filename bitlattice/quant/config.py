@@ -1,8 +1,6 @@
 """Quantization configuration: target format, precision budget and per-layer rules."""
 from __future__ import annotations
 
-import fnmatch
-import re
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -17,16 +15,16 @@ SKIP = "skip"
 
 @dataclass(frozen=True)
 class Rule:
-    """``pattern`` matches module names (glob by default, ``re:...`` for a regular expression).
+    """``pattern`` selects module names (a string selector: glob, or ``re:`` regular expression searched in the name;
+    see :mod:`bitlattice.select`).
     ``action`` is ``SKIP`` (keep the layer dense) or a dict of QuantConfig field overrides."""
 
     pattern: str
     action: Any = SKIP
 
     def matches(self, name: str) -> bool:
-        if self.pattern.startswith("re:"):
-            return re.search(self.pattern[3:], name) is not None
-        return fnmatch.fnmatchcase(name, self.pattern)
+        from ..select import matches
+        return matches(self.pattern, name, None)
 
 
 @dataclass(frozen=True)
@@ -41,7 +39,6 @@ class QuantConfig:
     group, scale -- override the scale group size / scale dtype of the format
     targets      -- module types that are quantized
     min_features -- layers with fewer input features stay dense
-    compute      -- per-layer compute policy ('exact', 'fp4'); None follows bitlattice.set_compute
     rules        -- ordered list of Rule; the first match decides
     """
 
@@ -54,7 +51,6 @@ class QuantConfig:
     scale: str | None = None
     targets: tuple[type, ...] = (torch.nn.Linear,)
     min_features: int = 32
-    compute: str | None = None
     rules: tuple[Rule, ...] = ()
 
     def __post_init__(self):

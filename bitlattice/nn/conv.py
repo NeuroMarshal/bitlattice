@@ -7,18 +7,15 @@ transformers; when x is a transposed channels-last tensor (a [B, T, C] tensor vi
 produce it) no copy is made, and the result is returned in the same layout. Backward keeps only x (the reference
 keeps x and the pre-activation) and recomputes the pre-activation.
 
-:func:`fused_conv1d_` switches the models' modules that call ``causal_conv1d_fn`` (Qwen3.5, Qwen3-Next and other
-hybrid models in transformers) to this implementation when the ``causal_conv1d`` package is not installed.
+The ``gated_delta_net`` conversion uses it for the linear-attention layers of Qwen3.5 / Qwen3-Next.
 """
 from __future__ import annotations
-
-import sys
 
 import torch
 
 from .. import _ops
 
-__all__ = ["causal_conv1d", "fused_conv1d_"]
+__all__ = ["causal_conv1d"]
 
 
 class _CausalConv1d(torch.autograd.Function):
@@ -60,20 +57,3 @@ def causal_conv1d(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | No
         xt = xt.contiguous()
     y = _CausalConv1d.apply(xt, weight, bias, activation is not None)
     return y.transpose(1, 2)
-
-
-def fused_conv1d_(model: torch.nn.Module) -> list[str]:
-    """Use :func:`causal_conv1d` in the transformers modules of ``model``'s layers that call ``causal_conv1d_fn``
-    through the reference fallback. Returns the patched module names."""
-    patched = []
-    for mod in {type(m).__module__ for m in model.modules()}:
-        module = sys.modules.get(mod)
-        fn = getattr(module, "causal_conv1d_fn", None)
-        if fn is None or fn is causal_conv1d:
-            continue
-        src = getattr(getattr(fn, "__wrapped__", fn), "__module__", "")
-        if src.startswith("causal_conv1d"):                    # the optimized package is in use
-            continue
-        module.causal_conv1d_fn = causal_conv1d
-        patched.append(mod)
-    return patched

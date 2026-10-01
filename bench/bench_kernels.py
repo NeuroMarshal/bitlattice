@@ -41,7 +41,6 @@ def bench_step(rows, cols):
                 q.grad = g
                 opt.step()
             out[f"lattice_{fmt}_{direction}"] = timeit(step)
-        st = {}
         D = _ops.direction(g, "factored", torch.zeros(rows, device="cuda"), torch.zeros(cols, device="cuda"), 1)
         phase = torch.zeros(rows, cols // 4, dtype=torch.uint8, device="cuda")
         packed = w.packed.clone()

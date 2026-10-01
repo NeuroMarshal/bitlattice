@@ -35,8 +35,8 @@ def test_fp4_linear_matches_quantized_reference(M):
 def test_fp4_training_step_runs_and_learns():
     torch.manual_seed(2)
     net = torch.nn.Sequential(torch.nn.Linear(128, 256), torch.nn.GELU(), torch.nn.Linear(256, 64)).to(DEV).bfloat16()
-    bl.quantize_(net, format="nvfp4")
-    opt = bl.optim.build(net, "muon", lr=5e-3)
+    bl.surgery.quantize_(net, "*", "nvfp4")
+    opt = bl.optim.Lattice(net, "muon", lr=5e-3)
     x = torch.randn(512, 128, device=DEV, dtype=torch.bfloat16)
     y = torch.randn(512, 64, device=DEV, dtype=torch.bfloat16) * 0.1
     losses = []
@@ -97,8 +97,8 @@ def test_fp4_all_gradients_close_to_exact(M):
 def test_fp4_all_training_learns_and_saves_fp4_inputs():
     torch.manual_seed(5)
     net = torch.nn.Sequential(torch.nn.Linear(128, 256), torch.nn.GELU(), torch.nn.Linear(256, 64)).to(DEV).bfloat16()
-    bl.quantize_(net, format="nvfp4")
-    opt = bl.optim.build(net, "muon", lr=5e-3, fused_backward=True)
+    bl.surgery.quantize_(net, "*", "nvfp4")
+    opt = bl.optim.Lattice(net, "muon", lr=5e-3, fused_backward=True)
     x = torch.randn(512, 128, device=DEV, dtype=torch.bfloat16)
     y = torch.randn(512, 64, device=DEV, dtype=torch.bfloat16) * 0.1
     losses = []
@@ -114,9 +114,9 @@ def test_fp4_all_training_learns_and_saves_fp4_inputs():
 def test_cached_weight_operands_follow_updates():
     torch.manual_seed(6)
     lin = torch.nn.Linear(256, 128, bias=False).to(DEV).bfloat16()
-    bl.quantize_(lin, format="nvfp4")
+    bl.surgery.quantize_(lin, "*", "nvfp4")
     x = torch.randn(64, 256, device=DEV, dtype=torch.bfloat16)
-    opt = bl.optim.build(lin, "muon", lr=5e-2)
+    opt = bl.optim.Lattice(lin, "muon", lr=5e-2)
     with bl.compute("fp4_all"):
         y1 = lin(x)
         y1.float().square().mean().backward()
@@ -143,10 +143,18 @@ def test_transposed_requantization_matches_dense_transpose():
 RECIPES = ("nvidia", "4over6", "quartet2", "quartet2_4o6", "quartet2_fast", "quartet2_delayed")
 
 
+def _C(policy, recipe="nvidia"):
+    """Compute for a route name ('exact', 'fp4', 'fp4_all', 'mxfp8', 'mxfp8_all') and an FP4 recipe."""
+    if policy == "exact":
+        return bl.Compute()
+    return bl.Compute("nvfp4" if policy.startswith("fp4") else "mxfp8", backward=policy.endswith("_all"),
+                      nvfp4=recipe)
+
+
 def _grads(x, w, gy, policy, recipe):
     p = torch.nn.Parameter(w.detach())
     xi = x.clone().requires_grad_(True)
-    with bl.compute(policy), bl.fp4_recipe(recipe):
+    with bl.compute(_C(policy, recipe)):
         y = torch.nn.functional.linear(xi, p)
     y.backward(gy)
     return y.detach().float(), xi.grad.float(), p.grad.float()
@@ -186,20 +194,28 @@ def test_eden_recipes_are_unbiased(recipe):
     assert mean_dw < 0.35 * one[1], (mean_dw, one)
 
 
-def test_recipe_selection_and_structural_nvfp4():
+def test_compute_settings_are_requirements():
     from bitlattice import formats as F
     assert bl.backend.is_nvfp4(F.get("nvfp4")) and bl.backend.is_nvfp4(F.get("nvfp4_4o6"))
     assert not bl.backend.is_nvfp4(F.get("mxfp4")) and not bl.backend.is_nvfp4(F.get("int4"))
-    w = LatticeTensor.from_float(torch.randn(128, 256, device=DEV) * 0.05, "nvfp4_4o6")
-    assert bl.backend.get_fp4_recipe(w).legacy
-    w.fp4_recipe = "quartet2"
-    assert bl.backend.get_fp4_recipe(w) == bl.backend.FP4_RECIPES["quartet2"]
-    with bl.fp4_recipe("4over6"):
-        assert bl.backend.get_fp4_recipe(w) == bl.backend.FP4_RECIPES["4over6"]
+    net = torch.nn.Sequential(torch.nn.Linear(256, 128, bias=False), torch.nn.Linear(128, 100, bias=False)).cuda()
+    bl.surgery.quantize_(net, "0", "nvfp4_4o6")
+    bl.surgery.quantize_(net, "1", "int4")
+    assert net[0].weight.compute is None                          # the plain default: exact
     x = torch.randn(64, 256, device=DEV, dtype=torch.bfloat16)
-    assert bl.backend.fp4_policy(x, w) == "exact" or bl.backend.fp4_policy(x, w) in ("fp4", "fp4_all")
-    with bl.compute("fp4_all"):
-        assert bl.backend.fp4_policy(x, w) == "fp4_all"
+    assert bl.compute_policy.route(x, net[0].weight)[0] == "exact"
+    assert bl.surgery.set_compute_(net, "0", "quartet2") == ["0.weight"]
+    assert bl.compute_policy.route(x, net[0].weight) == ("fp4_all", bl.COMPUTE_PRESETS["quartet2"])
+    with pytest.raises(ValueError, match="1.weight.*not NVFP4-layout"):
+        bl.surgery.set_compute_(net, "*", "fp4_all")                 # an explicit request the int4 layer cannot meet
+    assert net[1].weight.compute is None                           # nothing changed by the refused request
+    assert bl.surgery.set_compute_(net, "*", "fp4_all", skip_unfit=True) == ["0.weight"]
+    with bl.compute("exact"):
+        assert bl.compute_policy.route(x, net[0].weight)[0] == "exact"
+    text = str(bl.explain(net))
+    assert "fp4_all" not in text and "nvfp4" in text and "exact (default)" in text
+    bl.surgery.set_compute_(net, "*", "auto")
+    assert net[0].weight.compute is None
     with pytest.raises(ValueError):
         bl.backend.Fp4Recipe(gradients="eden", rotation=16)
 
@@ -209,12 +225,12 @@ def test_fp4_recipes_train():
         torch.manual_seed(5)
         net = torch.nn.Sequential(torch.nn.Linear(128, 256), torch.nn.GELU(), torch.nn.Linear(256, 128)).to(DEV)
         net = net.bfloat16()
-        bl.quantize_(net, format="nvfp4")
-        opt = bl.optim.build(net, "muon", lr=5e-3, fused_backward=True)
+        bl.surgery.quantize_(net, "*", "nvfp4")
+        opt = bl.optim.Lattice(net, "muon", lr=5e-3, fused_backward=True)
         x = torch.randn(512, 128, device=DEV, dtype=torch.bfloat16)
         y = torch.randn(512, 128, device=DEV, dtype=torch.bfloat16) * 0.1
         losses = []
-        with bl.compute("fp4_all"), bl.fp4_recipe(recipe):
+        with bl.compute(_C("fp4_all", recipe)):
             for _ in range(60):
                 loss = torch.nn.functional.mse_loss(net(x).float(), y.float())
                 loss.backward()
@@ -237,7 +253,7 @@ def test_consumers_share_one_input_quantization(recipe):
         return orig(*a, **k)
     bl.backend._input_operands = counting
     try:
-        with bl.compute("fp4_all"), bl.fp4_recipe(recipe):
+        with bl.compute(_C("fp4_all", recipe)):
             ys = [torch.nn.functional.linear(x, w) for w in ws]
             sum(y.float().square().mean() for y in ys).backward()
     finally:
@@ -248,7 +264,7 @@ def test_consumers_share_one_input_quantization(recipe):
     import gc
     gc.collect()
     x2 = x.detach().clone()
-    with bl.compute("fp4_all"), bl.fp4_recipe(recipe):
+    with bl.compute(_C("fp4_all", recipe)):
         torch.nn.functional.linear(x2, ws[0])
     n = len(bl.backend._SHARED)
     del x2
@@ -269,7 +285,7 @@ def test_recipes_with_checkpoint_recomputation(recipe):
     _, rdx, rdw = _grads(x, w, gy, "exact", "nvidia")
     p = torch.nn.Parameter(w.detach())
     xi = x.clone().requires_grad_(True)
-    with bl.compute("fp4_all"), bl.fp4_recipe(recipe):            # recomputation runs in backward: keep it inside
+    with bl.compute(_C("fp4_all", recipe)):            # recomputation runs in backward: keep it inside
         # an op before the layer: its input is a new tensor in the recomputation (as a norm output in a block)
         y = checkpoint(lambda t: torch.nn.functional.linear(t * 1.0, p), xi, use_reentrant=False)
         y.backward(gy)
@@ -289,7 +305,7 @@ def test_delayed_scales_follow_the_previous_call():
         _, rdx, rdw = _grads(x, w, gy, "exact", "nvidia")
         p.grad = None
         xi = x.clone().requires_grad_(True)
-        with bl.compute("fp4_all"), bl.fp4_recipe("quartet2_delayed"):
+        with bl.compute(_C("fp4_all", "quartet2_delayed")):
             torch.nn.functional.linear(xi, p).backward(gy)
         dx, dw = xi.grad.float(), p.grad.float()
         rel.append(max(((dx - rdx).norm() / rdx.norm()).item(), ((dw - rdw).norm() / rdw.norm()).item()))
@@ -305,7 +321,7 @@ def test_deferred_weight_gradients_match_accumulated(recipe):
     gys = [torch.randn(128, 128, device=DEV, dtype=torch.bfloat16) for _ in xs]
     ref = sum(_grads(x, w, gy, "exact", "nvidia")[2] for x, gy in zip(xs, gys))
     p = torch.nn.Parameter(w.detach())
-    with bl.compute("fp4_all"), bl.fp4_recipe(recipe):
+    with bl.compute(_C("fp4_all", recipe)):
         with bl.backend.defer_wgrad():
             for x, gy in zip(xs, gys):
                 torch.nn.functional.linear(x.clone().requires_grad_(True), p).backward(gy)
@@ -332,16 +348,6 @@ def test_mxfp8_all_any_format(fmt):
         assert rel < 0.06, (fmt, name, rel)
 
 
-@pytest.mark.skipif(not (torch.cuda.is_available() and bl.backend.mxfp8_supported(0)), reason="needs MXFP8 GEMMs")
-def test_auto_policy_routes_by_format():
-    lin = torch.nn.Sequential(torch.nn.Linear(256, 128, bias=False), torch.nn.Linear(128, 128, bias=False)).cuda()
-    bl.quantize_(lin, format="nvfp4", rules=[bl.Rule("1", {"format": "int4"})])
-    with bl.compute("auto"):
-        routes = {n: r for n, f, r in bl.backend.explain(lin)}
-    assert routes["0.weight"] == "fp4_all" and routes["1.weight"] == "mxfp8_all", routes
-
-
-
 def test_deferred_weight_gradients_with_delayed_scales():
     torch.manual_seed(14)
     w = LatticeTensor.from_float(torch.randn(128, 256, device=DEV) * 0.05, "nvfp4")
@@ -351,7 +357,7 @@ def test_deferred_weight_gradients_with_delayed_scales():
         gys = [torch.randn(128, 128, device=DEV, dtype=torch.bfloat16) for _ in xs]
         ref = sum(_grads(x, w, gy, "exact", "nvidia")[2] for x, gy in zip(xs, gys))
         p.grad = None
-        with bl.compute("fp4_all"), bl.fp4_recipe("quartet2_delayed"):
+        with bl.compute(_C("fp4_all", "quartet2_delayed")):
             with bl.backend.defer_wgrad():
                 for x, gy in zip(xs, gys):
                     torch.nn.functional.linear(x.clone().requires_grad_(True), p).backward(gy)
@@ -362,3 +368,15 @@ def test_deferred_weight_gradients_with_delayed_scales():
             bl.backend.flush_wgrad()
         rel = ((p.grad.float() - ref).norm() / ref.norm()).item()
         assert rel < 0.25, (step, rel)
+
+
+def test_optimizer_update_frees_cached_operands():
+    lin = torch.nn.Linear(256, 128, bias=False).to(DEV).bfloat16()
+    bl.surgery.quantize_(lin, "*", "nvfp4")
+    opt = bl.optim.Lattice(lin, "muon", lr=1e-2)
+    x = torch.randn(64, 256, device=DEV, dtype=torch.bfloat16)
+    with bl.compute(_C("fp4_all", "quartet2_fast")):
+        lin(x).float().square().mean().backward()
+    assert any(k[0] == id(lin.weight) for k in bl.backend._OPERANDS)
+    opt.step()
+    assert not any(k[0] == id(lin.weight) for k in bl.backend._OPERANDS)

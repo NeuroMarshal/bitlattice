@@ -46,7 +46,7 @@ def test_quantized_load_matches_quantize_after_load(dense_dir):
     assert isinstance(m.model.layers[0].mlp.down_proj.weight, LatticeTensor)
     assert not isinstance(m.lm_head.weight, LatticeTensor)
     ref = transformers.Qwen2ForCausalLM.from_pretrained(dense_dir, torch_dtype=torch.bfloat16).to(DEV).eval()
-    bl.quantize_(ref, cfg)
+    bl.surgery.quantize_(ref, "*", cfg)
     with torch.no_grad():
         assert torch.equal(m(_ids()).logits, ref(_ids()).logits)
 
@@ -86,7 +86,7 @@ def _write(path, tensors, config_update, extra_files=None):
 
 def _source(dense_dir, fmt):
     m = transformers.Qwen2ForCausalLM.from_pretrained(dense_dir, torch_dtype=torch.bfloat16).to(DEV)
-    bl.quantize_(m, bl.quant.presets.default(fmt), method="rtn")
+    bl.surgery.quantize_(m, "*", bl.quant.presets.default(fmt), method="rtn")
     return m
 
 
@@ -194,7 +194,7 @@ def test_bitlattice_roundtrip_and_training(dense_dir, tmp_path):
     m2 = bl.io.load(str(tmp_path), device=DEV)
     _check_same_weights(m, m2)
     m2.train()
-    opt = bl.optim.build(m2, "muon", lr=3e-3)
+    opt = bl.optim.Lattice(m2, "muon", lr=3e-3)
     ids = _ids()
     losses = []
     for _ in range(30):
@@ -224,7 +224,7 @@ def test_generate_and_gradient_checkpointing(dense_dir):
     m.gradient_checkpointing_enable()
     m.config.use_cache = False
     m.train()
-    opt = bl.optim.build(m, "muon", lr=3e-3, fused_backward=True)
+    opt = bl.optim.Lattice(m, "muon", lr=3e-3, fused_backward=True)
     with bl.storage.activations_in_ram():
         loss = m(ids, labels=ids).loss
     loss.backward()

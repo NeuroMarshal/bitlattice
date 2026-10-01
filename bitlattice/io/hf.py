@@ -237,7 +237,7 @@ def load(path_or_id: str, quant: QuantConfig | None = None, *, device: str | tor
          device_map: str | dict | None = None, max_memory: dict | None = None, dtype: torch.dtype = torch.bfloat16,
          model_cls=None, trust_remote_code: bool = False, revision: str | None = None,
          requantize: bool = False, config=None, key_map: dict | None = None) -> torch.nn.Module:
-    """Load a model (local directory or hub id) directly into lattice formats.
+    r"""Load a model (local directory or hub id) directly into lattice formats.
 
     quant       -- QuantConfig for dense weights (None: keep dense in ``dtype``). Pre-quantized checkpoints keep
                    their stored format unless ``requantize`` (dequantize then apply ``quant``).
@@ -339,7 +339,6 @@ def _quantize_dense(name: str, w: torch.Tensor, module, quant: QuantConfig | Non
     if fmt is None:
         return None
     lt = LatticeTensor.from_float(w, fmt, method=cfg.method, keep=cfg.keep, keep_dtype=cfg.keep_dtype, dtype=dtype)
-    lt.compute = cfg.compute
     return lt
 
 

@@ -40,7 +40,7 @@ def test_rules_first_match_wins():
     m = Tiny().to(DEV)
     cfg = QuantConfig(format="nvfp4", rules=(Rule("*lm_head"), Rule("layers.0.*"),
                                              Rule("*o_proj", {"format": "int8"})))
-    rep = bl.quantize_(m, cfg, report=True)
+    rep = bl.surgery.quantize_(m, "*", cfg, measure=True)
     assert not isinstance(m.lm_head.weight, LatticeTensor)
     assert not isinstance(m.layers[0].up.weight, LatticeTensor)
     assert m.layers[1].o_proj.weight.fmt.name == "int8"
@@ -51,7 +51,7 @@ def test_rules_first_match_wins():
 @pytest.mark.parametrize("keep", [0.0, 0.1, 0.5])
 def test_keep_slider_trades_error_for_bits(keep):
     m = Tiny().to(DEV)
-    rep = bl.quantize_(m, presets.default("int3"), keep=keep, report=True)
+    rep = bl.surgery.quantize_(m, "*", presets.default("int3"), keep=keep, measure=True)
     assert all(l.keep == round(keep * l.shape[1]) for l in rep.layers)
     test_keep_slider_trades_error_for_bits.results[keep] = (rep.bits_per_weight,
                                                            sum(l.rel_error for l in rep.layers) / len(rep.layers))
@@ -66,7 +66,7 @@ test_keep_slider_trades_error_for_bits.results = {}
 
 def test_accuracy_critical_preset_keeps_edges_dense():
     m = Tiny().to(DEV)
-    bl.quantize_(m, presets.accuracy_critical(m))
+    bl.surgery.quantize_(m, "*", presets.accuracy_critical(m))
     assert not isinstance(m.layers[0].q_proj.weight, LatticeTensor)
     assert not isinstance(m.layers[3].up.weight, LatticeTensor)
     assert m.layers[1].o_proj.weight.fmt.name == "int8"
@@ -78,10 +78,10 @@ def test_activation_saliency_uses_calibration():
     batches = [torch.randint(0, 100, (4, 16), device=DEV) for _ in range(3)]
     stats = bl.quant.calibrate(m, batches)
     assert "layers.1.up" in stats and stats["layers.1.up"].shape == (64,)
-    bl.quantize_(m, presets.default("int4"), keep=0.1, saliency="activation", calibration=stats)
+    bl.surgery.quantize_(m, "*", presets.default("int4"), keep=0.1, saliency="activation", calibration=stats)
     assert m.layers[1].up.weight.hi_idx.numel() == 6
     with pytest.raises(ValueError):
-        bl.quantize_(Tiny().to(DEV), presets.default("int4"), keep=0.1, saliency="activation")
+        bl.surgery.quantize_(Tiny().to(DEV), "*", presets.default("int4"), keep=0.1, saliency="activation")
 
 
 def test_quantized_model_output_close():
@@ -89,18 +89,20 @@ def test_quantized_model_output_close():
     m = Tiny().to(DEV)
     idx = torch.randint(0, 100, (2, 16), device=DEV)
     ref = m(idx)
-    bl.quantize_(m, presets.default("int8"))
+    bl.surgery.quantize_(m, "*", presets.default("int8"))
     out = m(idx)
     assert ((out - ref).norm() / ref.norm()).item() < 0.02
 
 
-def test_per_layer_compute_policy():
+def test_per_layer_compute_setting():
     m = Tiny().to(DEV)
-    cfg = QuantConfig(format="nvfp4", compute="fp4", rules=(Rule("*lm_head"), Rule("*o_proj", {"compute": "exact"})))
-    bl.quantize_(m, cfg)
-    assert m.layers[1].up.weight.compute == "fp4" and m.layers[1].o_proj.weight.compute == "exact"
-    assert bl.backend.get_compute(m.layers[1].up.weight) == "fp4"
-    with bl.compute("exact"):
-        assert bl.backend.get_compute(m.layers[1].up.weight) == "exact"
-    moved = m.layers[1].up.weight.to("cpu")
-    assert moved.compute == "fp4"
+    bl.surgery.quantize_(m, "*", QuantConfig(format="nvfp4", rules=(Rule("*lm_head"),)))
+    w = m.layers[1].up.weight
+    if not bl.backend.fp4_supported(0):
+        with pytest.raises(ValueError, match="FP4 tensor cores"):
+            bl.surgery.set_compute_(m, "*.up", "fp4")
+        return
+    assert bl.surgery.set_compute_(m, "*.up", "fp4")
+    assert w.compute == bl.COMPUTE_PRESETS["fp4"] and m.layers[1].o_proj.weight.compute is None
+    moved = w.to("cpu")
+    assert moved.compute == bl.COMPUTE_PRESETS["fp4"]

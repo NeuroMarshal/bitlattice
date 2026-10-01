@@ -1,4 +1,4 @@
-"""Layer split over devices, gradient accumulation with fused updates, token-chunked modules, auto storage."""
+"""Layer split over devices, gradient accumulation with fused updates, token-chunked modules, state placement."""
 import pytest
 import torch
 
@@ -70,7 +70,7 @@ def test_split_with_host_device_matches_and_trains(dense_dir):
     assert b.device.type == "cpu"
     assert torch.allclose(a.cpu(), b, atol=1e-3, rtol=1e-3)
     m.train()
-    opt = bl.optim.build(m, "muon", lr=3e-3, fused_backward=True)
+    opt = bl.optim.Lattice(m, "muon", lr=3e-3, fused_backward=True)
     losses = []
     for _ in range(15):
         loss = bl.nn.causal_lm_loss(m, ids)
@@ -106,13 +106,13 @@ def test_two_gpu_split_matches_single_device(dense_dir):
 
 
 @two_gpus
-@pytest.mark.parametrize("storage", ["gpu", "state_in_ram"])
-def test_two_gpu_training_equals_single_device(dense_dir, storage):
+@pytest.mark.parametrize("state", ["gpu", "ram"])
+def test_two_gpu_training_equals_single_device(dense_dir, state):
     def run(model):
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
         model.train()
-        opt = bl.optim.build(model, "muon", lr=3e-3, fused_backward=True, storage=storage)
+        opt = bl.optim.Lattice(model, "muon", lr=3e-3, fused_backward=True, state=state)
         ids = _ids()
         out = []
         for _ in range(10):
@@ -134,13 +134,13 @@ def test_accumulate_equals_summed_gradient():
     def model():
         torch.manual_seed(0)
         m = torch.nn.Sequential(torch.nn.Linear(64, 128), torch.nn.Tanh(), torch.nn.Linear(128, 32)).to(DEV)
-        bl.quantize_(m, format="nvfp4", min_features=16)
+        bl.surgery.quantize_(m, "*", "nvfp4", min_features=16)
         return m
 
     xs = [torch.randn(16, 64, device=DEV, generator=torch.Generator(DEV).manual_seed(i)) for i in range(3)]
     a, b = model(), model()
-    oa = bl.optim.build(a, "muon", lr=1e-2, fused_backward=True)
-    ob = bl.optim.build(b, "muon", lr=1e-2)
+    oa = bl.optim.Lattice(a, "muon", lr=1e-2, fused_backward=True)
+    ob = bl.optim.Lattice(b, "muon", lr=1e-2)
     with oa.accumulate():
         for x in xs[:-1]:
             a(x).square().mean().backward()
@@ -158,7 +158,7 @@ def test_accumulate_equals_summed_gradient():
             assert torch.equal(pa, pb)
 
 
-def test_token_chunked_matches_and_saves_memory():
+def test_token_chunks_match_and_save_memory():
     torch.manual_seed(0)
     mlp = transformers.models.qwen2.modeling_qwen2.Qwen2MLP(
         transformers.Qwen2Config(hidden_size=512, intermediate_size=2048)).to(DEV, torch.bfloat16)
@@ -177,8 +177,9 @@ def test_token_chunked_matches_and_saves_memory():
         return y.detach(), g, gw, saved
 
     y0, g0, w0, s0 = run()
-    names = bl.nn.token_chunked_(torch.nn.ModuleDict({"mlp": mlp}), "mlp", chunk=1000)
-    assert names == ["mlp"]
+    holder = torch.nn.ModuleDict({"mlp": mlp})
+    assert bl.surgery.convert_(holder, "mlp", "token_chunks", chunk=1000) == [("mlp", "Qwen2MLP", "TokenChunks")]
+    mlp = holder["mlp"]
     y1, g1, w1, s1 = run()
     assert torch.allclose(y0, y1, atol=1e-2, rtol=1e-2)
     assert torch.allclose(g0, g1, atol=1e-3, rtol=1e-2)
@@ -186,12 +187,12 @@ def test_token_chunked_matches_and_saves_memory():
     assert s1 < 0.4 * s0, (s0, s1)
 
 
-def test_auto_storage_policy(monkeypatch):
+def test_auto_state_placement(monkeypatch):
     m = torch.nn.Sequential(torch.nn.Linear(64, 64)).to(DEV)
-    assert bl.optim.build(m, "muon", storage="auto").storage == "gpu"
+    assert bl.optim.Lattice(m, "muon", state="auto").state_placement == "gpu"
     monkeypatch.setattr(bl.storage, "AUTO_STATE_FRACTION", 0.0)
-    opt = bl.optim.build(m, "muon", storage="auto")
-    assert opt.storage == "state_in_ram" and opt.state_device == "cpu"
+    opt = bl.optim.Lattice(m, "muon", state="auto")
+    assert opt.state_placement == "ram" and opt.state_device == "cpu"
     assert len(bl.plan(m, opt).weights_by_device) == 1
 
 
@@ -228,7 +229,7 @@ def test_pipelined_training_with_checkpointing_and_host_split(dense_dir):
     m.gradient_checkpointing_enable()
     m.config.use_cache = False
     m.train()
-    opt = bl.optim.build(m, "muon", lr=3e-3, fused_backward=True)
+    opt = bl.optim.Lattice(m, "muon", lr=3e-3, fused_backward=True)
     ids = _ids(b=4)
     losses = []
     for _ in range(12):
@@ -246,7 +247,7 @@ def test_two_gpu_pipelined_equals_single_device(dense_dir):
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
         model.train()
-        opt = bl.optim.build(model, "muon", lr=3e-3, fused_backward=True)
+        opt = bl.optim.Lattice(model, "muon", lr=3e-3, fused_backward=True)
         ids = _ids(b=4)
         out = []
         for _ in range(8):

@@ -1,16 +1,25 @@
-"""Bitlattice: training and fine-tuning of PyTorch models directly in low-bit and arbitrary number formats."""
-from . import backend, data, formats, io, kvcache, memory, nn, optim, parallel, pipeline, quant, storage, surgery
-from .backend import compute, fp4_recipe, set_compute, set_fp4_recipe
+"""Bitlattice: training and fine-tuning of PyTorch models directly in low-bit and arbitrary number formats.
+
+Principles of the API: docs/API.md. Edits of a model are in :mod:`bitlattice.surgery` (selectors: :mod:`bitlattice.
+select`); how lattice layers compute: :class:`Compute`; what was done: :func:`explain`.
+"""
+from . import backend, data, formats, io, kvcache, memory, nn, optim, parallel, pipeline, quant, select, storage, \
+    surgery
 from ._ops import HAVE_EXT
+from .compute_policy import PRESETS as COMPUTE_PRESETS
+from .compute_policy import Compute, compute
+from .explain import explain
 from .formats import Format, NativeFormat, TableFormat, UniformFormat
 from .optim import Lattice
 from .parallel import dispatch, infer_device_map
-from .quant import QuantConfig, Rule, dequantize_, quantize_
+from .quant import QuantConfig, Rule
+from .runner import Memory, Runner
 from .storage import plan
 from .tensor import LatticeTensor, is_lattice
 
-__version__ = "0.1.0"
+__version__ = "0.2.0.dev0"
 
-__all__ = ["backend", "data", "kvcache", "memory", "pipeline", "compute", "set_compute", "fp4_recipe", "set_fp4_recipe", "formats", "io", "nn", "optim", "parallel", "quant", "storage", "surgery", "plan",
-           "dispatch", "infer_device_map", "Lattice", "LatticeTensor", "is_lattice", "QuantConfig", "Rule",
-           "quantize_", "dequantize_", "Format", "TableFormat", "UniformFormat", "NativeFormat", "HAVE_EXT"]
+__all__ = ["backend", "data", "formats", "io", "kvcache", "memory", "nn", "optim", "parallel", "pipeline", "quant",
+           "select", "storage", "surgery", "HAVE_EXT", "Compute", "COMPUTE_PRESETS", "compute", "explain", "Format",
+           "NativeFormat", "TableFormat", "UniformFormat", "Lattice", "dispatch", "infer_device_map", "QuantConfig",
+           "Rule", "plan", "LatticeTensor", "is_lattice", "Memory", "Runner"]

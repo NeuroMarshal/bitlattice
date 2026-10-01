@@ -7,20 +7,17 @@ pieces of the sequence with the recurrent state carried from one piece to the ne
 piece. The result is the same recurrence (pieces are multiples of the kernel's 64-token chunks); gradients flow
 through the carried state. Variable-length batches (``cu_seqlens``) are passed through unchanged.
 
-:func:`sequence_chunked_` switches it in for the modules of a model that call such a function by module-level name
-(``torch_chunk_gated_delta_rule`` / ``chunk_gated_delta_rule`` in transformers' Qwen3.5 / Qwen3-Next).
+The ``gated_delta_net`` conversion takes the piece length as its ``seq_chunk`` option.
 """
 from __future__ import annotations
 
 import functools
-import sys
 
 import torch
 
-__all__ = ["sequence_chunked", "sequence_chunked_"]
+__all__ = ["sequence_chunked"]
 
 _SPLIT = ("g", "beta", "gk", "gv", "w", "u", "a", "b")
-NAMES = ("torch_chunk_gated_delta_rule", "chunk_gated_delta_rule")
 
 
 def sequence_chunked(fn, chunk: int = 4096):
@@ -48,17 +45,3 @@ def sequence_chunked(fn, chunk: int = 4096):
 
     wrapped._bl_sequence_chunk = chunk
     return wrapped
-
-
-def sequence_chunked_(model: torch.nn.Module, chunk: int = 4096, names=NAMES) -> list[str]:
-    """Wrap the module-level recurrence functions ``names`` used by ``model``'s layers; returns 'module.name' of the
-    wrapped ones."""
-    done = []
-    for mod in {type(m).__module__ for m in model.modules()}:
-        module = sys.modules.get(mod)
-        for name in names:
-            fn = getattr(module, name, None)
-            if callable(fn):
-                setattr(module, name, sequence_chunked(fn, chunk))
-                done.append(f"{mod}.{name}")
-    return done
