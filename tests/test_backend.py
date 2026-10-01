@@ -138,3 +138,119 @@ def test_transposed_requantization_matches_dense_transpose():
     wt = R.dequantize(R.Quantized(p, s, g, None, 256, 128), F.get("nvfp4"), torch.float32)
     ref = w.dequantize(torch.float32).t()
     assert ((wt - ref).norm() / ref.norm()).item() < 0.12
+
+
+RECIPES = ("nvidia", "4over6", "quartet2", "quartet2_4o6", "quartet2_fast")
+
+
+def _grads(x, w, gy, policy, recipe):
+    p = torch.nn.Parameter(w.detach())
+    xi = x.clone().requires_grad_(True)
+    with bl.compute(policy), bl.fp4_recipe(recipe):
+        y = torch.nn.functional.linear(xi, p)
+    y.backward(gy)
+    return y.detach().float(), xi.grad.float(), p.grad.float()
+
+
+@pytest.mark.parametrize("recipe", RECIPES)
+@pytest.mark.parametrize("M", [5, 96, 512])
+def test_recipes_gradients_close_to_exact(recipe, M):
+    torch.manual_seed(4)
+    x = torch.randn(M, 256, device=DEV, dtype=torch.bfloat16)
+    w = LatticeTensor.from_float(torch.randn(128, 256, device=DEV) * 0.05, "nvfp4", method="rtn")
+    gy = torch.randn(M, 128, device=DEV, dtype=torch.bfloat16)
+    ref = _grads(x, w, gy, "exact", "nvidia")
+    got = _grads(x, w, gy, "fp4_all", recipe)
+    for name, r, g in zip(("y", "dx", "dw"), ref, got):
+        rel = ((g - r).norm() / r.norm()).item()
+        assert rel < 0.25, (recipe, name, rel)
+
+
+@pytest.mark.parametrize("recipe", ["quartet2", "quartet2_4o6"])
+def test_eden_recipes_are_unbiased(recipe):
+    torch.manual_seed(8)
+    M = 256
+    x = torch.randn(M, 256, device=DEV, dtype=torch.bfloat16)
+    w = LatticeTensor.from_float(torch.randn(128, 256, device=DEV) * 0.05, "nvfp4", method="rtn")
+    gy = torch.randn(M, 128, device=DEV, dtype=torch.bfloat16)
+    _, rdx, rdw = _grads(x, w, gy, "exact", "nvidia")
+    n, sdx, sdw, one = 48, 0, 0, None
+    for i in range(n):
+        _, dx, dw = _grads(x, w, gy, "fp4_all", recipe)
+        sdx, sdw = sdx + dx, sdw + dw
+        if one is None:
+            one = (((dx - rdx).norm() / rdx.norm()).item(), ((dw - rdw).norm() / rdw.norm()).item())
+    mean_dx = ((sdx / n - rdx).norm() / rdx.norm()).item()
+    mean_dw = ((sdw / n - rdw).norm() / rdw.norm()).item()
+    assert mean_dx < 0.35 * one[0], (mean_dx, one)
+    assert mean_dw < 0.35 * one[1], (mean_dw, one)
+
+
+def test_recipe_selection_and_structural_nvfp4():
+    from bitlattice import formats as F
+    assert bl.backend.is_nvfp4(F.get("nvfp4")) and bl.backend.is_nvfp4(F.get("nvfp4_4o6"))
+    assert not bl.backend.is_nvfp4(F.get("mxfp4")) and not bl.backend.is_nvfp4(F.get("int4"))
+    w = LatticeTensor.from_float(torch.randn(128, 256, device=DEV) * 0.05, "nvfp4_4o6")
+    assert bl.backend.get_fp4_recipe(w).legacy
+    w.fp4_recipe = "quartet2"
+    assert bl.backend.get_fp4_recipe(w) == bl.backend.FP4_RECIPES["quartet2"]
+    with bl.fp4_recipe("4over6"):
+        assert bl.backend.get_fp4_recipe(w) == bl.backend.FP4_RECIPES["4over6"]
+    x = torch.randn(64, 256, device=DEV, dtype=torch.bfloat16)
+    assert bl.backend.fp4_policy(x, w) == "exact" or bl.backend.fp4_policy(x, w) in ("fp4", "fp4_all")
+    with bl.compute("fp4_all"):
+        assert bl.backend.fp4_policy(x, w) == "fp4_all"
+    with pytest.raises(ValueError):
+        bl.backend.Fp4Recipe(gradients="eden", rotation=16)
+
+
+def test_fp4_recipes_train():
+    for recipe in RECIPES:
+        torch.manual_seed(5)
+        net = torch.nn.Sequential(torch.nn.Linear(128, 256), torch.nn.GELU(), torch.nn.Linear(256, 128)).to(DEV)
+        net = net.bfloat16()
+        bl.quantize_(net, format="nvfp4")
+        opt = bl.optim.build(net, "muon", lr=5e-3, fused_backward=True)
+        x = torch.randn(512, 128, device=DEV, dtype=torch.bfloat16)
+        y = torch.randn(512, 128, device=DEV, dtype=torch.bfloat16) * 0.1
+        losses = []
+        with bl.compute("fp4_all"), bl.fp4_recipe(recipe):
+            for _ in range(60):
+                loss = torch.nn.functional.mse_loss(net(x).float(), y.float())
+                loss.backward()
+                opt.step()
+                losses.append(loss.item())
+        assert losses[-1] < 0.8 * losses[0], (recipe, losses[0], losses[-1])
+
+
+@pytest.mark.parametrize("recipe", ["nvidia", "quartet2_fast"])
+def test_consumers_share_one_input_quantization(recipe):
+    torch.manual_seed(9)
+    x = torch.randn(256, 256, device=DEV, dtype=torch.bfloat16, requires_grad=True)
+    ws = [torch.nn.Parameter(LatticeTensor.from_float(torch.randn(128, 256, device=DEV) * 0.05, "nvfp4"))
+          for _ in range(3)]
+    calls = {"n": 0}
+    orig = bl.backend._input_operands
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+    bl.backend._input_operands = counting
+    try:
+        with bl.compute("fp4_all"), bl.fp4_recipe(recipe):
+            ys = [torch.nn.functional.linear(x, w) for w in ws]
+            sum(y.float().square().mean() for y in ys).backward()
+    finally:
+        bl.backend._input_operands = orig
+    assert calls["n"] == 1
+    assert all(w.grad is not None and torch.isfinite(w.grad).all() for w in ws)
+    del ys
+    import gc
+    gc.collect()
+    x2 = x.detach().clone()
+    with bl.compute("fp4_all"), bl.fp4_recipe(recipe):
+        torch.nn.functional.linear(x2, ws[0])
+    n = len(bl.backend._SHARED)
+    del x2
+    gc.collect()
+    assert len(bl.backend._SHARED) == n - 1          # the entry died with its input

@@ -10,6 +10,13 @@
                the input gradient; the layer input is saved for backward in its transposed FP4 form (0.56 instead
                of 2 bytes per element)
 Layers or devices that do not qualify use 'exact'.
+
+How the FP4 policies quantize the operands is a recipe (:class:`Fp4Recipe`): 'nvidia' (the default; the NVFP4
+training recipe described above), '4over6' (four-over-six block scales for the activations), 'quartet2'
+(four-over-six forward; MS-EDEN, an unbiased estimator with lower error than stochastic rounding, on 128-point
+randomized Hadamard rotations of the inner dimension of both backward GEMMs). Set it with :func:`set_fp4_recipe`,
+the :func:`fp4_recipe` context, or per weight (``w.fp4_recipe``). Any NVFP4-layout format qualifies
+(:func:`is_nvfp4`: E2M1 values, E4M3 scales per 16, a global scale), e.g. 'nvfp4' and 'nvfp4_4o6'.
 """
 from __future__ import annotations
 
@@ -17,13 +24,17 @@ import contextlib
 import itertools
 import weakref
 from collections import OrderedDict
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import NamedTuple
 
 import torch
 
+from . import formats as F
+
 __all__ = ["POLICIES", "set_compute", "get_compute", "compute", "fp4_supported", "to_blocked", "nvfp4_linear",
-           "fp4_policy", "quantize_fp4", "fp4_mm", "rht_last", "Fp4Operand"]
+           "fp4_policy", "quantize_fp4", "fp4_mm", "rht_last", "Fp4Operand", "Fp4Recipe", "FP4_RECIPES",
+           "set_fp4_recipe", "get_fp4_recipe", "fp4_recipe", "is_nvfp4"]
 
 POLICIES = ("exact", "fp4", "fp4_all")
 # process-wide rather than thread-local: the backward pass (and checkpoint recomputation) runs on autograd worker
@@ -57,6 +68,106 @@ def compute(policy: str):
         _context.pop()
 
 
+@dataclass(frozen=True)
+class Fp4Recipe:
+    """Quantization of the GEMM operands under the FP4 policies.
+
+    activations      'rtn' | '4over6'   forward input: round to nearest, with four-over-six block scales or not
+    gradients        'sr' | 'eden'      output gradient in backward: stochastic rounding, or MS-EDEN (rounding to
+                                        nearest plus stochastically rounded, bias-correcting block scales; needs
+                                        ``rotation=128``)
+    rotation         16 | 128           randomized Hadamard block along the token axis of the weight-gradient GEMM
+    rotate_dgrad     bool               also rotate (128) the output-feature axis of the input-gradient GEMM (layers
+                                        whose output features are not a multiple of 128 skip it)
+    backward_4over6  bool               four-over-six block scales for the backward operands too
+    select           'mse' | 'mae'      four-over-six criterion
+    dgrad_weight     'requantize' | 'cached'   with ``rotate_dgrad``: the rotated W^T is re-quantized in every
+                                        backward (MS-EDEN with MS-EDEN gradients), or quantized once per weight
+                                        version (round to nearest, one rotation per version; as the transposed
+                                        weight of the NVIDIA recipe)
+    """
+
+    activations: str = "rtn"
+    gradients: str = "sr"
+    rotation: int = 16
+    rotate_dgrad: bool = False
+    backward_4over6: bool = False
+    select: str = "mse"
+    dgrad_weight: str = "requantize"
+
+    def __post_init__(self):
+        if self.activations not in ("rtn", "4over6"):
+            raise ValueError("activations must be 'rtn' or '4over6'")
+        if self.gradients not in ("sr", "eden"):
+            raise ValueError("gradients must be 'sr' or 'eden'")
+        if self.rotation not in (16, 128):
+            raise ValueError("rotation must be 16 or 128")
+        if self.gradients == "eden" and self.rotation != 128:
+            raise ValueError("MS-EDEN gradients need rotation=128")
+        if self.select not in ("mse", "mae"):
+            raise ValueError("select must be 'mse' or 'mae'")
+        if self.dgrad_weight not in ("requantize", "cached"):
+            raise ValueError("dgrad_weight must be 'requantize' or 'cached'")
+
+    @property
+    def legacy(self) -> bool:
+        """True for the NVIDIA recipe (kernels of version 0.1, identical numbers)."""
+        return self == Fp4Recipe()
+
+
+FP4_RECIPES: dict[str, Fp4Recipe] = {
+    "nvidia": Fp4Recipe(),
+    "4over6": Fp4Recipe(activations="4over6"),
+    "quartet2": Fp4Recipe(activations="4over6", gradients="eden", rotation=128, rotate_dgrad=True),
+    "quartet2_4o6": Fp4Recipe(activations="4over6", gradients="eden", rotation=128, rotate_dgrad=True,
+                              backward_4over6=True),
+    "quartet2_fast": Fp4Recipe(activations="4over6", gradients="eden", rotation=128, rotate_dgrad=True,
+                               dgrad_weight="cached"),
+}
+_recipe_default = [FP4_RECIPES["nvidia"]]
+_recipe_context: list[Fp4Recipe] = []
+
+
+def _as_recipe(r) -> Fp4Recipe:
+    if isinstance(r, Fp4Recipe):
+        return r
+    if r not in FP4_RECIPES:
+        raise ValueError(f"unknown FP4 recipe {r!r}; known: {sorted(FP4_RECIPES)}")
+    return FP4_RECIPES[r]
+
+
+def set_fp4_recipe(recipe) -> None:
+    """Process-wide default recipe (a name from ``FP4_RECIPES`` or an :class:`Fp4Recipe`)."""
+    _recipe_default[0] = _as_recipe(recipe)
+
+
+def get_fp4_recipe(tensor=None) -> Fp4Recipe:
+    """Effective recipe: an active ``fp4_recipe(...)`` context, else the tensor's own, else the default."""
+    if _recipe_context:
+        return _recipe_context[-1]
+    own = getattr(tensor, "fp4_recipe", None)
+    return _as_recipe(own) if own is not None else _recipe_default[0]
+
+
+@contextlib.contextmanager
+def fp4_recipe(recipe):
+    _recipe_context.append(_as_recipe(recipe))
+    try:
+        yield
+    finally:
+        _recipe_context.pop()
+
+
+def is_nvfp4(fmt) -> bool:
+    """NVFP4 storage layout: E2M1 values, E4M3 scales per 16 elements, a per-tensor global scale."""
+    sc = getattr(fmt, "scale", None)
+    return (getattr(fmt, "kind", None) == "table" and fmt.bits == 4 and sc is not None and sc.group == 16
+            and sc.dtype == "e4m3" and sc.global_scale and fmt.levels == _NVFP4_LEVELS)
+
+
+_NVFP4_LEVELS = F.get("nvfp4").levels
+
+
 @lru_cache(maxsize=None)
 def fp4_supported(device_index: int) -> bool:
     if not hasattr(torch, "float4_e2m1fn_x2"):
@@ -79,7 +190,7 @@ def to_blocked(s: torch.Tensor) -> torch.Tensor:
 def fp4_policy(x: torch.Tensor, w) -> str:
     """'fp4_all', 'fp4' or 'exact': the policy that applies to this layer call."""
     pol = get_compute(w)
-    if pol == "exact" or not (x.is_cuda and w.fmt.name == "nvfp4" and w.hi_idx is None and w.dim() == 2
+    if pol == "exact" or not (x.is_cuda and is_nvfp4(w.fmt) and w.hi_idx is None and w.dim() == 2
                               and w.shape[1] % 32 == 0 and w.shape[0] % 16 == 0
                               and fp4_supported(x.device.index or 0)):
         return "exact"
@@ -100,6 +211,7 @@ class Fp4Operand(NamedTuple):
     scales: torch.Tensor
     global_scale: torch.Tensor
     blocked: bool = False
+    rotate_seed: int = -1         # seed of the 128-point rotation along cols (-1: none or the 16-point legacy one)
 
 
 _sr_counter = itertools.count(1)
@@ -115,12 +227,41 @@ def quantize_fp4(x2: torch.Tensor, stochastic: bool = False) -> Fp4Operand:
     return Fp4Operand(packed, scales, g)
 
 
+@lru_cache(maxsize=None)
+def _two_level(device_index: int) -> bool:
+    """Whether ``torch.nn.functional.scaled_mm`` takes NVFP4 block scales plus a per-tensor scale (applied inside the
+    GEMM epilogue); probed once per device."""
+    Fn = torch.nn.functional
+    if not hasattr(Fn, "scaled_mm") or not hasattr(Fn, "ScalingType"):
+        return False
+    try:
+        dev = torch.device("cuda", device_index)
+        a = torch.zeros(128, 32, dtype=torch.uint8, device=dev).view(torch.float4_e2m1fn_x2)
+        s = to_blocked(torch.ones(128, 4, device=dev).to(torch.float8_e4m3fn))
+        one = torch.ones((), device=dev)
+        _scaled_mm_2l(a, a, s, s, one, one, torch.bfloat16)
+        return True
+    except Exception:                                    # older torch / unsupported device: GEMM + scale kernel
+        return False
+
+
+def _scaled_mm_2l(a, b, sa, sb, ga, gb, out_dtype):
+    Fn = torch.nn.functional
+    ST, SW = Fn.ScalingType, Fn.SwizzleType
+    rec = [ST.BlockWise1x16, ST.TensorWise]
+    sw = [SW.SWIZZLE_32_4_4, SW.NO_SWIZZLE]
+    return Fn.scaled_mm(a, b.t(), [sa, ga], rec, [sb, gb], rec, swizzle_a=sw, swizzle_b=sw, output_dtype=out_dtype)
+
+
 def fp4_mm(a: Fp4Operand, b: Fp4Operand, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-    """A B^T for NVFP4 operands A [M, K], B [N, K] (K: multiple of 32), fp32 accumulation, ``out_dtype`` output
-    scaled by the global scales in place."""
+    """A B^T for NVFP4 operands A [M, K], B [N, K] (K: multiple of 32), fp32 accumulation, ``out_dtype`` output.
+    The global scales are applied in the GEMM epilogue where supported, else by an in-place scale kernel."""
     fp4 = torch.float4_e2m1fn_x2
     sa = a.scales if a.blocked else to_blocked(a.scales)
     sb = b.scales if b.blocked else to_blocked(b.scales)
+    if _two_level(a.packed.device.index or 0):
+        return _scaled_mm_2l(a.packed.view(fp4), b.packed.view(fp4), sa, sb, a.global_scale.float().reshape(()),
+                             b.global_scale.float().reshape(()), out_dtype)
     y = torch._scaled_mm(a.packed.view(fp4), b.packed.view(fp4).t(), scale_a=sa, scale_b=sb, out_dtype=out_dtype)
     return torch.ops.bitlattice.scale_(y, a.global_scale * b.global_scale.float())
 
@@ -168,6 +309,19 @@ def weight_t_operand(w) -> Fp4Operand:
     return _cached(w, "wt", make)
 
 
+def weight_t_rotated_operand(w, four_over_six: bool = False) -> Fp4Operand:
+    """W^T [K, N] rotated along N (128-blocks) and re-quantized once per weight version (round to nearest); the
+    rotation seed (``rotate_seed`` of the result) is fixed per version."""
+    ver = getattr(w, "_bl_version", 0)
+    seed = (id(w) * 2654435761 + ver * 40503 + 1) & 0x7FFFFFFF
+
+    def make():
+        packed, scales, g = torch.ops.bitlattice.nvfp4_quantize(w.packed, True, _RTN, four_over_six, False, True, 0,
+                                                                None, w.scales, w.global_scale, seed, True)
+        return Fp4Operand(packed, scales, g, True, seed)
+    return _cached(w, "wt128_4o6" if four_over_six else "wt128", make)
+
+
 @lru_cache(maxsize=None)
 def _hadamard16(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """Orthogonal 16x16 matrix diag(s) H / 4 with a fixed random sign vector s."""
@@ -189,48 +343,190 @@ def _pad_rows(x2: torch.Tensor, multiple: int) -> torch.Tensor:
     return torch.nn.functional.pad(x2, (0, 0, 0, pad)) if pad else x2
 
 
-def nvfp4_linear(x: torch.Tensor, w, bias: torch.Tensor | None = None) -> torch.Tensor:
-    """y = Q(x) W^T (+ bias) with x quantized to NVFP4 on the fly; W must be an nvfp4 LatticeTensor."""
+# ---- recipe-driven quantization of GEMM operands ----------------------------------------------------------------
+
+_RTN, _SR, _EDEN = 0, 1, 2
+
+
+def _seed() -> int:
+    return next(_sr_counter) & 0x7FFFFFFF
+
+
+def _q(x2: torch.Tensor, *, transpose: bool = False, mode: int = _RTN, four_over_six: bool = False,
+       recipe: Fp4Recipe | None = None, rotate_seed: int = -1, seed: int = 0, w=None) -> Fp4Operand:
+    """NVFP4 operand from the general kernel: rows of x2 (or of x2^T), optionally rotated (128) with
+    ``rotate_seed``; ``w``: an NVFP4 weight given by its codes (transposed re-quantization)."""
+    mae = recipe is not None and recipe.select == "mae"
+    rot = rotate_seed >= 0
+    if w is not None:
+        packed, scales, g = torch.ops.bitlattice.nvfp4_quantize(w.packed, True, mode, four_over_six, mae, rot, seed,
+                                                                None, w.scales, w.global_scale,
+                                                                rotate_seed if rot else -1, True)
+    else:
+        packed, scales, g = torch.ops.bitlattice.nvfp4_quantize(x2, transpose, mode, four_over_six, mae, rot, seed,
+                                                                None, None, None, rotate_seed if rot else -1, True)
+    return Fp4Operand(packed, scales, g, True, rotate_seed)
+
+
+def _side(on: bool, mode: int = _RTN, four_over_six: bool = False, rotate_seed: int = -1, seed: int = 0) -> list:
+    return [int(on), mode, int(four_over_six), int(rotate_seed >= 0), seed, rotate_seed]
+
+
+def _q2(x2: torch.Tensor, row: list, col: list, recipe: Fp4Recipe) -> tuple[Fp4Operand | None, Fp4Operand | None]:
+    """Row and column (x2^T) operands of x2 [M, K] (both multiples of 128) from one read of x2 per pass."""
+    rp, rs, rg, cp, cs, cg = torch.ops.bitlattice.nvfp4_quantize2(x2, row, col, recipe.select == "mae", None, True)
+    return (Fp4Operand(rp, rs, rg, True, row[5] if row[3] else -1) if row[0] else None,
+            Fp4Operand(cp, cs, cg, True, col[5] if col[3] else -1) if col[0] else None)
+
+
+def _act_operand(x2: torch.Tensor, recipe: Fp4Recipe) -> Fp4Operand:
+    if recipe.activations == "4over6":
+        return _q(x2, four_over_six=True, recipe=recipe)
+    return quantize_fp4(x2)
+
+
+def _pad_to(recipe: Fp4Recipe) -> int:
+    return 128 if recipe.rotation == 128 else 32
+
+
+def nvfp4_linear(x: torch.Tensor, w, bias: torch.Tensor | None = None, recipe: Fp4Recipe | None = None
+                 ) -> torch.Tensor:
+    """y = Q(x) W^T (+ bias) with x quantized to NVFP4 on the fly; W must be an NVFP4 LatticeTensor."""
+    recipe = recipe or get_fp4_recipe(w)
     K = x.shape[-1]
-    x2 = x.reshape(-1, K)
-    M = x2.shape[0]
-    xq = quantize_fp4(_pad_rows(x2, 16).contiguous())
+    M = x.numel() // K
+
+    def make():
+        return _act_operand(_pad_rows(x.reshape(-1, K), 16).contiguous(), recipe)
+    xq = _shared(x, recipe, "fwd", make)
     y = fp4_mm(xq, weight_operand(w), x.dtype)[:M]
     if bias is not None:
         y += bias.to(y.dtype)
     return y.reshape(*x.shape[:-1], w.shape[0])
 
 
-def fp4_forward_saving(x: torch.Tensor, w, bias):
+# ---- one quantization per input shared by its consumers -------------------------------------------------------
+# Projections reading the same tensor (q / k / v, gate / up) would quantize it once each and save one copy of x^T
+# each for backward. The last few inputs are remembered by identity (weak reference + version counter + recipe), so
+# the consumers share the operands (and the saved x^T: less activation memory as well). Sharing one random rotation
+# and one stochastic draw between consumers keeps every gradient estimate unbiased.
+
+SHARE_INPUTS = True
+_SHARED: "OrderedDict" = OrderedDict()
+_SHARED_MAX = 4
+
+
+def _shared(x: torch.Tensor, recipe: Fp4Recipe, kind: str, make):
+    if not SHARE_INPUTS:
+        return make()
+    key = (id(x), x._version, recipe, kind, tuple(x.shape))
+    hit = _SHARED.get(key)
+    if hit is not None and hit[0]() is x:
+        _SHARED.move_to_end(key)
+        return hit[1]
+    val = make()
+    # the entry dies with the input (no operand outlives its consumers' forward passes)
+    _SHARED[key] = (weakref.ref(x, lambda _, k=key: _SHARED.pop(k, None)), val)
+    while len(_SHARED) > _SHARED_MAX:
+        _SHARED.popitem(last=False)
+    return val
+
+
+def clear_shared() -> None:
+    """Drop the remembered input operands (they also expire after a few other inputs)."""
+    _SHARED.clear()
+
+
+def fp4_forward_saving(x: torch.Tensor, w, bias, recipe: Fp4Recipe | None = None):
     """Forward of 'fp4_all': returns (y, saved), where saved holds x^T (rotated, NVFP4) for the weight gradient."""
+    recipe = recipe or get_fp4_recipe(w)
     K = x.shape[-1]
-    x2 = _pad_rows(x.reshape(-1, K), 32).contiguous()
     M = x.numel() // K
-    xq = quantize_fp4(x2)
+    xq, xt = _shared(x, recipe, "fwd+t", lambda: _input_operands(x, recipe))
     y = fp4_mm(xq, weight_operand(w), x.dtype)[:M]
     if bias is not None:
         y += bias.to(y.dtype)
-    # |x H/4| <= 4 max|x| for the orthogonal 16x16 rotation: the row-wise global scale bounds the rotated one
-    xt = Fp4Operand(*torch.ops.bitlattice.quantize_nvfp4_t(x2, _hadamard16(x2.device, torch.float32), -1, 0,
-                                                           xq.global_scale * 4.0))
     return y.reshape(*x.shape[:-1], w.shape[0]), xt
 
 
-def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool):
+def _input_operands(x: torch.Tensor, recipe: Fp4Recipe) -> tuple[Fp4Operand, Fp4Operand]:
+    """Forward operand of x and its (rotated) transposed operand for the weight gradient."""
+    K = x.shape[-1]
+    x2 = _pad_rows(x.reshape(-1, K), _pad_to(recipe)).contiguous()
+    if recipe.rotation == 128 and K % 128 == 0:
+        # one read of x for both
+        mode = _EDEN if recipe.gradients == "eden" else _RTN
+        fos = recipe.backward_4over6 or (mode == _RTN and recipe.activations == "4over6")
+        return _q2(x2, _side(True, _RTN, recipe.activations == "4over6"), _side(True, mode, fos, _seed(), _seed()),
+                   recipe)
+    xq = _act_operand(x2, recipe)
+    if recipe.rotation == 16:
+        # |x H/4| <= 4 max|x| for the orthogonal 16x16 rotation: the row-wise global scale bounds the rotated one
+        bound = xq.global_scale * (4.0 * (256.0 / 448.0 if recipe.activations == "4over6" else 1.0))
+        xt = Fp4Operand(*torch.ops.bitlattice.quantize_nvfp4_t(x2, _hadamard16(x2.device, torch.float32), -1, 0,
+                                                               bound))
+    else:
+        mode = _EDEN if recipe.gradients == "eden" else _RTN
+        fos = recipe.backward_4over6 or (mode == _RTN and recipe.activations == "4over6")
+        xt = _q(x2, transpose=True, mode=mode, four_over_six=fos, recipe=recipe, rotate_seed=_seed(), seed=_seed())
+    return xq, xt
+
+
+def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool,
+                 recipe: Fp4Recipe | None = None):
     """Input and weight gradients of y = x W^T on FP4 tensor cores."""
+    recipe = recipe or get_fp4_recipe(w)
     N = gy.shape[-1]
     g2 = gy.reshape(-1, N)
     M = g2.shape[0]
-    g2p = _pad_rows(g2, 32).contiguous()
+    g2p = _pad_rows(g2, _pad_to(recipe)).contiguous()
     gx = gw = None
     gq = None
+    b46 = recipe.backward_4over6
+    rotated_w = need_w and xt.rotate_seed >= 0
+    if N % 128 == 0 and (rotated_w or not need_w) and (recipe.rotate_dgrad or not need_x) and not recipe.legacy:
+        # one read of g for the input-gradient operand (rows, rotated along N) and the weight-gradient operand
+        # (columns, rotated along the tokens with the rotation of the saved x^T)
+        mode = _EDEN if recipe.gradients == "eden" else _SR
+        wt = None
+        if need_x and recipe.dgrad_weight == "cached":
+            wt = weight_t_rotated_operand(w, b46)
+        r = wt.rotate_seed if wt is not None else _seed()
+        gq, gt = _q2(g2p, _side(need_x, mode, b46, r, _seed()),
+                     _side(need_w, mode, b46, xt.rotate_seed if need_w else -1, _seed()), recipe)
+        if need_x:
+            if wt is None:
+                wt = _q(None, mode=_EDEN if mode == _EDEN else _RTN, four_over_six=b46, recipe=recipe, rotate_seed=r,
+                        seed=_seed(), w=w)
+            gx = fp4_mm(gq, wt, gy.dtype)[:M]
+        if need_w:
+            gw = fp4_mm(gt, xt, w.dtype)
+        return gx, gw
     if need_x:
-        gq = quantize_fp4(g2p, stochastic=True)
-        gx = fp4_mm(gq, weight_t_operand(w), gy.dtype)[:M]
+        if recipe.rotate_dgrad and N % 128 == 0:
+            mode = _EDEN if recipe.gradients == "eden" else _SR
+            wt = weight_t_rotated_operand(w, b46) if recipe.dgrad_weight == "cached" else None
+            r = wt.rotate_seed if wt is not None else _seed()
+            gq = _q(g2p, mode=mode, four_over_six=b46, recipe=recipe, rotate_seed=r, seed=_seed())
+            # W^T: MS-EDEN with MS-EDEN gradients (both factors unbiased), else round to nearest
+            if wt is None:
+                wt = _q(None, mode=_EDEN if mode == _EDEN else _RTN, four_over_six=b46, recipe=recipe,
+                        rotate_seed=r, seed=_seed(), w=w)
+            gx = fp4_mm(gq, wt, gy.dtype)[:M]
+            gq = None                                     # rotated: its global scale does not bound g^T
+        else:
+            gq = _q(g2p, mode=_SR, four_over_six=True, recipe=recipe, seed=_seed()) if b46 else \
+                quantize_fp4(g2p, stochastic=True)
+            gx = fp4_mm(gq, weight_t_operand(w), gy.dtype)[:M]
     if need_w:
-        seed = next(_sr_counter) & 0x7FFFFFFF                                          # g^T rotated, [N, Mp]
-        bound = gq.global_scale * 4.0 if gq is not None else None
-        gt = Fp4Operand(*torch.ops.bitlattice.quantize_nvfp4_t(g2p, _hadamard16(g2p.device, torch.float32), seed, 0,
-                                                               bound))
+        if xt.rotate_seed >= 0:                                                        # g^T rotated (128), [N, Mp]
+            mode = _EDEN if recipe.gradients == "eden" else _SR
+            gt = _q(g2p, transpose=True, mode=mode, four_over_six=b46, recipe=recipe, rotate_seed=xt.rotate_seed,
+                    seed=_seed())
+        else:
+            seed = _seed()                                                             # g^T rotated (16), [N, Mp]
+            bound = gq.global_scale * (4.0 * (256.0 / 448.0 if b46 else 1.0)) if gq is not None else None
+            gt = Fp4Operand(*torch.ops.bitlattice.quantize_nvfp4_t(g2p, _hadamard16(g2p.device, torch.float32), seed,
+                                                                   0, bound))
         gw = fp4_mm(gt, xt, w.dtype)
     return gx, gw

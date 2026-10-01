@@ -82,3 +82,58 @@ def test_nvfp4_input_transposed():
     d = (v.view(256, -1, 16) * (sc * g)[..., None]).reshape(256, 128)
     ref = w.dequantize(torch.float32).t()
     assert ((d - ref).norm() / ref.norm()).item() < 0.12
+
+
+SIDES = [  # (mode, four_over_six, rotate)
+    ("rtn", False, False), ("rtn", True, False), ("sr", False, True), ("eden", False, True), ("eden", True, True),
+    ("rtn", True, True),
+]
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("row", SIDES)
+@pytest.mark.parametrize("col", SIDES[::-1])
+def test_dual_layout_kernel_matches_reference(dtype, row, col):
+    x = _data(256, 384).to(dtype)
+    rmode, rfos, rrot = row
+    cmode, cfos, crot = col
+    r = [1, MODES[rmode], int(rfos), int(rrot), 5, 21]
+    c = [1, MODES[cmode], int(cfos), int(crot), 9, 33]
+    rp, rs, rg, cp, cs, cg = torch.ops.bitlattice.nvfp4_quantize2(x, r, c)
+    for (p, s, g), src, (mode, fos, rot, seed, rs_) in (((rp, rs, rg), x.float(), (rmode, rfos, rrot, 5, 21)),
+                                                       ((cp, cs, cg), x.float().t().contiguous(),
+                                                        (cmode, cfos, crot, 9, 33))):
+        v_ref, s_ref, g_ref = Q.quantize(src, mode=mode, four_over_six=fos, seed=seed, rotate=rot, rotate_seed=rs_)
+        v, sc = _decode(p, s, g, *src.shape)
+        assert torch.allclose(g.reshape(()), g_ref.reshape(()), rtol=1e-6)
+        assert (sc != s_ref).float().mean().item() < 2e-3
+        assert (v != v_ref).float().mean().item() < 2e-3
+
+
+def test_dual_layout_one_side_and_given_scales():
+    x = _data(128, 256)
+    rp, rs, rg, cp, cs, cg = torch.ops.bitlattice.nvfp4_quantize2(x, [1, 0, 0, 0, 0, -1], [0, 0, 0, 0, 0, -1])
+    assert cp.numel() == 0 and rp.shape == (128, 128)
+    p1, s1, g1 = torch.ops.bitlattice.nvfp4_quantize(x, False, 0, False, False, False, 0)
+    assert torch.equal(rp, p1) and torch.equal(rs.view(torch.uint8), s1.view(torch.uint8))
+    given = torch.tensor([g1.item() * 2, 1.0], device=DEV)
+    rp2, rs2, rg2, *_ = torch.ops.bitlattice.nvfp4_quantize2(x, [1, 0, 0, 0, 0, -1], [0, 0, 0, 0, 0, -1], False, given)
+    assert rg2.item() == given[0].item()
+
+
+@pytest.mark.parametrize("shape", [(256, 384), (200, 336), (128, 128)])
+def test_blocked_scales_match_tiled_layout(shape):
+    from bitlattice.backend import to_blocked
+    x = _data(*shape)
+    for transpose in (False, True):
+        if transpose and shape[0] % 128:
+            continue
+        p, s, g = torch.ops.bitlattice.nvfp4_quantize(x, transpose, 0, True, False, False, 0)
+        pb, sb, gb = torch.ops.bitlattice.nvfp4_quantize(x, transpose, 0, True, False, False, 0, None, None, None, -1,
+                                                         True)
+        assert torch.equal(p, pb) and torch.equal(to_blocked(s).view(torch.uint8), sb.view(torch.uint8))
+    if shape[0] % 128 == 0 and shape[1] % 128 == 0:
+        a = torch.ops.bitlattice.nvfp4_quantize2(x, [1, 0, 1, 0, 0, -1], [1, 2, 0, 1, 3, 7])
+        b = torch.ops.bitlattice.nvfp4_quantize2(x, [1, 0, 1, 0, 0, -1], [1, 2, 0, 1, 3, 7], False, None, True)
+        assert torch.equal(to_blocked(a[1]).view(torch.uint8), b[1].view(torch.uint8))
+        assert torch.equal(to_blocked(a[4]).view(torch.uint8), b[4].view(torch.uint8))

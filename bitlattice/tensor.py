@@ -43,6 +43,7 @@ class LatticeTensor(torch.Tensor):
         t.hi_idx, t.hi_val = hi_idx, hi_val
         t.fmt = F.get(fmt)
         t.compute = None          # per-tensor compute policy ('exact', 'fp4'); None follows bitlattice.backend
+        t.fp4_recipe = None       # per-tensor FP4 recipe (name or Fp4Recipe); None follows bitlattice.backend
         return t
 
     def __init__(self, *args, **kwargs):  # state is set in __new__
@@ -135,6 +136,7 @@ class LatticeTensor(torch.Tensor):
         t = LatticeTensor(p["packed"], p["scales"], p["global_scale"], p["zeros"], self.fmt, kw.get("shape", self.shape),
                           kw.get("dtype", self.dtype), p["hi_idx"], p["hi_val"])
         t.compute = self.compute
+        t.fp4_recipe = getattr(self, "fp4_recipe", None)
         return t
 
     # ------------------------------------------------------------------------------------------------------------
@@ -210,17 +212,20 @@ class _LatticeLinear(torch.autograd.Function):
         # the input is kept only for the weight gradient: not when the weight is frozen, and not in the no-grad
         # first pass of a checkpointed block (its recomputation saves it)
         need_w = ctx.needs_input_grad[1]
+        if ctx.policy != "exact":
+            ctx.recipe = backend.get_fp4_recipe(w)      # the backward runs on other threads: keep the forward's
         if ctx.policy == "fp4_all":
             ctx.x_meta = (x.shape, x.dtype)
             if need_w:
-                y, xt = backend.fp4_forward_saving(x, w, bias)
+                y, xt = backend.fp4_forward_saving(x, w, bias, ctx.recipe)
                 ctx.save_for_backward(xt.packed, xt.scales, xt.global_scale)
+                ctx.xt_meta = (xt.blocked, xt.rotate_seed)
                 return y
             ctx.save_for_backward()
-            return backend.nvfp4_linear(x, w, bias)
+            return backend.nvfp4_linear(x, w, bias, ctx.recipe)
         ctx.save_for_backward(x if need_w else None)
         if ctx.policy == "fp4":
-            return backend.nvfp4_linear(x, w, bias)
+            return backend.nvfp4_linear(x, w, bias, ctx.recipe)
         return torch.nn.functional.linear(x, w.dequantize(x.dtype), bias)
 
     @staticmethod
@@ -231,9 +236,9 @@ class _LatticeLinear(torch.autograd.Function):
             from . import backend
             shape, dtype = ctx.x_meta
             saved = ctx.saved_tensors
-            xt = backend.Fp4Operand(*saved) if saved else None
+            xt = backend.Fp4Operand(*saved, *ctx.xt_meta) if saved else None
             gx, gw = backend.fp4_backward(gy, w, xt, ctx.needs_input_grad[0],
-                                          ctx.needs_input_grad[1] and xt is not None)
+                                          ctx.needs_input_grad[1] and xt is not None, ctx.recipe)
             gx = gx.to(dtype).reshape(shape) if gx is not None else None
             gw = gw.to(w.dtype) if gw is not None else None
             return gx, gw, gb

@@ -30,7 +30,11 @@ std::tuple<Tensor, Tensor, Tensor> bl_nvfp4_quantize(Tensor x, bool transpose, i
                                                      bool mae, bool rotate, int64_t seed,
                                                      std::optional<Tensor> global_scale,
                                                      std::optional<Tensor> w_scales, std::optional<Tensor> w_global,
-                                                     int64_t rotate_seed);
+                                                     int64_t rotate_seed, bool blocked);
+std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> bl_nvfp4_quantize2(Tensor x, std::vector<int64_t> row,
+                                                                             std::vector<int64_t> col, bool mae,
+                                                                             std::optional<Tensor> global_scales,
+                                                                             bool blocked);
 Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::optional<Tensor> c, int64_t k, double beta2,
                     int64_t block, int64_t ns_steps, int64_t ns_dtype, int64_t sinkhorn_iters, double clip,
                     int64_t block_cols, int64_t ns_coeffs, int64_t ns_algo);
@@ -62,8 +66,11 @@ TORCH_LIBRARY(bitlattice, m) {
   m.def("scale_(Tensor(a!) y, Tensor alpha) -> Tensor(a!)");
   m.def("nvfp4_quantize(Tensor x, bool transpose=False, int mode=0, bool four_over_six=False, bool mae=False, "
         "bool rotate=False, int seed=0, Tensor? global_scale=None, Tensor? w_scales=None, Tensor? w_global=None, "
-        "int rotate_seed=-1) "
+        "int rotate_seed=-1, bool blocked=False) "
         "-> (Tensor, Tensor, Tensor)");
+  m.def("nvfp4_quantize2(Tensor x, int[] row, int[] col, bool mae=False, Tensor? global_scales=None, "
+        "bool blocked=False) "
+        "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
@@ -78,6 +85,7 @@ TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
   m.impl("requantize_nvfp4_t", &bl_requantize_nvfp4_t);
   m.impl("scale_", &bl_scale_);
   m.impl("nvfp4_quantize", &bl_nvfp4_quantize);
+  m.impl("nvfp4_quantize2", &bl_nvfp4_quantize2);
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CompositeExplicitAutograd, m) { m.impl("direction", &bl_direction); }

@@ -3,7 +3,7 @@
 // One configurable pipeline per 16-element block:
 //   [rotation]  randomized Hadamard transform over 128-element chunks (8 lanes x 16 values, warp shuffles)
 //   scale       block amax / 6 (or / 4: four over six, choosing the lower MSE or MAE of the round-to-nearest codes)
-//   codes       round to nearest | stochastic rounding | round to nearest with MS-EDEN scale correction
+//   codes       round to nearest (ties to even) | stochastic rounding | round to nearest with MS-EDEN scale correction
 //   MS-EDEN     S = <x, x> / <x, x_rtn> per 128 elements; every block scale times S, stochastically rounded to E4M3
 // Layouts: rows of a [rows, cols] tensor along cols ("row"), or rows of its transpose ("col", via a shared-memory
 // tile); the input may be bf16 / fp16 / fp32 or an NVFP4 tensor given by its codes and scales (re-quantization of
@@ -17,8 +17,17 @@
 
 #include <optional>
 #include <type_traits>
+#include <vector>
 
 #include "common.cuh"
+
+// architecture-specific targets with the E2M1 conversion instructions (sm_100a / sm_120a and relatives)
+#if defined(__CUDA_ARCH__) &&                                                                                   \
+    (defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM101_ALL) ||                              \
+     defined(__CUDA_ARCH_FEAT_SM103_ALL) || defined(__CUDA_ARCH_FEAT_SM110_ALL) ||                              \
+     defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL))
+#define BL_HW_E2M1 1
+#endif
 
 namespace {
 
@@ -37,11 +46,10 @@ struct Opts {
   uint32_t rseed;    // rotation signs (both operands of a GEMM use the same)
 };
 
+// nearest E2M1 level, ties to the even code (as the hardware conversion); |v| > 6 saturates
 __device__ __forceinline__ uint32_t code_rtn(float v) {
   const float a = fabsf(v);
-  uint32_t m;
-  if (v >= 0.0f) m = (a > 0.25f) + (a > 0.75f) + (a > 1.25f) + (a > 1.75f) + (a > 2.5f) + (a > 3.5f) + (a > 5.0f);
-  else m = (a >= 0.25f) + (a >= 0.75f) + (a >= 1.25f) + (a >= 1.75f) + (a >= 2.5f) + (a >= 3.5f) + (a >= 5.0f);
+  const uint32_t m = (a > 0.25f) + (a >= 0.75f) + (a > 1.25f) + (a >= 1.75f) + (a > 2.5f) + (a >= 3.5f) + (a > 5.0f);
   return (v < 0.0f && m ? 8u : 0u) | m;
 }
 
@@ -125,6 +133,41 @@ __device__ __forceinline__ float lane8_sum(float x) {
 }
 
 // quantize one block: returns packed codes, writes the scale byte. ``elem0`` / ``block`` index the stochastic draws.
+// round-to-nearest codes of v * inv (16 values), and the dequantized values of codes c times s
+__device__ __forceinline__ void codes16(const float v[16], float inv, uint32_t c[16]) {
+#ifdef BL_HW_E2M1
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    uint32_t r;
+    asm("{\n .reg .b8 t;\n cvt.rn.satfinite.e2m1x2.f32 t, %1, %2;\n cvt.u32.u8 %0, t;\n}"
+        : "=r"(r) : "f"(v[2 * k + 1] * inv), "f"(v[2 * k] * inv));
+    c[2 * k] = r & 15u;
+    c[2 * k + 1] = r >> 4;
+  }
+#else
+#pragma unroll
+  for (int i = 0; i < 16; ++i) c[i] = code_rtn(v[i] * inv);
+#endif
+}
+
+__device__ __forceinline__ void values16(const uint32_t c[16], float s, float out[16]) {
+#ifdef BL_HW_E2M1
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    uint32_t h2;
+    const uint16_t b = static_cast<uint16_t>(c[2 * k] | (c[2 * k + 1] << 4));
+    asm("{\n .reg .b8 t;\n cvt.u8.u16 t, %1;\n cvt.rn.f16x2.e2m1x2 %0, t;\n}" : "=r"(h2) : "h"(b));
+    const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h2));
+    out[2 * k] = f.x * s;
+    out[2 * k + 1] = f.y * s;
+  }
+#else
+#pragma unroll
+  for (int i = 0; i < 16; ++i) out[i] = level(c[i]) * s;
+#endif
+}
+
+// quantize one block: returns packed codes, writes the scale byte. ``elem0`` / ``block`` index the stochastic draws.
 __device__ __forceinline__ uint64_t quantize16(const float v[16], float g, const Opts& o, uint64_t elem0,
                                                uint64_t block, int lane8, uint8_t* scale_out) {
   // one division per block; elements are scaled by the reciprocal (the reference does the same)
@@ -134,19 +177,21 @@ __device__ __forceinline__ uint64_t quantize16(const float v[16], float g, const
   float s = e4m3_round(amax / 6.0f / g) * g;
   float inv = s > 0.0f ? 1.0f / s : 0.0f;
   uint32_t c[16];
-#pragma unroll
-  for (int i = 0; i < 16; ++i) c[i] = code_rtn(v[i] * inv);
+  codes16(v, inv, c);
   if (o.fos) {
     const float s4 = e4m3_round(amax / 4.0f / g) * g;
     const float inv4 = s4 > 0.0f ? 1.0f / s4 : 0.0f;
-    float e6 = 0.0f, e4 = 0.0f;
     uint32_t c4[16];
+    codes16(v, inv4, c4);
+    float d6[16], d4[16];
+    values16(c, s, d6);
+    values16(c4, s4, d4);
+    float e6 = 0.0f, e4 = 0.0f;
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
-      c4[i] = code_rtn(v[i] * inv4);
-      const float d6 = level(c[i]) * s - v[i], d4 = level(c4[i]) * s4 - v[i];
-      e6 += o.mae ? fabsf(d6) : d6 * d6;
-      e4 += o.mae ? fabsf(d4) : d4 * d4;
+      const float a6 = d6[i] - v[i], a4 = d4[i] - v[i];
+      e6 += o.mae ? fabsf(a6) : a6 * a6;
+      e4 += o.mae ? fabsf(a4) : a4 * a4;
     }
     if (e4 < e6) {
       s = s4;
@@ -160,11 +205,13 @@ __device__ __forceinline__ uint64_t quantize16(const float v[16], float g, const
 #pragma unroll
     for (int i = 0; i < 16; ++i) c[i] = code_sr(v[i] * inv, bl::hash_uniform(elem0 + i, o.seed, 0u));
   } else if (o.mode == kEDEN) {
+    float d[16];
+    values16(c, s, d);
     float xx = 0.0f, xr = 0.0f;
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
       xx += v[i] * v[i];
-      xr += v[i] * (level(c[i]) * s);
+      xr += v[i] * d[i];
     }
     xx = lane8_sum(xx);
     xr = lane8_sum(xr);
@@ -201,12 +248,25 @@ __device__ __forceinline__ void atomic_max_pos(float* addr, float v) {
   atomicMax(reinterpret_cast<int*>(addr), __float_as_int(v));
 }
 
+// Block scales [rows, cols] row-major, or directly in the 128x4-tiled layout of block-scaled GEMMs (``nc``: columns
+// padded to a multiple of 4, divided by 4); see bitlattice.backend.to_blocked
+struct ScaleOut {
+  uint8_t* p;
+  int64_t cols;
+  int64_t nc;
+  bool blocked;
+  __device__ __forceinline__ void put(int64_t r, int64_t c, uint8_t v) const {
+    if (blocked) p[((r >> 7) * nc + (c >> 2)) * 512 + (r & 31) * 16 + ((r >> 5) & 3) * 4 + (c & 3)] = v;
+    else p[r * cols + c] = v;
+  }
+};
+
 // ---------------------------------------------------------------- row layout: blocks along the last dimension
 // thread b handles block b; 8 consecutive threads hold one 128-element chunk (cols % 128 == 0 when rotating or EDEN)
 
 template <typename T, bool kAmax>
 __global__ void row_kernel(const T* x, int64_t nblocks, int64_t cols, Opts o, float* amax, const float* gptr,
-                           uint8_t* packed, uint8_t* scales) {
+                           uint8_t* packed, ScaleOut scales) {
   const int64_t b = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const bool live = b < nblocks;
   const int lane8 = static_cast<int>(b & 7);
@@ -231,7 +291,7 @@ __global__ void row_kernel(const T* x, int64_t nblocks, int64_t cols, Opts o, fl
   const uint64_t out = quantize16(v, g, o, static_cast<uint64_t>(b) * 16, static_cast<uint64_t>(b), lane8, &s8);
   if (live) {
     reinterpret_cast<uint64_t*>(packed)[b] = out;
-    scales[b] = s8;
+    scales.put(b / (cols / 16), b % (cols / 16), s8);
   }
 }
 
@@ -261,7 +321,7 @@ __device__ __forceinline__ float load_elem<uint8_t>(const uint8_t*, int64_t cols
 
 template <typename T, bool kAmax>
 __global__ void col_kernel(const T* x, int64_t rows, int64_t cols, Fp4Input w, Opts o, float* amax,
-                           const float* gptr, uint8_t* packed, uint8_t* scales) {
+                           const float* gptr, uint8_t* packed, ScaleOut scales) {
   __shared__ float tile[128][33];
   const int t = threadIdx.x;
   const int64_t r0 = static_cast<int64_t>(blockIdx.y) * 128, c0 = static_cast<int64_t>(blockIdx.x) * 32;
@@ -295,10 +355,160 @@ __global__ void col_kernel(const T* x, int64_t rows, int64_t cols, Fp4Input w, O
                                   static_cast<uint64_t>(oc * nb + ob), lane8, &s8);
   if (oc < cols) {
     reinterpret_cast<uint64_t*>(packed + oc * (rows / 2))[ob] = out;
-    scales[oc * nb + ob] = s8;
+    scales.put(oc, ob, s8);
   }
 }
 
+// ---------------------------------------------------------------- both layouts from one read (cast-transpose)
+// A CTA of 256 threads stages a 128 x 128 tile of x [M, K] in shared memory and quantizes its rows (operand rows of
+// x, blocks along K) and its columns (operand rows of x^T, blocks along M), each side with its own options. As in
+// the other kernels a thread owns one 16-element block and 8 consecutive lanes one 128-element chunk; the rotation
+// signs of a lane are computed once. Element (r, c) of the tile lives at r * 128 + (c ^ swz(r)) with swz(r) =
+// ((r / 16) % 8) * (elements per 4 bank words): 16-byte row reads stay contiguous and the column reads of a warp (4
+// columns x 8 row groups) hit distinct banks.
+
+struct Side {
+  bool on;
+  int mode;
+  bool fos;
+  bool rotate;
+  uint32_t seed, rseed;
+};
+
+template <typename T> struct Stage { using type = T; static constexpr int kSwz = 3; };
+template <> struct Stage<float> { using type = float; static constexpr int kSwz = 2; };
+
+template <int kSwz> __device__ __forceinline__ int swz(int r) { return ((r >> 4) & 7) << kSwz; }
+
+__device__ __forceinline__ uint32_t sign_mask(int lane8, uint32_t rseed) {
+  uint32_t m = 0;
+#pragma unroll
+  for (int i = 0; i < 16; ++i)
+    m |= (bl::hash_uniform(static_cast<uint64_t>(lane8 * 16 + i), rseed, 0x5151u) < 0.5f ? 1u : 0u) << i;
+  return m;
+}
+
+__device__ __forceinline__ void rotate_masked(float v[16], int lane8, uint32_t mask) {
+#pragma unroll
+  for (int i = 0; i < 16; ++i) v[i] = (mask >> i) & 1u ? -v[i] : v[i];
+  hadamard128(v, lane8);
+}
+
+__device__ __forceinline__ float global_of(const float* amax, const float* given, int side, bool fos) {
+  if (given) return given[side];
+  return fmaxf(amax[side] / (6.0f * (fos ? 256.0f : 448.0f)), 1e-12f);
+}
+
+template <typename T, bool kAmax>
+__global__ void __launch_bounds__(256) dual_kernel(const T* __restrict__ x, int64_t M, int64_t K, Side row, Side col,
+                                                   bool mae, float* amax, const float* given, float* g_out,
+                                                   uint8_t* rp, ScaleOut rs, uint8_t* cp, ScaleOut cs) {
+  using E = typename Stage<T>::type;
+  constexpr int kSwz = Stage<T>::kSwz;
+  constexpr int kPer = 16 / sizeof(E);                       // elements per 16-byte vector
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  E* tile = reinterpret_cast<E*>(smem_raw);
+  const int64_t r0 = static_cast<int64_t>(blockIdx.y) * 128, k0 = static_cast<int64_t>(blockIdx.x) * 128;
+  for (int i = threadIdx.x; i < 128 * 128 / kPer; i += 256) {
+    const int r = i / (128 / kPer), c = (i % (128 / kPer)) * kPer;
+    *reinterpret_cast<uint4*>(tile + r * 128 + (c ^ swz<kSwz>(r))) =
+        *reinterpret_cast<const uint4*>(x + (r0 + r) * K + k0 + c);
+  }
+  const int lane8 = threadIdx.x & 7, sub = threadIdx.x >> 3;   // sub: 0..31
+  const uint32_t rmask = row.on && row.rotate ? sign_mask(lane8, row.rseed) : 0u;
+  const uint32_t cmask = col.on && col.rotate ? sign_mask(lane8, col.rseed) : 0u;
+  float gr = 0.0f, gc = 0.0f;
+  Opts ro{row.mode, row.fos, mae, false, row.seed, row.rseed}, co{col.mode, col.fos, mae, false, col.seed, col.rseed};
+  if (!kAmax) {
+    if (row.on) gr = global_of(amax, given, 0, row.fos);
+    if (col.on) gc = global_of(amax, given, 1, col.fos);
+    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
+      g_out[0] = gr;
+      g_out[1] = gc;
+    }
+  }
+  __syncthreads();
+  float mr = 0.0f, mc = 0.0f;
+  float v[16];
+  if (row.on) {
+#pragma unroll 1
+    for (int k = 0; k < 4; ++k) {
+      const int r = sub + 32 * k;
+      const E* src = tile + r * 128;
+      const int sw = swz<kSwz>(r);
+#pragma unroll
+      for (int h = 0; h < 16 / kPer; ++h) {
+        const uint4 raw = *reinterpret_cast<const uint4*>(src + ((lane8 * 16 + h * kPer) ^ sw));
+        const E* e = reinterpret_cast<const E*>(&raw);
+#pragma unroll
+        for (int t = 0; t < kPer; ++t) v[h * kPer + t] = tof<E>(e[t]);
+      }
+      if (row.rotate) rotate_masked(v, lane8, rmask);
+      const int64_t orow = r0 + r;
+      if (kAmax) {
+#pragma unroll
+        for (int i = 0; i < 16; ++i) mr = fmaxf(mr, fabsf(v[i]));
+      } else {
+        const int64_t b = orow * (K / 16) + k0 / 16 + lane8;
+        uint8_t s8;
+        const uint64_t out = quantize16(v, gr, ro, static_cast<uint64_t>(b) * 16, static_cast<uint64_t>(b), lane8,
+                                        &s8);
+        reinterpret_cast<uint64_t*>(rp)[b] = out;
+        rs.put(orow, k0 / 16 + lane8, s8);
+      }
+    }
+  }
+  if (col.on) {
+#pragma unroll 1
+    for (int k = 0; k < 4; ++k) {
+      const int c = sub + 32 * k;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {
+        const int r = lane8 * 16 + i;
+        v[i] = tof<E>(tile[r * 128 + (c ^ swz<kSwz>(r))]);
+      }
+      if (col.rotate) rotate_masked(v, lane8, cmask);
+      const int64_t ocol = k0 + c;
+      if (kAmax) {
+#pragma unroll
+        for (int i = 0; i < 16; ++i) mc = fmaxf(mc, fabsf(v[i]));
+      } else {
+        const int64_t b = ocol * (M / 16) + r0 / 16 + lane8;
+        uint8_t s8;
+        const uint64_t out = quantize16(v, gc, co, static_cast<uint64_t>(b) * 16, static_cast<uint64_t>(b), lane8,
+                                        &s8);
+        reinterpret_cast<uint64_t*>(cp)[b] = out;
+        cs.put(ocol, r0 / 16 + lane8, s8);
+      }
+    }
+  }
+  if (kAmax) {
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+      mr = fmaxf(mr, __shfl_xor_sync(0xffffffffu, mr, m));
+      mc = fmaxf(mc, __shfl_xor_sync(0xffffffffu, mc, m));
+    }
+    if ((threadIdx.x & 31) == 0) {
+      if (row.on) atomic_max_pos(amax, mr);
+      if (col.on) atomic_max_pos(amax + 1, mc);
+    }
+  }
+}
+
+}  // namespace
+
+namespace {
+// scale buffer for an operand [rows, cols / 16]: row-major, or tiled (zero padding to 128 rows x 4 columns)
+std::pair<at::Tensor, ScaleOut> scale_buffer(int64_t rows, int64_t scols, bool blocked, const at::TensorOptions& opt) {
+  if (!blocked) {
+    at::Tensor t = at::empty({rows, scols}, opt);
+    return {t, ScaleOut{t.data_ptr<uint8_t>(), scols, 0, false}};
+  }
+  const int64_t nr = (rows + 127) / 128, nc = (scols + 3) / 4;
+  const bool pad = nr * 128 != rows || nc * 4 != scols;
+  at::Tensor t = pad ? at::zeros({nr * 128 * nc * 4}, opt) : at::empty({nr * 128 * nc * 4}, opt);
+  return {t, ScaleOut{t.data_ptr<uint8_t>(), scols, nc, true}};
+}
 }  // namespace
 
 // x: [rows, cols] bf16 / fp16 / fp32, or uint8 NVFP4 codes [rows, cols/2] with ``w_scales`` / ``w_global`` (col
@@ -310,7 +520,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bl_nvfp4_quantize(at::Tensor x, b
                                                                  int64_t seed, std::optional<at::Tensor> global_scale,
                                                                  std::optional<at::Tensor> w_scales,
                                                                  std::optional<at::Tensor> w_global,
-                                                                 int64_t rotate_seed) {
+                                                                 int64_t rotate_seed, bool blocked) {
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 2, "x must be a contiguous 2-D CUDA tensor");
   const c10::cuda::CUDAGuard guard(x.device());
   const bool fp4_in = x.scalar_type() == at::kByte;
@@ -324,7 +534,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bl_nvfp4_quantize(at::Tensor x, b
          static_cast<uint32_t>(rotate_seed < 0 ? seed : rotate_seed)};
   auto opt = x.options();
   at::Tensor packed = at::empty({out_rows, out_cols / 2}, opt.dtype(at::kByte));
-  at::Tensor scales = at::empty({out_rows, out_cols / 16}, opt.dtype(at::kByte));
+  auto [scales, sout] = scale_buffer(out_rows, out_cols / 16, blocked, opt.dtype(at::kByte));
   at::Tensor amax = at::zeros({1}, opt.dtype(at::kFloat));
   at::Tensor global;
   const bool given = global_scale.has_value();
@@ -345,18 +555,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bl_nvfp4_quantize(at::Tensor x, b
       const int64_t nb = rows * cols / 16;
       const int blocks = static_cast<int>((nb + 255) / 256);
       if (!given) row_kernel<T, true><<<blocks, 256, 0, stream>>>(ptr, nb, cols, o, amax.data_ptr<float>(), nullptr,
-                                                                  nullptr, nullptr);
+                                                                  nullptr, sout);
       finish_global();
       row_kernel<T, false><<<blocks, 256, 0, stream>>>(ptr, nb, cols, o, nullptr, global.data_ptr<float>(),
-                                                       packed.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>());
+                                                       packed.data_ptr<uint8_t>(), sout);
     } else {
       TORCH_CHECK(rows % 128 == 0, "transposed quantization needs rows % 128 == 0 (pad first)");
       dim3 grid(static_cast<unsigned>((cols + 31) / 32), static_cast<unsigned>(rows / 128));
       if (!given) col_kernel<T, true><<<grid, 256, 0, stream>>>(ptr, rows, cols, w, o, amax.data_ptr<float>(),
-                                                                nullptr, nullptr, nullptr);
+                                                                nullptr, nullptr, sout);
       finish_global();
       col_kernel<T, false><<<grid, 256, 0, stream>>>(ptr, rows, cols, w, o, nullptr, global.data_ptr<float>(),
-                                                     packed.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>());
+                                                     packed.data_ptr<uint8_t>(), sout);
     }
   };
   if (fp4_in) launch(x.data_ptr<uint8_t>());
@@ -368,4 +578,56 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bl_nvfp4_quantize(at::Tensor x, b
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {packed, scales.view(at::kFloat8_e4m3fn), global};
+}
+
+
+// Both layouts of x [M, K] (M, K multiples of 128) from one read per pass. row / col = {on, mode, four_over_six,
+// rotate, seed, rotate_seed}; a side that is off returns empty tensors. Global scales: given ([2]: row, col) or the
+// amax of each (rotated) side / (6 * (four_over_six ? 256 : 448)), computed by a first pass over x.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> bl_nvfp4_quantize2(
+    at::Tensor x, std::vector<int64_t> row, std::vector<int64_t> col, bool mae, std::optional<at::Tensor> global_scales,
+    bool blocked) {
+  TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 2, "x must be a contiguous 2-D CUDA tensor");
+  TORCH_CHECK(row.size() == 6 && col.size() == 6, "row / col: {on, mode, four_over_six, rotate, seed, rotate_seed}");
+  const int64_t M = x.size(0), K = x.size(1);
+  TORCH_CHECK(M % 128 == 0 && K % 128 == 0, "both dimensions must be multiples of 128");
+  const c10::cuda::CUDAGuard guard(x.device());
+  auto side = [](const std::vector<int64_t>& v) {
+    return Side{v[0] != 0, static_cast<int>(v[1]), v[2] != 0, v[3] != 0, static_cast<uint32_t>(v[4]),
+                static_cast<uint32_t>(v[5] < 0 ? v[4] : v[5])};
+  };
+  const Side rs = side(row), cs = side(col);
+  auto opt = x.options().dtype(at::kByte);
+  at::Tensor rp = at::empty({rs.on ? M : 0, K / 2}, opt), cp = at::empty({cs.on ? K : 0, M / 2}, opt);
+  auto [rsc, rso] = scale_buffer(rs.on ? M : 0, K / 16, blocked, opt);
+  auto [csc, cso] = scale_buffer(cs.on ? K : 0, M / 16, blocked, opt);
+  at::Tensor g = at::empty({2}, x.options().dtype(at::kFloat));
+  at::Tensor amax = at::zeros({2}, x.options().dtype(at::kFloat));
+  at::Tensor given;
+  if (global_scales.has_value()) given = global_scales->to(at::kFloat).reshape({2}).contiguous();
+  const float* gp = global_scales.has_value() ? given.data_ptr<float>() : nullptr;
+  dim3 grid(static_cast<unsigned>(K / 128), static_cast<unsigned>(M / 128));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto launch = [&](auto* ptr) {
+    using T = std::remove_const_t<std::remove_pointer_t<decltype(ptr)>>;
+    const size_t smem = 128 * 128 * sizeof(typename Stage<T>::type);
+    auto k_amax = dual_kernel<T, true>;
+    auto k_quant = dual_kernel<T, false>;
+    if (smem > 48 * 1024) {
+      cudaFuncSetAttribute(k_amax, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+      cudaFuncSetAttribute(k_quant, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+    }
+    if (!gp) k_amax<<<grid, 256, smem, stream>>>(ptr, M, K, rs, cs, mae, amax.data_ptr<float>(), nullptr, nullptr,
+                                                 nullptr, rso, nullptr, cso);
+    k_quant<<<grid, 256, smem, stream>>>(ptr, M, K, rs, cs, mae, amax.data_ptr<float>(), gp, g.data_ptr<float>(),
+                                         rp.data_ptr<uint8_t>(), rso, cp.data_ptr<uint8_t>(), cso);
+  };
+  if (x.scalar_type() == at::kBFloat16) launch(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()));
+  else if (x.scalar_type() == at::kHalf) launch(reinterpret_cast<const __half*>(x.data_ptr<at::Half>()));
+  else {
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "x must be bf16, fp16 or fp32");
+    launch(x.data_ptr<float>());
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {rp, rsc.view(at::kFloat8_e4m3fn), g.narrow(0, 0, 1), cp, csc.view(at::kFloat8_e4m3fn), g.narrow(0, 1, 1)};
 }

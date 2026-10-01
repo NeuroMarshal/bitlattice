@@ -4,6 +4,7 @@ blocks.
 
 Conventions (shared with csrc/nvfp4.cu):
     value = e2m1(code) * e4m3(scale) * global              blocks of 16 along the last dimension
+    round to nearest: ties to the even code (as the hardware E2M1 conversion)
     four over six: the tensor scale uses 256 instead of 448 (256 * 6/4 = 384 is exact in E4M3), every block is
                    quantized with its maximum mapped to 6 and to 4 and keeps the one with the lower error
                    ('mse' or 'mae'); the choice uses round-to-nearest codes
@@ -58,14 +59,13 @@ def _e4m3(v: torch.Tensor) -> torch.Tensor:
 
 
 def _nearest(v: torch.Tensor) -> torch.Tensor:
+    """Nearest E2M1 level, ties to the even code (as the hardware conversion); |v| > 6 saturates."""
     lv = E2M1.to(v.device)
-    a = v.abs().clamp(max=6.0)
-    mid = (lv[1:] + lv[:-1]) / 2
-    # ties to the lower value: positive ties go down in magnitude, negative ties go up in magnitude
-    idx_pos = torch.bucketize(a, mid, right=False)                 # a == mid -> lower index
-    idx_neg = torch.bucketize(a, mid, right=True)                  # a == mid -> higher index (more negative)
-    idx = torch.where(v < 0, idx_neg, idx_pos)
-    return torch.where(v < 0, -lv[idx], lv[idx])
+    a = v.abs()
+    mid = ((lv[1:] + lv[:-1]) / 2).tolist()
+    idx = sum(((a >= m) if i % 2 else (a > m)).to(torch.int64) for i, m in enumerate(mid))
+    m = lv[idx]
+    return torch.where(v < 0, -m, m)
 
 
 def _stochastic(v: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
