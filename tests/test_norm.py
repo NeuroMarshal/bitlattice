@@ -73,3 +73,44 @@ def test_fuse_on_a_model():
     changed = bl.nn.fuse_rmsnorm_(m)
     assert changed == {"Qwen2RMSNorm": 5}
     assert torch.allclose(m(x).logits.float(), ref.float(), atol=5e-2, rtol=5e-2)
+
+
+class _GatedRef(torch.nn.Module):
+    """The normalize-then-gate RMSNorm of Qwen3.5 / Qwen3-Next linear-attention layers."""
+
+    def __init__(self, d, eps=1e-6):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(d) + 0.1 * torch.randn(d))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states, gate):
+        input_dtype = hidden_states.dtype
+        h = hidden_states.to(torch.float32)
+        var = h.pow(2).mean(-1, keepdim=True)
+        h = h * torch.rsqrt(var + self.variance_epsilon)
+        h = self.weight * h.to(input_dtype)
+        h = h * torch.nn.functional.silu(gate.to(torch.float32))
+        return h.to(input_dtype)
+
+
+class GatedRMSNormGated(_GatedRef):
+    pass
+
+
+def test_gated_rmsnorm_matches_reference():
+    torch.manual_seed(0)
+    ref = GatedRMSNormGated(128).cuda().bfloat16()
+    lean = GatedRMSNormGated(128).cuda().bfloat16()
+    lean.load_state_dict(ref.state_dict())
+    assert bl.nn.fuse_rmsnorm_(lean) == {"GatedRMSNormGated": 1}
+    x = torch.randn(3, 300, 128, device="cuda", dtype=torch.bfloat16)
+    g = torch.randn(3, 300, 128, device="cuda", dtype=torch.bfloat16)
+    outs = []
+    for m in (ref, lean):
+        xi, gi = x.clone().requires_grad_(True), g.clone().requires_grad_(True)
+        y = m(xi, gi)
+        (y.float() * torch.linspace(-1, 1, 128, device="cuda")).sum().backward()
+        outs.append((y.float(), xi.grad.float(), gi.grad.float(), m.weight.grad.float()))
+        m.weight.grad = None
+    for name, a, b in zip(("y", "dx", "dgate", "dw"), outs[1], outs[0]):
+        assert ((a - b).norm() / b.norm()).item() < 2e-2, name

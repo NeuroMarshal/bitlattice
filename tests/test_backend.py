@@ -339,3 +339,26 @@ def test_auto_policy_routes_by_format():
     with bl.compute("auto"):
         routes = {n: r for n, f, r in bl.backend.explain(lin)}
     assert routes["0.weight"] == "fp4_all" and routes["1.weight"] == "mxfp8_all", routes
+
+
+
+def test_deferred_weight_gradients_with_delayed_scales():
+    torch.manual_seed(14)
+    w = LatticeTensor.from_float(torch.randn(128, 256, device=DEV) * 0.05, "nvfp4")
+    p = torch.nn.Parameter(w.detach())
+    for step in range(3):                              # the first step is exact; later ones use delayed scales
+        xs = [(torch.randn(128, 256, device=DEV) * s).to(torch.bfloat16) for s in (1.0, 1.3)]
+        gys = [torch.randn(128, 128, device=DEV, dtype=torch.bfloat16) for _ in xs]
+        ref = sum(_grads(x, w, gy, "exact", "nvidia")[2] for x, gy in zip(xs, gys))
+        p.grad = None
+        with bl.compute("fp4_all"), bl.fp4_recipe("quartet2_delayed"):
+            with bl.backend.defer_wgrad():
+                for x, gy in zip(xs, gys):
+                    torch.nn.functional.linear(x.clone().requires_grad_(True), p).backward(gy)
+            for _, items in bl.backend._PENDING.values():   # the operands to concatenate: power-of-two scales
+                for gt, xt in items:
+                    for g in (gt.global_scale, xt.global_scale):
+                        assert torch.equal(g, torch.exp2(torch.round(torch.log2(g))))
+            bl.backend.flush_wgrad()
+        rel = ((p.grad.float() - ref).norm() / ref.norm()).item()
+        assert rel < 0.25, (step, rel)

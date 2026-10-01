@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["rms_norm", "fuse_rmsnorm_"]
+__all__ = ["rms_norm", "rms_norm_gated", "fuse_rmsnorm_"]
 
 _ROWS = 4096
 
@@ -60,6 +60,59 @@ class _RMSNorm(torch.autograd.Function):
                 gw.to(w.dtype) if gw is not None else None, None, None, None)
 
 
+class _RMSNormGated(torch.autograd.Function):
+    """y = cast(cast(w * cast(x * rstd)) * silu(gate)) (normalize, then gate; as in Qwen3.5 / Qwen3-Next linear
+    attention). Reference implementations keep several float32 copies of x and gate (normalized input, its product
+    with the weight, silu(gate), the product); here only x, gate (their own dtype) and rstd are kept."""
+
+    @staticmethod
+    def forward(ctx, x, gate, w, eps: float):
+        shape = x.shape
+        x2, g2 = x.reshape(-1, shape[-1]), gate.reshape(-1, shape[-1])
+        out = torch.empty_like(x2)
+        rstd = torch.empty(x2.shape[0], dtype=torch.float32, device=x.device)
+        for s in range(0, x2.shape[0], _ROWS):
+            xf = x2[s:s + _ROWS].float()
+            r = torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
+            rstd[s:s + _ROWS] = r.squeeze(-1)
+            b = w * (xf * r).to(x.dtype)
+            out[s:s + _ROWS] = (b * torch.nn.functional.silu(g2[s:s + _ROWS].float())).to(x.dtype)
+        ctx.save_for_backward(x, gate, w, rstd)
+        return out.reshape(shape)
+
+    @staticmethod
+    def backward(ctx, gy):
+        x, gate, w, rstd = ctx.saved_tensors
+        d = x.shape[-1]
+        x2, g2, gy2 = x.reshape(-1, d), gate.reshape(-1, d), gy.reshape(-1, d)
+        gx = torch.empty_like(x2) if ctx.needs_input_grad[0] else None
+        gg = torch.empty_like(g2) if ctx.needs_input_grad[1] else None
+        gw = torch.zeros(d, dtype=torch.float32, device=x.device) if ctx.needs_input_grad[2] else None
+        wf = w.float()
+        for s in range(0, x2.shape[0], _ROWS):
+            r = rstd[s:s + _ROWS, None]
+            n = x2[s:s + _ROWS].float() * r                                   # normalized input
+            a = n.to(x.dtype).float()
+            z = g2[s:s + _ROWS].float()
+            sg = torch.sigmoid(z)
+            dy = gy2[s:s + _ROWS].float()
+            if gg is not None:
+                b = (w * a.to(x.dtype)).float()
+                gg[s:s + _ROWS] = (dy * b * sg * (1.0 + z * (1.0 - sg))).to(gate.dtype)
+            db = dy * (z * sg)                                                # d(w * a)
+            if gw is not None:
+                gw += (db * a).sum(0)
+            if gx is not None:
+                dn = db * wf
+                gx[s:s + _ROWS] = (r * (dn - n * (dn * n).mean(-1, keepdim=True))).to(x.dtype)
+        return (gx.reshape(x.shape) if gx is not None else None, gg.reshape(gate.shape) if gg is not None else None,
+                gw.to(w.dtype) if gw is not None else None, None)
+
+
+def rms_norm_gated(x: torch.Tensor, gate: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    return _RMSNormGated.apply(x, gate, w, eps)
+
+
 def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float, offset: float = 0.0,
              cast_first: bool = True) -> torch.Tensor:
     return _RMSNorm.apply(x, w, eps, offset, cast_first)
@@ -89,8 +142,9 @@ def _convention(mod, eps: float):
 
 
 def fuse_rmsnorm_(model: torch.nn.Module) -> dict[str, int]:
-    """Use the lean RMSNorm in every module named ``*RMSNorm`` (not gated variants) whose output it reproduces;
-    the convention is decided once per class on a materialized instance. Returns {class name: modules changed}."""
+    """Use the lean RMSNorm in every module named ``*RMSNorm`` whose output it reproduces, and the lean gated
+    RMSNorm in every ``*RMSNormGated`` (normalize, then gate with SiLU); the convention is decided once per class on
+    a materialized instance. Returns {class name: modules changed}."""
     by_class: dict[type, object] = {}
     changed: dict[str, int] = {}
     for mod in model.modules():
@@ -117,4 +171,39 @@ def fuse_rmsnorm_(model: torch.nn.Module) -> dict[str, int]:
 
         mod.forward = forward
         changed[cls.__name__] = changed.get(cls.__name__, 0) + 1
+    for mod in model.modules():
+        cls = type(mod)
+        if not cls.__name__.endswith("RMSNormGated") or getattr(mod, "_bl_gated", False):
+            continue
+        w, eps = getattr(mod, "weight", None), _eps(mod)
+        if not isinstance(w, torch.Tensor) or w.dim() != 1 or eps is None or w.device.type == "meta":
+            continue
+        if cls not in by_class:
+            by_class[cls] = _gated_matches(mod, eps)
+        if not by_class[cls]:
+            continue
+
+        def gated(x, gate=None, _m=mod, _eps=eps, _orig=mod.forward):
+            if gate is None:
+                return _orig(x)
+            return rms_norm_gated(x, gate, _m.weight, _eps)
+
+        mod.forward = gated
+        mod._bl_gated = True
+        changed[cls.__name__] = changed.get(cls.__name__, 0) + 1
     return changed
+
+
+def _gated_matches(mod, eps: float) -> bool:
+    """Whether ``mod(x, gate)`` is normalize-then-gate with SiLU (the convention :func:`rms_norm_gated` implements)."""
+    w = mod.weight
+    dt = w.dtype if w.is_floating_point() else torch.bfloat16
+    x = torch.randn(4, w.shape[0], device=w.device, dtype=dt)
+    g = torch.randn(4, w.shape[0], device=w.device, dtype=dt)
+    try:
+        with torch.no_grad():
+            ref = mod(x, g)
+            out = rms_norm_gated(x, g, w, eps)
+    except TypeError:
+        return False
+    return out.shape == ref.shape and torch.allclose(out.float(), ref.float(), atol=1e-2, rtol=1e-2)

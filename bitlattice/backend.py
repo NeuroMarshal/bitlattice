@@ -447,6 +447,9 @@ def _q2(x2: torch.Tensor, row: list, col: list, recipe: Fp4Recipe, site: dict | 
         if hist is not None and all(known[i] for i in range(2) if on[i]):
             f = [recipe.scale_margin / (6.0 * (256.0 if side[2] else 448.0)) for side in (row, col)]
             given = torch.stack([hist[0] * f[0], hist[1] * f[1]]).clamp_min(1e-30)    # device ops only, no sync
+            pow2 = torch.tensor([bool(row[6]), bool(col[6])], device=x2.device) if len(row) > 6 else None
+            if pow2 is not None and (row[6] or col[6]):          # concatenated operands need power-of-two scales
+                given = torch.where(pow2, torch.exp2(torch.ceil(torch.log2(given))), given)
         seen = torch.zeros(2, device=x2.device)
     rp, rs, rg, cp, cs, cg = torch.ops.bitlattice.nvfp4_quantize2(x2, row, col, recipe.select == "mae", given, True,
                                                                   seen)
