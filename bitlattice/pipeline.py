@@ -170,8 +170,12 @@ class _ActivationOffload:
     back, ``restore`` makes the compute stream wait for it and reattaches the data. The backward visits units in a
     known order, so the next unit's inputs are prefetched while the current one computes."""
 
+    _POOLS: dict = {}          # device -> HostPool: exact-size buffers kept across steps
+
     def __init__(self, device: torch.device):
+        from .hostmem import HostPool
         self.stream = torch.cuda.Stream(device=device)
+        self.pool = self._POOLS.setdefault(device, HostPool())
         self.host: dict = {}
         self.ready: dict = {}
 
@@ -179,7 +183,7 @@ class _ActivationOffload:
         ev = torch.cuda.Event()
         ev.record(torch.cuda.current_stream(t.device))
         self.stream.wait_event(ev)
-        h = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+        h = self.pool.take(t.shape, t.dtype)
         data = t.data
         with torch.cuda.stream(self.stream):
             h.copy_(data, non_blocking=True)
@@ -195,6 +199,7 @@ class _ActivationOffload:
             g = h.to(t.device, non_blocking=True)
             ev = torch.cuda.Event()
             ev.record(self.stream)
+        self.pool.give(h, ev)                          # reusable once this copy has completed
         self.ready[key] = (t, g, ev)
 
     def restore(self, key) -> None:

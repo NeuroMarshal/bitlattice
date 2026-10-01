@@ -154,6 +154,7 @@ class Lattice(torch.optim.Optimizer):
         self.fused_backward = fused_backward
         self.state_device = state_device
         self._copy_streams: dict = {}     # device -> side stream for host-memory state transfers
+        self._host_bufs: dict = {}        # (parameter, state key) -> its exact-size pinned host buffer
         self._last_copy: dict = {}        # device -> event of the last write-back
         self._order: dict = {}            # device -> parameters in update order (recorded on the first step)
         self._next: dict = {}
@@ -276,7 +277,12 @@ class Lattice(torch.optim.Optimizer):
             for k in self._OFFLOAD:
                 if k in st and st[k].is_cuda:
                     gpu = st[k]
-                    host = torch.empty(gpu.shape, dtype=gpu.dtype, device="cpu", pin_memory=True)
+                    # the same exact-size buffer every step: its previous contents were read by the copy to the
+                    # GPU, which the update (and so this write-back) follows
+                    host = self._host_bufs.get((p, k))
+                    if host is None or host.shape != gpu.shape or host.dtype != gpu.dtype:
+                        from ..hostmem import pinned_empty
+                        host = self._host_bufs[(p, k)] = pinned_empty(gpu.shape, gpu.dtype)
                     host.copy_(gpu, non_blocking=True)
                     gpu.record_stream(stream)
                     st[k] = host

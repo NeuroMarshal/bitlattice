@@ -339,8 +339,8 @@ class HostEmbedding(Converted):
         self._device = w.device
         # the host copy is made now and checked; the parameter gives up its device storage once the conversion is
         # applied (installed), so a refused conversion changes nothing
-        self.__dict__["_host"] = w.detach().to("cpu").pin_memory() if torch.cuda.is_available() else \
-            w.detach().to("cpu")
+        from ..hostmem import to_pinned
+        self.__dict__["_host"] = to_pinned(w)
 
     def installed(self):
         self.weight.data = self.__dict__.pop("_host")
@@ -372,8 +372,8 @@ class HostLinear(Converted):
         super().__init__(original)
         w = self.weight
         self._device = w.device
-        self.__dict__["_host"] = w.detach().to("cpu").pin_memory() if torch.cuda.is_available() else \
-            w.detach().to("cpu")
+        from ..hostmem import to_pinned
+        self.__dict__["_host"] = to_pinned(w)
 
     def installed(self):
         self.weight.data = self.__dict__.pop("_host")
