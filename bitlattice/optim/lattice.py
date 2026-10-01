@@ -13,7 +13,6 @@ Every option can be overridden per parameter group.
 from __future__ import annotations
 
 import contextlib
-import math
 from typing import Any, Iterable
 
 import torch

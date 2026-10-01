@@ -273,9 +273,8 @@ def test_low_precision_momentum_trains(momentum):
 def test_quantized_momentum_tracks_fp32():
     torch.manual_seed(0)
     p32 = torch.nn.Parameter(torch.randn(64, 256, device=DEV))
-    st32, st8 = {}, {}
+    st8 = {}
     opt = bl.Lattice([p32], momentum="int8")
-    g = {"beta1": 0.9, "momentum": "fp32"}
     m_ref = torch.zeros(64, 256, device=DEV)
     for step in range(1, 30):
         G = torch.randn(64, 256, device=DEV) * (1 + step % 3)

@@ -10,7 +10,6 @@ from functools import lru_cache
 
 import torch
 
-from . import formats as F
 from . import reference as R
 
 try:

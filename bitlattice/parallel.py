@@ -453,4 +453,4 @@ def pipelined_causal_lm_loss(model: torch.nn.Module, input_ids: torch.Tensor, la
     return loss
 
 
-from .pipeline import init, is_main, train_step  # noqa: E402  (one process per GPU; see bitlattice.pipeline)
+from .pipeline import init, is_main, train_step  # noqa: E402,F401  (re-exported: one process per GPU; see bitlattice.pipeline)

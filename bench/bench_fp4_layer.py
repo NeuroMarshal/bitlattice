@@ -60,7 +60,6 @@ def main():
             if err:
                 rec.update({k: round(v, 4) for k, v in err.items()})
             print(json.dumps(rec), flush=True)
-        del x, gy, w, ref
         torch.cuda.empty_cache()
 
 

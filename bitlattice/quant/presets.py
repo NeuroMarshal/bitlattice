@@ -9,7 +9,7 @@ import re
 
 import torch
 
-from .config import SKIP, QuantConfig, Rule
+from .config import QuantConfig, Rule
 
 __all__ = ["default", "accuracy_critical", "aggressive", "skip_blocks", "layer_indices"]
 
