@@ -15,7 +15,8 @@ elements of the last dimension: ``group > 0`` -- fixed group, ``group == -1`` --
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 
 import torch
@@ -79,7 +80,8 @@ class Format:
     @property
     def container_bits(self) -> int:
         b = self.bits
-        return 1 if b == 1 else 2 if b == 2 else 4 if b <= 4 else 8 if b <= 8 else 16 if b <= 16 else 32
+        return 1 if b == 1 else 2 if b == 2 else 4 if b <= 4 else 8 if b <= 8 else 16 if b <= 16 else 32 if b <= 32 \
+            else 64
 
     @property
     def scale(self) -> ScaleSpec | None:
@@ -171,8 +173,8 @@ class UniformFormat(Format):
     kind: str = "uniform"
 
     def __post_init__(self):
-        if not 1 <= self.bits <= 32:
-            raise ValueError("uniform formats hold 1..32-bit codes")
+        if not 1 <= self.bits <= 64:
+            raise ValueError("uniform formats hold 1..64-bit codes")
         lo, hi = -(1 << (self.bits - 1)), (1 << (self.bits - 1)) - 1
         if self.zero_point:
             lo, hi = 0, (1 << self.bits) - 1
@@ -216,11 +218,16 @@ def exmy_values(e: int, m: int, bias: int | None = None, special: str = "none") 
     """Decode table of a 1+e+m bit sign/exponent/mantissa float with subnormals.
 
     special: 'none' (all codes finite), 'fn' (all-ones exponent+mantissa is NaN, as float8_e4m3fn),
-    'ieee' (all-ones exponent is inf/NaN, excluded).
+    'ieee' (all-ones exponent is inf/NaN, excluded), 'fnuz' (no negative zero: that code is NaN; bias + 1, as the
+    *_fnuz float8 types).
     """
-    bias = (1 << (e - 1)) - 1 if bias is None else bias
+    if bias is None:
+        bias = (1 << (e - 1)) - (0 if special == "fnuz" else 1)
     out = []
     for code in range(1 << (1 + e + m)):
+        if special == "fnuz" and code == 1 << (e + m):
+            out.append(float("nan"))
+            continue
         s = -1.0 if code >> (e + m) else 1.0
         ex = (code >> m) & ((1 << e) - 1)
         mant = code & ((1 << m) - 1)
@@ -242,6 +249,20 @@ NF4_VALUES = (-1.0, -0.6961928009986877, -0.5250730514526367, -0.394917488098144
               -0.18477343022823334, -0.09105003625154495, 0.0, 0.07958029955625534, 0.16093020141124725,
               0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
               0.7229568362236023, 1.0)
+
+
+def normal_float_values(bits: int) -> tuple[float, ...]:
+    """NF-k levels (QLoRA): quantiles of N(0, 1) with an exact zero, normalized to [-1, 1]; 2**bits codes."""
+    if bits == 4:
+        return NF4_VALUES
+    n = 1 << bits
+    normal = torch.distributions.Normal(0.0, 1.0)
+    offset = 0.9677                                                   # as in the NF4 construction
+    pos = normal.icdf(torch.linspace(offset, 0.5, n // 2 + 1)[:-1]).tolist()
+    neg = (-normal.icdf(torch.linspace(offset, 0.5, n // 2)[:-1])).tolist()
+    vals = sorted(set([v / pos[0] for v in pos] + [0.0] + [v / pos[0] for v in neg]))
+    vals = vals[:n] + [float("nan")] * (n - len(vals))
+    return tuple(vals)
 
 
 def table(name: str, values, bits: int | None = None, group: int = 64, scale: str = "fp16",
@@ -296,8 +317,19 @@ def available() -> list[str]:
     return sorted(_REGISTRY)
 
 
+_SUFFIX = re.compile(r"_(g\d+|grow|gt|s(?:fp32|fp16|bf16|e4m3|e8m0)|gs|sym|asym|4o6)$")
+
+
 def get(spec) -> Format:
-    """Resolve a format from a name ('nvfp4', 'int4', 'fp6_e3m2', 'bf16', ...), a torch dtype or a Format."""
+    """Resolve a format.
+
+    Names: a registered format ('nvfp4', 'mxfp8', 'q4_0', ...), or a family with parameters --
+    ``intN`` / ``uintN`` (N = 1..64; uint has a per-group zero point), ``fpN_eXmY`` / ``eXmY`` (any sign/exponent/
+    mantissa split up to 8 bits), ``nfN`` (normal float) -- followed by optional suffixes:
+    ``_g<G>`` group size, ``_grow`` one scale per row, ``_gt`` one per tensor, ``_s<dtype>`` scale dtype
+    (fp32, fp16, bf16, e4m3, e8m0), ``_gs`` per-tensor global scale, ``_sym`` / ``_asym`` integer range,
+    ``_4o6`` four-over-six scale choice (blocks map their maximum to the top or the second level).
+    Also torch floating dtypes and Format objects."""
     if isinstance(spec, Format):
         return spec
     if isinstance(spec, torch.dtype):
@@ -308,14 +340,63 @@ def get(spec) -> Format:
     if key in _REGISTRY:
         f = _REGISTRY[key]
         return f() if callable(f) else f
-    if key.startswith("int") and key[3:].isdigit():
-        return uniform(int(key[3:]))
-    if key.startswith("uint") and key[4:].isdigit():
-        return uniform(int(key[4:]), zero_point=True, name=key)
-    if key.startswith("fp") and "_e" in key:                   # fp6_e3m2, fp5_e2m2, ...
-        e, m = key.split("_e", 1)[1].split("m")
-        return TableFormat(key, 1 + int(e) + int(m), exmy_values(int(e), int(m)), ScaleSpec(32, "fp16"))
-    raise KeyError(f"unknown format {spec!r}; known: {', '.join(available())}")
+    base, mods = key, []
+    while True:
+        m = _SUFFIX.search(base)
+        if not m:
+            break
+        mods.insert(0, m.group(1))
+        base = base[:m.start()]
+    if not mods:
+        fmt = _family(base)
+        if fmt is None:
+            raise KeyError(f"unknown format {spec!r}; known: {', '.join(available())}")
+        return fmt
+    fmt = get(base) if base in _REGISTRY else _family(base, "sym" in mods)
+    if fmt is None:
+        raise KeyError(f"unknown format {spec!r}")
+    scale_kw = {}
+    for mod in mods:
+        if mod.startswith("g") and mod[1:].isdigit():
+            scale_kw["group"] = int(mod[1:])
+        elif mod == "grow":
+            scale_kw["group"] = -1
+        elif mod == "gt":
+            scale_kw["group"] = 0
+        elif mod.startswith("s") and mod != "sym":
+            scale_kw["dtype"] = mod[1:]
+        elif mod == "gs":
+            scale_kw["global_scale"] = True
+    if scale_kw:
+        scale_kw.setdefault("strict", False)
+        fmt = fmt.with_scale(**scale_kw)
+    if "4o6" in mods:
+        fmt = replace(fmt, name=fmt.name + "_4o6", init="4over6")
+    if scale_kw or "4o6" in mods:
+        fmt = replace(fmt, name=key)
+    return fmt
+
+
+def _family(key: str, symmetric: bool = False) -> Format | None:
+    m = re.fullmatch(r"(u?)int(\d+)", key)
+    if m:
+        bits = int(m.group(2))
+        if not 1 <= bits <= 64:
+            return None
+        group, scale = (64, "fp16") if bits <= 8 else (-1, "fp32")
+        return uniform(bits, group=group, scale=scale, zero_point=bool(m.group(1)), symmetric=symmetric, name=key)
+    m = re.fullmatch(r"(?:fp(\d+)_)?e(\d+)m(\d+)(fn|fnuz)?", key)
+    if m:
+        e, mm = int(m.group(2)), int(m.group(3))
+        bits = 1 + e + mm
+        if m.group(1) and int(m.group(1)) != bits or not 2 <= bits <= 8:
+            return None
+        special = m.group(4) or "none"
+        return TableFormat(key, bits, exmy_values(e, mm, special=special), ScaleSpec(32, "fp16"))
+    m = re.fullmatch(r"nf(\d)", key)
+    if m and 2 <= int(m.group(1)) <= 8:
+        return TableFormat(key, int(m.group(1)), normal_float_values(int(m.group(1))), ScaleSpec(64, "fp16"))
+    return None
 
 
 for _name, _fmt in {
@@ -334,7 +415,25 @@ for _name, _fmt in {
     "mxfp8_e5m2": TableFormat("mxfp8_e5m2", 8, exmy_values(5, 2, special="ieee"), ScaleSpec(32, "e8m0", strict=True)),
     "mxfp6": TableFormat("mxfp6", 6, exmy_values(2, 3), ScaleSpec(32, "e8m0", strict=True)),
     "mxfp6_e3m2": TableFormat("mxfp6_e3m2", 6, exmy_values(3, 2), ScaleSpec(32, "e8m0", strict=True)),
-    "mxint8": uniform(8, group=32, scale="e8m0", symmetric=True),
+    "mxint8": uniform(8, group=32, scale="e8m0", symmetric=True, name="mxint8"),
+    "mxint4": uniform(4, group=32, scale="e8m0", symmetric=True, name="mxint4"),
+    # NVFP4 with the four-over-six block scale choice (same storage and hardware layout as nvfp4)
+    "nvfp4_4o6": TableFormat("nvfp4_4o6", 4, _E2M1, ScaleSpec(16, "e4m3", global_scale=True, strict=True),
+                             init="4over6"),
+    "fp8_e4m3fnuz": TableFormat("fp8_e4m3fnuz", 8, exmy_values(4, 3, special="fnuz"), ScaleSpec(-1, "fp32")),
+    "fp8_e5m2fnuz": TableFormat("fp8_e5m2fnuz", 8, exmy_values(5, 2, special="fnuz"), ScaleSpec(-1, "fp32")),
+    "fp8_e3m4": TableFormat("fp8_e3m4", 8, exmy_values(3, 4), ScaleSpec(-1, "fp32")),
+    # block formats in the style of llama.cpp (value = scale * q (+ min); 32-element blocks, fp16 scales)
+    "q4_0": uniform(4, group=32, scale="fp16", name="q4_0"),
+    "q4_1": uniform(4, group=32, scale="fp16", zero_point=True, name="q4_1"),
+    "q5_0": uniform(5, group=32, scale="fp16", name="q5_0"),
+    "q5_1": uniform(5, group=32, scale="fp16", zero_point=True, name="q5_1"),
+    "q8_0": uniform(8, group=32, scale="fp16", name="q8_0"),
+    "q2_k": uniform(2, group=16, scale="fp16", zero_point=True, name="q2_k"),
+    "q3_k": uniform(3, group=16, scale="fp16", name="q3_k"),
+    "q6_k": uniform(6, group=16, scale="fp16", name="q6_k"),
+    "nf3": TableFormat("nf3", 3, normal_float_values(3), ScaleSpec(64, "fp16")),
+    "nf2": TableFormat("nf2", 2, normal_float_values(2), ScaleSpec(64, "fp16")),
     "binary": TableFormat("binary", 1, (-1.0, 1.0), ScaleSpec(128, "fp16"), init="absmean"),
     "ternary": UniformFormat("ternary", 2, -1, 1, ScaleSpec(128, "fp16"), init="absmean"),
     "int8": uniform(8, group=-1, scale="fp32", symmetric=True),

@@ -23,9 +23,14 @@ std::tuple<Tensor, Tensor> bl_factored_scales(Tensor G, Tensor r, Tensor c, int6
 Tensor bl_factored_apply(Tensor G, Tensor a, Tensor b, int64_t row0, int64_t nrows);
 std::tuple<Tensor, Tensor> bl_quantize_nvfp4(Tensor x, Tensor global_scale, int64_t seed, int64_t step);
 std::tuple<Tensor, Tensor, Tensor> bl_quantize_nvfp4_t(Tensor x, std::optional<Tensor> hadamard, int64_t seed,
-                                                       int64_t step);
+                                                       int64_t step, std::optional<Tensor> global_scale);
 std::tuple<Tensor, Tensor, Tensor> bl_requantize_nvfp4_t(Tensor packed, Tensor scales, Tensor global_scale);
 Tensor bl_scale_(Tensor y, Tensor alpha);
+std::tuple<Tensor, Tensor, Tensor> bl_nvfp4_quantize(Tensor x, bool transpose, int64_t mode, bool four_over_six,
+                                                     bool mae, bool rotate, int64_t seed,
+                                                     std::optional<Tensor> global_scale,
+                                                     std::optional<Tensor> w_scales, std::optional<Tensor> w_global,
+                                                     int64_t rotate_seed);
 Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::optional<Tensor> c, int64_t k, double beta2,
                     int64_t block, int64_t ns_steps, int64_t ns_dtype, int64_t sinkhorn_iters, double clip,
                     int64_t block_cols, int64_t ns_coeffs, int64_t ns_algo);
@@ -51,9 +56,14 @@ TORCH_LIBRARY(bitlattice, m) {
   m.def("factored_scales(Tensor G, Tensor(a!) r, Tensor(b!) c, int k, float beta2, float clip) -> (Tensor, Tensor)");
   m.def("factored_apply(Tensor G, Tensor a, Tensor b, int row0, int nrows) -> Tensor");
   m.def("quantize_nvfp4(Tensor x, Tensor global_scale, int seed=-1, int step=0) -> (Tensor, Tensor)");
-  m.def("quantize_nvfp4_t(Tensor x, Tensor? hadamard, int seed=-1, int step=0) -> (Tensor, Tensor, Tensor)");
+  m.def("quantize_nvfp4_t(Tensor x, Tensor? hadamard, int seed=-1, int step=0, Tensor? global_scale=None) -> "
+        "(Tensor, Tensor, Tensor)");
   m.def("requantize_nvfp4_t(Tensor packed, Tensor scales, Tensor global_scale) -> (Tensor, Tensor, Tensor)");
   m.def("scale_(Tensor(a!) y, Tensor alpha) -> Tensor(a!)");
+  m.def("nvfp4_quantize(Tensor x, bool transpose=False, int mode=0, bool four_over_six=False, bool mae=False, "
+        "bool rotate=False, int seed=0, Tensor? global_scale=None, Tensor? w_scales=None, Tensor? w_global=None, "
+        "int rotate_seed=-1) "
+        "-> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
@@ -67,6 +77,7 @@ TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
   m.impl("quantize_nvfp4_t", &bl_quantize_nvfp4_t);
   m.impl("requantize_nvfp4_t", &bl_requantize_nvfp4_t);
   m.impl("scale_", &bl_scale_);
+  m.impl("nvfp4_quantize", &bl_nvfp4_quantize);
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CompositeExplicitAutograd, m) { m.impl("direction", &bl_direction); }

@@ -47,6 +47,8 @@ def lattice_args(fmt, device) -> tuple:
 def cuda_ok(fmt, rows: int, cols: int, device) -> bool:
     if not HAVE_EXT or torch.device(device).type != "cuda" or cols % 8:
         return False
+    if fmt.kind != "native" and fmt.container_bits > 32:            # 33..64-bit codes: reference path
+        return False
     g = fmt.scale.group if fmt.kind != "native" else 1
     return not (g > 0 and (g % 8 or cols % g))
 

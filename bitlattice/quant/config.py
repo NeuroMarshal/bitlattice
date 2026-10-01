@@ -34,7 +34,8 @@ class QuantConfig:
     """Target format and budget.
 
     format       -- any format accepted by ``bitlattice.formats.get`` ('nvfp4', 'int4', 'fp6_e3m2', ...)
-    method       -- 'rtn' or 'mse' (per-group clipping search)
+    method       -- 'rtn', 'mse' (per-group clipping search) or '4over6' (table formats: each group maps its maximum
+                    to the top or the second-highest level, whichever has the lower error)
     keep         -- fraction in [0, 1] of input channels of every quantized layer kept in ``keep_dtype``
     saliency     -- 'weight' (column norm) or 'activation' (mean square input x column norm; needs calibration)
     group, scale -- override the scale group size / scale dtype of the format
@@ -59,8 +60,8 @@ class QuantConfig:
     def __post_init__(self):
         if not 0.0 <= self.keep <= 1.0:
             raise ValueError("keep must be in [0, 1]")
-        if self.method not in ("rtn", "mse"):
-            raise ValueError("method must be 'rtn' or 'mse'")
+        if self.method not in ("rtn", "mse", "4over6"):
+            raise ValueError("method must be 'rtn', 'mse' or '4over6'")
         if self.saliency not in ("weight", "activation"):
             raise ValueError("saliency must be 'weight' or 'activation'")
         object.__setattr__(self, "rules", tuple(r if isinstance(r, Rule) else Rule(*r) for r in self.rules))

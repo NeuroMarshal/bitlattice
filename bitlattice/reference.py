@@ -188,18 +188,32 @@ def quantize(w: torch.Tensor, fmt, method: str = "rtn", grid: int = 16, shrink: 
         s = wg.abs().mean(-1).clamp_min(1e-12) / (fmt.max_abs if fmt.max_abs > 1 else 1.0)
     else:
         s = (wg.abs().amax(-1) / fmt.max_abs).clamp_min(1e-12)
+    # four over six: a group may map its maximum to the second-highest level instead of the highest (the top gap
+    # of an FP4 grid, 4 -> 6, is the widest); the per-tensor scale then leaves room for that larger group scale
+    expand = []
+    if fmt.kind == "table" and (method == "4over6" or getattr(fmt, "init", "") == "4over6" or method == "mse"):
+        pos = sorted(v for v in fmt.levels if v > 0)
+        if len(pos) >= 2:
+            expand = [pos[-1] / pos[-2]]
+    four6 = method == "4over6" or getattr(fmt, "init", "") == "4over6"
     gscale = None
     if spec.global_scale:
+        # four over six: the largest power of two p with p * (top / second level) exactly representable (256 for
+        # E2M1 / E4M3), so the block holding the tensor maximum can still choose either scale
+        top = F.E4M3_MAX
+        if four6 and expand:
+            top = 2.0 ** math.floor(math.log2(F.E4M3_MAX / expand[0]))
         gscale = (global_scale.to(w2.device, torch.float32).reshape(1) if global_scale is not None else
-                  (w2.abs().amax() / (fmt.max_abs * F.E4M3_MAX)).clamp_min(1e-12).reshape(1))
+                  (w2.abs().amax() / (fmt.max_abs * top)).clamp_min(1e-12).reshape(1))
     pow2 = spec.dtype == "e8m0"            # power-of-two scales round up, so the group maximum is never clipped
 
     def up(t):
         return torch.exp2(torch.ceil(torch.log2(t.clamp_min(2.0 ** -126)))) if pow2 else t
 
-    if method == "mse" and zero is None:
+    if method in ("mse", "4over6") and zero is None or (four6 and zero is None):
+        cands = ([1.0] + expand) if (four6 and method != "mse") else torch.linspace(1.0, shrink, grid).tolist() + expand
         best_err, best_s = None, None
-        for a in torch.linspace(1.0, shrink, grid).tolist():
+        for a in cands:
             sq = effective_scales(encode_scales(up(s * a) / (gscale if gscale is not None else 1.0), spec), spec,
                                   gscale)
             se = expand_groups(sq, rows, cols, spec)
@@ -212,7 +226,7 @@ def quantize(w: torch.Tensor, fmt, method: str = "rtn", grid: int = 16, shrink: 
                 best_err = torch.where(better, err, best_err)
                 best_s = torch.where(better, up(s * a), best_s)
         s = best_s
-    elif method not in ("rtn", "mse"):
+    elif method not in ("rtn", "mse", "4over6"):
         raise ValueError(method)
     else:
         s = up(s)

@@ -226,8 +226,10 @@ std::tuple<at::Tensor, at::Tensor> bl_quantize_nvfp4(at::Tensor x, at::Tensor gl
 
 // x [M, K] (M % 16 == 0) -> NVFP4 of x^T (optionally rotated along M by ``hadamard`` [16, 16] fp32): packed
 // [K, M/2], E4M3 scales [K, M/16], fp32 global scale [1] from the amax of the (rotated) tensor
+// ``global_scale`` given: use it (a bound on the rotated amax known from elsewhere) and skip the amax pass
 std::tuple<at::Tensor, at::Tensor, at::Tensor> bl_quantize_nvfp4_t(at::Tensor x, std::optional<at::Tensor> hadamard,
-                                                                   int64_t seed, int64_t step) {
+                                                                   int64_t seed, int64_t step,
+                                                                   std::optional<at::Tensor> global_scale) {
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 2, "x must be a contiguous 2-D CUDA tensor");
   TORCH_CHECK(x.size(0) % 16 == 0, "rows must be a multiple of 16");
   const c10::cuda::CUDAGuard guard(x.device());
@@ -246,9 +248,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bl_quantize_nvfp4_t(at::Tensor x,
   constexpr int threads = 256;
   const int blocks = static_cast<int>((n + threads - 1) / threads);
   auto stream = at::cuda::getCurrentCUDAStream();
+  const bool known = global_scale.has_value();
+  if (known) amax.copy_(global_scale->to(at::kFloat).reshape({1}) * (6.0f * 448.0f));
   auto launch = [&](auto* ptr) {
     using T = std::remove_const_t<std::remove_pointer_t<decltype(ptr)>>;
-    amax_t<T><<<blocks, threads, 0, stream>>>(ptr, M, K, H, amax.data_ptr<float>());
+    if (!known) amax_t<T><<<blocks, threads, 0, stream>>>(ptr, M, K, H, amax.data_ptr<float>());
     quantize_t<T><<<blocks, threads, 0, stream>>>(ptr, M, K, H, amax.data_ptr<float>(), global.data_ptr<float>(),
                                                   packed.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(), seed,
                                                   static_cast<uint32_t>(step));
