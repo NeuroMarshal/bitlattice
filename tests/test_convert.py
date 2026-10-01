@@ -95,7 +95,10 @@ def test_checkpointed_decoder_layers_keep_their_attributes_and_gradients():
         m.config.use_cache = False
         m.train()
     bl.surgery.convert_(b, "re:layers\\.\\d+$", "checkpoint")
-    assert b.model.layers[0].attention_type == a.model.layers[0].attention_type    # read by the model's forward
+    layer, original = b.model.layers[0], b.model.layers[0].original
+    for k, v in vars(original).items():               # configuration the model's forward may read (attention_type)
+        if not k.startswith("_"):
+            assert getattr(layer, k) is v or k == "training", k
     x = torch.randint(0, 128, (2, 17), device=DEV)
     la, lb = bl.nn.causal_lm_loss(a, x), bl.nn.causal_lm_loss(b, x)
     la.backward()
