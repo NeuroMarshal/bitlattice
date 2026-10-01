@@ -271,22 +271,22 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
     ahead = _RunAhead(max(1, run_ahead))
     offload = _ActivationOffload(dev) if offload_activations and backward else None
     head_owner = segs[-1].owner
-    next_emb = {}
-    if extra_loss is not None and embed_here:
-        with torch.no_grad():
-            for m, ids in enumerate(ids_mb):
-                e = emb(ids[:, 1:]).detach()
-                if head_owner == me:
-                    next_emb[m] = e
-                else:
-                    keep.append((dist.isend(e, head_owner, group=_group(me, head_owner, "aux")), None))
-    elif extra_loss is not None and head_owner == me:
-        # the receives are posted now, not when the head is reached: a send left pending for the whole forward
-        # would block any device-wide synchronization on the sender (the caching allocator releasing memory under
-        # pressure calls cudaFree), and the sender would then never produce the activations this process waits for
-        for m in range(M):
-            e = torch.empty(ids_mb[m].shape[0], ids_mb[m].shape[1] - 1, width, dtype=dtype, device=dev)
-            next_emb[m] = (e, dist.irecv(e, segs[0].owner, group=_group(segs[0].owner, me, "aux")))
+    # the extra loss's input embeddings of tokens 1.. are sent by the embedding's process right after its last
+    # segment's activation of the same micro-batch, and received at the head: a send is never pending while its
+    # sender still owes the receiver activations (a device-wide synchronization on the sender -- the caching
+    # allocator releasing memory under pressure calls cudaFree -- would wait for it and deadlock both), and neither
+    # side holds the embeddings for longer than the head needs them
+    aux_from = segs[0].owner
+    send_aux_after = (max(s for s, seg in enumerate(segs) if seg.owner == me)
+                      if extra_loss is not None and embed_here and head_owner != me else None)
+
+    def aux_embeddings(m):
+        if embed_here:
+            with torch.no_grad():
+                return emb(ids_mb[m][:, 1:]).detach()
+        e = torch.empty(ids_mb[m].shape[0], ids_mb[m].shape[1] - 1, width, dtype=dtype, device=dev)
+        dist.irecv(e, aux_from, group=_group(aux_from, me, "aux")).wait()
+        return e
     with grad:
         prep = [_block_kwargs(backbone, blocks, ids, embed_here, width, dtype, dev) for ids in ids_mb]
         # forward: each segment (run of units on this GPU) micro-batch by micro-batch, so its output for micro-batch
@@ -318,12 +318,7 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                         out = blocks[item[1]](y, **prep[m][1][item[1]])
                         y = out[0] if isinstance(out, tuple) else out
                     else:
-                        e = None
-                        if extra_loss is not None:
-                            e = next_emb.pop(m)
-                            if isinstance(e, tuple):
-                                e, work = e
-                                work.wait()
+                        e = aux_embeddings(m) if extra_loss is not None else None
                         fn = functools.partial(_head_loss, model, norm, head, lab_mb[m], ids_mb[m], chunk,
                                                extra_loss)
                         # the head (final norm, vocabulary-wide loss, extra heads) is recomputed in backward, so only
@@ -346,6 +341,9 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                             # the activation now lives on the next process; backward needs only the graph node
                             if backward:
                                 _release(y)
+                if s == send_aux_after:
+                    keep.append((dist.isend(aux_embeddings(m), head_owner, group=_group(me, head_owner, "aux")),
+                                 None))
                 ahead.tick()
                 _prune(keep)
         # backward: unit by unit, each over all micro-batches; a unit's gradients are complete after its last
@@ -381,6 +379,9 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                                     g = ins.pop((s, j + 1, m)).grad
                                 if y.requires_grad and g is not None:
                                     _backward_released(y, g)
+                            x = ins.get((s, j, m))
+                            if x is not None and x.grad is not None:
+                                x.data = torch.empty(0, dtype=x.dtype, device=x.device)   # only its .grad is read from now on
                         if j == 0 and seg.prev is not None:
                             gi = ins.pop((s, 0, m)).grad
                             _log("bwd send", s, m, "to", seg.prev)
