@@ -165,9 +165,12 @@ def _group_view(w2: torch.Tensor, spec: F.ScaleSpec) -> torch.Tensor:
     return w2.reshape(rows, cols // spec.group, spec.group)
 
 
-def quantize(w: torch.Tensor, fmt, method: str = "rtn", grid: int = 16, shrink: float = 0.5) -> Quantized:
+def quantize(w: torch.Tensor, fmt, method: str = "rtn", grid: int = 16, shrink: float = 0.5,
+             global_scale: torch.Tensor | None = None) -> Quantized:
     """Quantize a dense tensor. ``method``: 'rtn' (absmax/absmean/minmax scale) or 'mse' (per-group search of a
-    clipping factor in [shrink, 1] minimising the squared error, ``grid`` candidates)."""
+    clipping factor in [shrink, 1] minimising the squared error, ``grid`` candidates). ``global_scale``: use this
+    per-tensor scale (formats that have one) instead of deriving it from the tensor, e.g. to append to storage
+    quantized earlier; group scales are clamped to its range."""
     fmt = F.get(fmt)
     if fmt.kind == "native":
         raise ValueError("native formats are not quantized")
@@ -187,23 +190,32 @@ def quantize(w: torch.Tensor, fmt, method: str = "rtn", grid: int = 16, shrink: 
         s = (wg.abs().amax(-1) / fmt.max_abs).clamp_min(1e-12)
     gscale = None
     if spec.global_scale:
-        gscale = (w2.abs().amax() / (fmt.max_abs * F.E4M3_MAX)).clamp_min(1e-12).reshape(1)
+        gscale = (global_scale.to(w2.device, torch.float32).reshape(1) if global_scale is not None else
+                  (w2.abs().amax() / (fmt.max_abs * F.E4M3_MAX)).clamp_min(1e-12).reshape(1))
+    pow2 = spec.dtype == "e8m0"            # power-of-two scales round up, so the group maximum is never clipped
+
+    def up(t):
+        return torch.exp2(torch.ceil(torch.log2(t.clamp_min(2.0 ** -126)))) if pow2 else t
+
     if method == "mse" and zero is None:
         best_err, best_s = None, None
         for a in torch.linspace(1.0, shrink, grid).tolist():
-            sq = effective_scales(encode_scales(s * a / (gscale if gscale is not None else 1.0), spec), spec, gscale)
+            sq = effective_scales(encode_scales(up(s * a) / (gscale if gscale is not None else 1.0), spec), spec,
+                                  gscale)
             se = expand_groups(sq, rows, cols, spec)
             r = nearest_rank(fmt, w2 / se)
             err = group_sum((rank_level(fmt, r) * se - w2) ** 2, spec)
             if best_err is None:
-                best_err, best_s = err, s * a
+                best_err, best_s = err, up(s * a)
             else:
                 better = err < best_err
                 best_err = torch.where(better, err, best_err)
-                best_s = torch.where(better, s * a, best_s)
+                best_s = torch.where(better, up(s * a), best_s)
         s = best_s
     elif method not in ("rtn", "mse"):
         raise ValueError(method)
+    else:
+        s = up(s)
     scales = encode_scales(s / (gscale if gscale is not None else 1.0), spec)
     se = expand_groups(effective_scales(scales, spec, gscale), rows, cols, spec)
     ze = expand_groups(zero, rows, cols, spec) if zero is not None else None

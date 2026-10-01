@@ -329,6 +329,12 @@ for _name, _fmt in {
     "fp8": TableFormat("fp8", 8, exmy_values(4, 3, special="fn"), ScaleSpec(-1, "fp32")),
     "fp8_e4m3": TableFormat("fp8_e4m3", 8, exmy_values(4, 3, special="fn"), ScaleSpec(-1, "fp32")),
     "fp8_e5m2": TableFormat("fp8_e5m2", 8, exmy_values(5, 2, special="ieee"), ScaleSpec(-1, "fp32")),
+    # OCP microscaling (MX) formats: 32-element blocks with a power-of-two (E8M0) scale
+    "mxfp8": TableFormat("mxfp8", 8, exmy_values(4, 3, special="fn"), ScaleSpec(32, "e8m0", strict=True)),
+    "mxfp8_e5m2": TableFormat("mxfp8_e5m2", 8, exmy_values(5, 2, special="ieee"), ScaleSpec(32, "e8m0", strict=True)),
+    "mxfp6": TableFormat("mxfp6", 6, exmy_values(2, 3), ScaleSpec(32, "e8m0", strict=True)),
+    "mxfp6_e3m2": TableFormat("mxfp6_e3m2", 6, exmy_values(3, 2), ScaleSpec(32, "e8m0", strict=True)),
+    "mxint8": uniform(8, group=32, scale="e8m0", symmetric=True),
     "binary": TableFormat("binary", 1, (-1.0, 1.0), ScaleSpec(128, "fp16"), init="absmean"),
     "ternary": UniformFormat("ternary", 2, -1, 1, ScaleSpec(128, "fp16"), init="absmean"),
     "int8": uniform(8, group=-1, scale="fp32", symmetric=True),
