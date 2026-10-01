@@ -157,3 +157,39 @@ def test_attention_chunks_reproduce_the_layer_and_its_gradients(chunk):
     assert torch.equal(out, ref)
     with pytest.raises(TypeError, match="chunk"):
         bl.surgery.convert_(b, "*.self_attn", "attention_chunks")
+
+
+def test_host_embedding_frees_the_device_table_and_reverts():
+    transformers = pytest.importorskip("transformers")
+    cfg = transformers.Qwen2Config(vocab_size=512, hidden_size=64, intermediate_size=128, num_hidden_layers=1,
+                                   num_attention_heads=4, num_key_value_heads=2, tie_word_embeddings=False)
+    torch.manual_seed(0)
+    m = transformers.Qwen2ForCausalLM(cfg).to(DEV, torch.bfloat16)
+    m.config.use_cache = False
+    x = torch.randint(0, 512, (2, 17), device=DEV)
+    ref = bl.nn.causal_lm_loss(m, x)
+    with pytest.raises(ValueError, match="trainable"):
+        bl.surgery.convert_(m, "*embed_tokens", "host_embedding")
+    assert m.model.embed_tokens.weight.is_cuda                     # a refused conversion changes nothing
+    bl.surgery.freeze_(m, "*embed_tokens")
+    w = m.model.embed_tokens.weight
+    before = torch.cuda.memory_allocated()
+    bl.surgery.convert_(m, "*embed_tokens", "host_embedding")
+    assert m.model.embed_tokens.weight is w and not w.is_cuda and w.is_pinned()
+    assert torch.cuda.memory_allocated() <= before - w.numel() * w.element_size()
+    assert torch.equal(bl.nn.causal_lm_loss(m, x), ref)
+    loss = bl.nn.causal_lm_loss(m, x)
+    loss.backward()                                                # trains the rest; no gradient for the table
+    assert w.grad is None and m.lm_head.weight.grad is not None
+    bl.surgery.revert_(m, "*embed_tokens")
+    assert m.model.embed_tokens.weight is w and w.is_cuda
+
+
+def test_host_embedding_refuses_tied_tables():
+    transformers = pytest.importorskip("transformers")
+    cfg = transformers.Qwen2Config(vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=1,
+                                   num_attention_heads=4, num_key_value_heads=2, tie_word_embeddings=True)
+    m = transformers.Qwen2ForCausalLM(cfg).to(DEV, torch.bfloat16)
+    bl.surgery.freeze_(m, "*embed_tokens")
+    with pytest.raises(ValueError, match="tied"):
+        bl.surgery.convert_(m, "*embed_tokens", "host_embedding")

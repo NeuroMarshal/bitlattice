@@ -126,6 +126,7 @@ Presets:
 | `convert_(model, sel, "checkpoint", saved=None \| "fp8" \| "nvfp4")` | recompute the selected modules in backward; tensors saved during recomputation optionally packed |
 | `convert_(model, "*.mlp", "token_chunks", chunk=2048)` | MLPs run on checkpointed sequence slices (long contexts) |
 | `convert_(model, "*.linear_attn", "gated_delta_net", seq_chunk=4096)` | Gated DeltaNet without copies of q/k per value head; recurrence over sequence pieces |
+| `convert_(model, "*.self_attn", "attention_chunks", chunk=4096)` | causal attention over query pieces: the layer keeps its input, K and V; each piece recomputed in backward |
 | `bl.plan(model, opt)` | weights, optimizer state (GPU / host), gradient peak, weights per device |
 
 ## Several GPUs

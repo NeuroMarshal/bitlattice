@@ -33,6 +33,9 @@ Conversions:
                       recomputes it; ``saved`` ('fp8' / 'nvfp4', lossy) stores the recomputed module's saved
                       tensors compressed, which lowers the per-layer peak (use it instead of the model's own
                       gradient checkpointing for these modules)
+    host_embedding    a frozen embedding table kept in pinned host memory: lookups gather the rows on the CPU and copy
+                      only them to the device of the indices (frees the table's GPU memory, e.g. 2.5 GB for a
+                      250k x 5120 vocabulary); refused for trainable or tied tables
     compressed_saves  tensors saved for backward inside the module stored as ``fmt`` ('fp8' or 'nvfp4'; lossy) --
                       for modules that are not recomputed: inside a checkpointed region the hooks would also act in
                       its first pass and keep what checkpointing discards; there use ``checkpoint`` with ``saved``
@@ -53,7 +56,7 @@ from ..select import Selector, select
 log = logging.getLogger("bitlattice")
 
 __all__ = ["convert_", "revert_", "conversions", "register_conversion", "Conversion", "Converted", "Unfit",
-           "AttentionChunks", "RMSNorm",
+           "AttentionChunks", "HostEmbedding", "RMSNorm",
            "GatedRMSNorm", "GatedDeltaNet", "TokenChunks", "Checkpointed", "CompressedSaves"]
 
 
@@ -75,6 +78,9 @@ class Converted(torch.nn.Module):
     @property
     def original(self) -> torch.nn.Module:
         return self.__dict__["_bl_original"]
+
+    def installed(self) -> None:
+        """Called once the conversion is applied (after its check): conversions that move data do it here."""
 
     def __getattr__(self, name: str):
         # parameters, buffers and children are this module's own; the original's plain instance attributes
@@ -267,6 +273,46 @@ def _attention_probe(m, new):
     return x, (angle.cos().to(x.dtype), angle.sin().to(x.dtype)), None
 
 
+class HostEmbedding(Converted):
+    def __init__(self, original):
+        super().__init__(original)
+        w = self.weight
+        self._device = w.device
+        # the host copy is made now and checked; the parameter gives up its device storage once the conversion is
+        # applied (installed), so a refused conversion changes nothing
+        self.__dict__["_host"] = w.detach().to("cpu").pin_memory() if torch.cuda.is_available() else \
+            w.detach().to("cpu")
+
+    def installed(self):
+        self.weight.data = self.__dict__.pop("_host")
+
+    def forward(self, ids):
+        w = self.__dict__.get("_host", self.weight)
+        idx = ids.reshape(-1).to("cpu")
+        out = torch.empty(idx.numel(), w.shape[1], dtype=w.dtype, pin_memory=w.is_pinned())
+        torch.index_select(w, 0, idx, out=out)
+        out = out.view(*ids.shape, w.shape[1])
+        return out.to(ids.device, non_blocking=True) if ids.device.type != "cpu" else out
+
+    def restored(self):
+        self.weight.data = self.weight.data.to(self._device)
+        return super().restored()
+
+    def settings(self):
+        return f"{tuple(self.weight.shape)}, pinned={self.weight.is_pinned()}"
+
+
+def _make_host_embedding(m):
+    w = m.weight
+    if w.device.type == "meta":
+        raise Unfit("parameters not materialized (meta)")
+    if w.requires_grad:
+        raise Unfit("the table is trainable (freeze it first: host lookups have no gradient)")
+    if getattr(m, "max_norm", None) is not None:
+        raise Unfit("max_norm renormalizes the table in place")
+    return HostEmbedding(m)
+
+
 class TokenChunks(Converted):
     def __init__(self, original, chunk: int = 2048, dim: int = -2, checkpoint: bool = True):
         super().__init__(original)
@@ -344,6 +390,7 @@ class Conversion:
     make: Callable[..., torch.nn.Module]
     probe: Callable[[torch.nn.Module, torch.nn.Module], tuple] | None
     tol: float = 2e-2
+    exclusive: bool = False         # the module's parameters must not be shared with other modules (e.g. tied heads)
 
 
 class Unfit(ValueError):
@@ -421,6 +468,12 @@ _CONVERSIONS: dict[str, Conversion] = {
         lambda m: all(hasattr(m, k) for k in ("q_proj", "k_proj", "v_proj", "o_proj", "head_dim", "scaling")),
         _make_attention,
         _attention_probe),
+    "host_embedding": Conversion(
+        "frozen embedding table in pinned host memory; rows gathered on the CPU, only they are copied to the GPU",
+        lambda m: isinstance(m, torch.nn.Embedding),
+        _make_host_embedding,
+        lambda m, new: (torch.randint(0, m.num_embeddings, (2, 33), device=new._device),),
+        tol=0.0, exclusive=True),
     "checkpoint": Conversion(
         "recompute in backward (inputs kept); `saved` packs the recomputed saved tensors ('fp8' / 'nvfp4')",
         lambda m: True,
@@ -483,7 +536,8 @@ def convert_(model: torch.nn.Module, target: Selector, to: str, *, check: bool =
         raise ValueError(f"no module matches {target!r}")
     plan = []
     for name, m in chosen:
-        why = _refusal(conv, to, m, options, check)
+        shared = _shared_with(model, name, m) if conv.exclusive else None
+        why = f"its parameters are shared with {shared} (tied)" if shared else _refusal(conv, to, m, options, check)
         if isinstance(why, str):
             if not skip_unfit:
                 raise ValueError(f"{name} ({type(m).__name__}): {why}")
@@ -492,7 +546,20 @@ def convert_(model: torch.nn.Module, target: Selector, to: str, *, check: bool =
         plan.append((name, m, why))
     for name, m, new in plan:
         _set(model, name, new)
+        new.installed()
     return [(name, type(m).__name__, type(new).__name__) for name, m, new in plan]
+
+
+def _shared_with(model: torch.nn.Module, name: str, m: torch.nn.Module) -> str | None:
+    """Name of a module outside ``m`` that holds one of ``m``'s parameters, if any."""
+    mine = {id(p) for p in m.parameters()}
+    inside = name + "."
+    for other_name, other in model.named_modules(remove_duplicate=False):
+        if other_name == name or other_name.startswith(inside) or other is m:
+            continue
+        if any(id(p) in mine for p in other.parameters(recurse=False)):
+            return other_name or "the model"
+    return None
 
 
 def _refusal(conv: Conversion, to: str, m: torch.nn.Module, options: dict, check: bool):
