@@ -283,3 +283,21 @@ def test_quantized_momentum_tracks_fp32():
         m8 = opt._momentum(G, st8, {"beta1": 0.9, "momentum": "int8"}, 0).clone()
     rel = ((m8 - m_ref).norm() / m_ref.norm()).item()
     assert rel < 0.02, rel
+
+
+@pytest.mark.parametrize("momentum", ["int8", "nvfp4", "bf16"])
+def test_low_precision_momentum_in_host_memory_matches_gpu(momentum):
+    torch.manual_seed(1)
+    w = torch.randn(64, 256, device=DEV) * 0.05
+    ps = [torch.nn.Parameter(LatticeTensor.from_float(w, "nvfp4", dtype=torch.bfloat16)) for _ in range(2)]
+    opts = [bl.Lattice([ps[0]], lr=1e-2, momentum=momentum, normalize="row"),
+            bl.Lattice([ps[1]], lr=1e-2, momentum=momentum, normalize="row", state_device="cpu")]
+    for s in range(4):
+        g = (torch.randn(64, 256, device=DEV) * (s + 1)).to(torch.bfloat16)
+        for p, o in zip(ps, opts):
+            p.grad = g.clone()
+            o.step()
+    opts[1].synchronize()
+    assert torch.equal(ps[0].packed, ps[1].packed) and torch.equal(ps[0].scales, ps[1].scales)
+    host = [k for k, v in opts[1].state[ps[1]].items() if torch.is_tensor(v) and not v.is_cuda]
+    assert any(k.startswith("m") for k in host), host
