@@ -225,9 +225,19 @@ class _LatticeLinear(torch.autograd.Function):
                 return y
             ctx.save_for_backward()
             return backend.nvfp4_linear(x, w, bias, ctx.recipe)
+        if ctx.policy == "mxfp8_all":
+            ctx.x_meta = (x.shape, x.dtype)
+            if need_w:
+                y, xt = backend.mx_forward_saving(x, w, bias)
+                ctx.save_for_backward(xt.codes, xt.scales)
+                return y
+            ctx.save_for_backward()
+            return backend.mx_linear(x, w, bias)
         ctx.save_for_backward(x if need_w else None)
         if ctx.policy == "fp4":
             return backend.nvfp4_linear(x, w, bias, ctx.recipe)
+        if ctx.policy == "mxfp8":
+            return backend.mx_linear(x, w, bias)
         return torch.nn.functional.linear(x, w.dequantize(x.dtype), bias)
 
     @staticmethod
@@ -246,6 +256,16 @@ class _LatticeLinear(torch.autograd.Function):
                                           ctx.needs_input_grad[1] and xt is not None, ctx.recipe)
             gx = gx.to(dtype).reshape(shape) if gx is not None else None
             gw = gw.to(w.dtype) if gw is not None else None          # None: deferred (backend.defer_wgrad)
+            return gx, gw, gb
+        if ctx.policy == "mxfp8_all":
+            from . import backend
+            shape, dtype = ctx.x_meta
+            saved = ctx.saved_tensors
+            xt = backend.Mx8Operand(*saved) if saved else None
+            gx, gw = backend.mx_backward(gy, w, xt, ctx.needs_input_grad[0],
+                                         ctx.needs_input_grad[1] and xt is not None)
+            gx = gx.to(dtype).reshape(shape) if gx is not None else None
+            gw = gw.to(w.dtype) if gw is not None else None
             return gx, gw, gb
         (x,) = ctx.saved_tensors
         W = w.dequantize(gy.dtype)

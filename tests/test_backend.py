@@ -314,3 +314,28 @@ def test_deferred_weight_gradients_match_accumulated(recipe):
     rel = ((p.grad.float() - ref).norm() / ref.norm()).item()
     assert rel < 0.25, rel
     assert not bl.backend.pending_wgrad()
+
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and bl.backend.mxfp8_supported(0)), reason="needs MXFP8 GEMMs")
+@pytest.mark.parametrize("fmt", ["int4", "nvfp4", "mxfp4", "int8", "fp6_e3m2_g32_se4m3_gs"])
+def test_mxfp8_all_any_format(fmt):
+    torch.manual_seed(13)
+    M = 200
+    x = torch.randn(M, 256, device=DEV, dtype=torch.bfloat16)
+    w = LatticeTensor.from_float(torch.randn(128, 256, device=DEV) * 0.05, fmt, dtype=torch.bfloat16)
+    gy = torch.randn(M, 128, device=DEV, dtype=torch.bfloat16)
+    ref = _grads(x, w, gy, "exact", "nvidia")
+    got = _grads(x, w, gy, "mxfp8_all", "nvidia")
+    for name, r, g in zip(("y", "dx", "dw"), ref, got):
+        rel = ((g - r).norm() / r.norm()).item()
+        assert rel < 0.06, (fmt, name, rel)
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and bl.backend.mxfp8_supported(0)), reason="needs MXFP8 GEMMs")
+def test_auto_policy_routes_by_format():
+    lin = torch.nn.Sequential(torch.nn.Linear(256, 128, bias=False), torch.nn.Linear(128, 128, bias=False)).cuda()
+    bl.quantize_(lin, format="nvfp4", rules=[bl.Rule("1", {"format": "int4"})])
+    with bl.compute("auto"):
+        routes = {n: r for n, f, r in bl.backend.explain(lin)}
+    assert routes["0.weight"] == "fp4_all" and routes["1.weight"] == "mxfp8_all", routes

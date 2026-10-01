@@ -373,6 +373,7 @@ struct Side {
   bool fos;
   bool rotate;
   uint32_t seed, rseed;
+  bool pow2;         // global scale rounded up to a power of two (operands that are later concatenated exactly)
 };
 
 template <typename T> struct Stage { using type = T; static constexpr int kSwz = 3; };
@@ -394,9 +395,10 @@ __device__ __forceinline__ void rotate_masked(float v[16], int lane8, uint32_t m
   hadamard128(v, lane8);
 }
 
-__device__ __forceinline__ float global_of(const float* amax, const float* given, int side, bool fos) {
+__device__ __forceinline__ float global_of(const float* amax, const float* given, int side, bool fos, bool pow2) {
   if (given) return given[side];
-  return fmaxf(amax[side] / (6.0f * (fos ? 256.0f : 448.0f)), 1e-12f);
+  const float g = fmaxf(amax[side] / (6.0f * (fos ? 256.0f : 448.0f)), 1e-12f);
+  return pow2 ? exp2f(ceilf(log2f(g))) : g;
 }
 
 template <typename T, bool kAmax>
@@ -421,8 +423,8 @@ __global__ void __launch_bounds__(256) dual_kernel(const T* __restrict__ x, int6
   float gr = 0.0f, gc = 0.0f;
   Opts ro{row.mode, row.fos, mae, false, row.seed, row.rseed}, co{col.mode, col.fos, mae, false, col.seed, col.rseed};
   if (!kAmax) {
-    if (row.on) gr = global_of(amax, given, 0, row.fos);
-    if (col.on) gc = global_of(amax, given, 1, col.fos);
+    if (row.on) gr = global_of(amax, given, 0, row.fos, row.pow2);
+    if (col.on) gc = global_of(amax, given, 1, col.fos, col.pow2);
     if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
       g_out[0] = gr;
       g_out[1] = gc;
@@ -522,7 +524,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bl_nvfp4_quantize(at::Tensor x, b
                                                                  int64_t seed, std::optional<at::Tensor> global_scale,
                                                                  std::optional<at::Tensor> w_scales,
                                                                  std::optional<at::Tensor> w_global,
-                                                                 int64_t rotate_seed, bool blocked) {
+                                                                 int64_t rotate_seed, bool blocked, bool pow2_global) {
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 2, "x must be a contiguous 2-D CUDA tensor");
   const c10::cuda::CUDAGuard guard(x.device());
   const bool fp4_in = x.scalar_type() == at::kByte;
@@ -550,6 +552,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bl_nvfp4_quantize(at::Tensor x, b
   const float top = 6.0f * (four_over_six ? 256.0f : 448.0f);
   auto finish_global = [&]() {
     global = given ? global_scale->to(at::kFloat).reshape({1}).contiguous() : (amax / top).clamp_min(1e-12);
+    if (!given && pow2_global) global = at::exp2(at::ceil(at::log2(global)));
   };
   auto launch = [&](auto* ptr) {
     using T = std::remove_const_t<std::remove_pointer_t<decltype(ptr)>>;
@@ -591,7 +594,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     at::Tensor x, std::vector<int64_t> row, std::vector<int64_t> col, bool mae, std::optional<at::Tensor> global_scales,
     bool blocked, std::optional<at::Tensor> amax_out) {
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 2, "x must be a contiguous 2-D CUDA tensor");
-  TORCH_CHECK(row.size() == 6 && col.size() == 6, "row / col: {on, mode, four_over_six, rotate, seed, rotate_seed}");
+  TORCH_CHECK((row.size() == 6 || row.size() == 7) && (col.size() == 6 || col.size() == 7),
+              "row / col: {on, mode, four_over_six, rotate, seed, rotate_seed[, pow2_global]}");
   const int64_t M = x.size(0), K = x.size(1);
   TORCH_CHECK(M % 128 == 0 && K % 128 == 0, "both dimensions must be multiples of 128");
   TORCH_CHECK(!amax_out.has_value() || (amax_out->is_cuda() && amax_out->scalar_type() == at::kFloat &&
@@ -600,7 +604,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
   const c10::cuda::CUDAGuard guard(x.device());
   auto side = [](const std::vector<int64_t>& v) {
     return Side{v[0] != 0, static_cast<int>(v[1]), v[2] != 0, v[3] != 0, static_cast<uint32_t>(v[4]),
-                static_cast<uint32_t>(v[5] < 0 ? v[4] : v[5])};
+                static_cast<uint32_t>(v[5] < 0 ? v[4] : v[5]), v.size() > 6 && v[6] != 0};
   };
   const Side rs = side(row), cs = side(col);
   auto opt = x.options().dtype(at::kByte);

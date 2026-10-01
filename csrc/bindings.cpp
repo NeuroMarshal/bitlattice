@@ -26,6 +26,7 @@ std::tuple<Tensor, Tensor, Tensor> bl_quantize_nvfp4_t(Tensor x, std::optional<T
                                                        int64_t step, std::optional<Tensor> global_scale);
 std::tuple<Tensor, Tensor, Tensor> bl_requantize_nvfp4_t(Tensor packed, Tensor scales, Tensor global_scale);
 Tensor bl_scale_(Tensor y, Tensor alpha);
+std::tuple<Tensor, Tensor, Tensor, Tensor> bl_mx_quantize2(Tensor x, bool row, bool col, bool e5m2, bool blocked);
 Tensor bl_causal_conv1d_fwd(Tensor x, Tensor weight, std::optional<Tensor> bias, bool silu_act);
 std::tuple<Tensor, Tensor, Tensor> bl_causal_conv1d_bwd(Tensor x, Tensor weight, std::optional<Tensor> bias, Tensor dy,
                                                         bool silu_act);
@@ -33,7 +34,7 @@ std::tuple<Tensor, Tensor, Tensor> bl_nvfp4_quantize(Tensor x, bool transpose, i
                                                      bool mae, bool rotate, int64_t seed,
                                                      std::optional<Tensor> global_scale,
                                                      std::optional<Tensor> w_scales, std::optional<Tensor> w_global,
-                                                     int64_t rotate_seed, bool blocked);
+                                                     int64_t rotate_seed, bool blocked, bool pow2_global);
 std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> bl_nvfp4_quantize2(Tensor x, std::vector<int64_t> row,
                                                                              std::vector<int64_t> col, bool mae,
                                                                              std::optional<Tensor> global_scales,
@@ -72,11 +73,13 @@ TORCH_LIBRARY(bitlattice, m) {
   m.def("scale_(Tensor(a!) y, Tensor alpha) -> Tensor(a!)");
   m.def("nvfp4_quantize(Tensor x, bool transpose=False, int mode=0, bool four_over_six=False, bool mae=False, "
         "bool rotate=False, int seed=0, Tensor? global_scale=None, Tensor? w_scales=None, Tensor? w_global=None, "
-        "int rotate_seed=-1, bool blocked=False) "
+        "int rotate_seed=-1, bool blocked=False, bool pow2_global=False) "
         "-> (Tensor, Tensor, Tensor)");
   m.def("nvfp4_quantize2(Tensor x, int[] row, int[] col, bool mae=False, Tensor? global_scales=None, "
         "bool blocked=False, Tensor(a!)? amax_out=None) "
         "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+  m.def("mx_quantize2(Tensor x, bool row=True, bool col=False, bool e5m2=False, bool blocked=False) "
+        "-> (Tensor, Tensor, Tensor, Tensor)");
   m.def("causal_conv1d_fwd(Tensor x, Tensor weight, Tensor? bias, bool silu_act) -> Tensor");
   m.def("causal_conv1d_bwd(Tensor x, Tensor weight, Tensor? bias, Tensor dy, bool silu_act) -> (Tensor, Tensor, Tensor)");
 }
@@ -95,6 +98,7 @@ TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
   m.impl("nvfp4_quantize", &bl_nvfp4_quantize);
   m.impl("nvfp4_quantize2", &bl_nvfp4_quantize2);
   m.impl("causal_conv1d_fwd", &bl_causal_conv1d_fwd);
+  m.impl("mx_quantize2", &bl_mx_quantize2);
   m.impl("causal_conv1d_bwd", &bl_causal_conv1d_bwd);
 }
 

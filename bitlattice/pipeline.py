@@ -302,9 +302,8 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                         y = y.detach()
                         if offload is not None:
                             _release(prev)              # the graph node keeps no data; the input owns it now
-                    if y is not None:
-                        if backward:
-                            y.requires_grad_(True)
+                    if y is not None and backward:          # evaluation keeps no unit inputs or outputs
+                        y.requires_grad_(True)
                         ins[(s, j, m)] = y
                     if item[0] == "embed":
                         y = prep[m][0]
@@ -333,12 +332,14 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                     if offload is not None and (s, j, m) in ins and item[0] == "block":
                         offload.put((s, j, m), ins[(s, j, m)])
                     if y is not None:
-                        outs[(s, j, m)] = (y, y.shape)
+                        if backward:
+                            outs[(s, j, m)] = (y, y.shape)
                         if j == last and seg.next is not None:
                             _log("fwd send", s, m, "to", seg.next)
                             keep.append((dist.isend(y.detach(), seg.next, group=_group(me, seg.next)), None))
                             # the activation now lives on the next process; backward needs only the graph node
-                            _release(y)
+                            if backward:
+                                _release(y)
                 ahead.tick()
                 _prune(keep)
         # backward: unit by unit, each over all micro-batches; a unit's gradients are complete after its last

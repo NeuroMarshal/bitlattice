@@ -9,6 +9,10 @@
                by a random-sign 16x16 Hadamard transform, the transposed weight is re-quantized (1x16 blocks) for
                the input gradient; the layer input is saved for backward in its transposed FP4 form (0.56 instead
                of 2 bytes per element)
+    'mxfp8'    any lattice format: activations and the weight (dequantized and re-quantized once per weight version)
+               in MXFP8 (E4M3 elements, power-of-two scales per 32) on FP8 tensor cores, forward only
+    'mxfp8_all' forward, input-gradient and weight-gradient GEMMs in MXFP8 (the layer input saved as MXFP8 x^T)
+    'auto'     per layer: NVFP4-layout weights 'fp4_all', other formats 'mxfp8_all' where supported, else 'exact'
 Layers or devices that do not qualify use 'exact'.
 
 How the FP4 policies quantize the operands is a recipe (:class:`Fp4Recipe`): 'nvidia' (the default; the NVFP4
@@ -32,12 +36,13 @@ import torch
 
 from . import formats as F
 
-__all__ = ["POLICIES", "set_compute", "get_compute", "compute", "fp4_supported", "to_blocked", "nvfp4_linear",
+__all__ = ["POLICIES", "set_compute", "get_compute", "compute", "fp4_supported", "mxfp8_supported", "explain",
+           "to_blocked", "nvfp4_linear", "mx_mm", "Mx8Operand",
            "fp4_policy", "quantize_fp4", "fp4_mm", "rht_last", "Fp4Operand", "Fp4Recipe", "FP4_RECIPES",
            "set_fp4_recipe", "get_fp4_recipe", "fp4_recipe", "is_nvfp4", "defer_wgrad", "flush_wgrad",
            "pending_wgrad", "clear_shared"]
 
-POLICIES = ("exact", "fp4", "fp4_all")
+POLICIES = ("exact", "fp4", "fp4_all", "mxfp8", "mxfp8_all", "auto")
 # process-wide rather than thread-local: the backward pass (and checkpoint recomputation) runs on autograd worker
 # threads and must see the policy of the forward pass
 _default = ["exact"]
@@ -185,6 +190,21 @@ _NVFP4_LEVELS = F.get("nvfp4").levels
 
 
 @lru_cache(maxsize=None)
+def mxfp8_supported(device_index: int) -> bool:
+    """MXFP8 block-scaled GEMMs (E8M0 scales per 32) through PyTorch on this device (probed once)."""
+    if not hasattr(torch, "float8_e8m0fnu"):
+        return False
+    try:
+        dev = torch.device("cuda", device_index)
+        a = torch.zeros(128, 128, device=dev).to(torch.float8_e4m3fn)
+        s = torch.full((128 * 4,), 127, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
+        torch._scaled_mm(a, a.t(), scale_a=s, scale_b=s, out_dtype=torch.bfloat16)
+        return True
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=None)
 def fp4_supported(device_index: int) -> bool:
     if not hasattr(torch, "float4_e2m1fn_x2"):
         return False
@@ -203,16 +223,40 @@ def to_blocked(s: torch.Tensor) -> torch.Tensor:
     return b.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
 
 
+def _fp4_ok(x: torch.Tensor, w) -> bool:
+    return (x.is_cuda and is_nvfp4(w.fmt) and w.hi_idx is None and w.dim() == 2 and w.shape[1] % 32 == 0
+            and w.shape[0] % 16 == 0 and fp4_supported(x.device.index or 0))
+
+
+def _mx_ok(x: torch.Tensor, w) -> bool:
+    return (x.is_cuda and w.dim() == 2 and w.shape[0] % 128 == 0 and w.shape[1] % 128 == 0
+            and mxfp8_supported(x.device.index or 0))
+
+
 def fp4_policy(x: torch.Tensor, w) -> str:
-    """'fp4_all', 'fp4' or 'exact': the policy that applies to this layer call."""
+    """The route of this layer call: 'fp4_all', 'fp4', 'mxfp8_all', 'mxfp8' or 'exact'."""
     pol = get_compute(w)
-    if pol == "exact" or not (x.is_cuda and is_nvfp4(w.fmt) and w.hi_idx is None and w.dim() == 2
-                              and w.shape[1] % 32 == 0 and w.shape[0] % 16 == 0
-                              and fp4_supported(x.device.index or 0)):
-        return "exact"
-    if pol == "fp4_all" and w.shape[0] % 32 == 0:
-        return "fp4_all"
-    return "fp4"
+    if pol == "auto":
+        pol = "fp4_all" if _fp4_ok(x, w) else "mxfp8_all" if _mx_ok(x, w) else "exact"
+    if pol in ("fp4", "fp4_all"):
+        if not _fp4_ok(x, w):
+            return "exact"
+        return "fp4_all" if pol == "fp4_all" and w.shape[0] % 32 == 0 else "fp4"
+    if pol in ("mxfp8", "mxfp8_all"):
+        return pol if _mx_ok(x, w) else "exact"
+    return "exact"
+
+
+def explain(model: torch.nn.Module, tokens: int = 128) -> list[tuple[str, str, str]]:
+    """(parameter name, format, route) for every lattice weight of ``model`` under the current policy, for an input
+    of ``tokens`` rows on the weight's device."""
+    from .tensor import LatticeTensor
+    out = []
+    for name, p in model.named_parameters():
+        if isinstance(p, LatticeTensor) and p.dim() == 2 and p.device.type != "meta":
+            x = torch.empty(tokens, p.shape[1], device=p.device, dtype=p.dtype)
+            out.append((name, p.fmt.name, fp4_policy(x, p)))
+    return out
 
 
 def qualifies_fp4(x: torch.Tensor, w) -> bool:
@@ -648,3 +692,69 @@ def flush_wgrad(params=None, optimizer=None) -> int:
             optimizer._on_grad(p)
         n += 1
     return n
+
+
+# ---- MXFP8 path: any weight format on FP8 tensor cores ------------------------------------------------------------
+
+class Mx8Operand(NamedTuple):
+    """A [rows, cols] matrix in MXFP8: E4M3 codes, E8M0 scales per 32 along cols in the GEMM's tiled layout."""
+
+    codes: torch.Tensor
+    scales: torch.Tensor
+
+
+def _mx2(x2: torch.Tensor, row: bool, col: bool):
+    rc, rs, cc, cs = torch.ops.bitlattice.mx_quantize2(x2, row, col, False, True)
+    return Mx8Operand(rc, rs) if row else None, Mx8Operand(cc, cs) if col else None
+
+
+def mx_mm(a: Mx8Operand, b: Mx8Operand, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    """A B^T for MXFP8 operands A [M, K], B [N, K]."""
+    return torch._scaled_mm(a.codes, b.codes.t(), scale_a=a.scales, scale_b=b.scales, out_dtype=out_dtype)
+
+
+def mx_weight_operands(w) -> tuple[Mx8Operand, Mx8Operand]:
+    """W [N, K] along K and W^T [K, N] along N in MXFP8, from the dequantized weight, once per weight version."""
+    def make():
+        dense = w.dequantize(torch.bfloat16).reshape(w.shape[0], -1).contiguous()
+        wq, wt = _mx2(dense, True, True)
+        return (wq.codes, wq.scales, wt.codes, wt.scales)          # flat: the cache counts tensor bytes
+    c = _cached(w, "mx8", make)
+    return Mx8Operand(c[0], c[1]), Mx8Operand(c[2], c[3])
+
+
+def mx_linear(x: torch.Tensor, w, bias=None) -> torch.Tensor:
+    K = x.shape[-1]
+    M = x.numel() // K
+    xq, _ = _shared(x, None, "mx8", lambda: _mx2(_pad_rows(x.reshape(-1, K), 128).contiguous(), True, False))
+    wq, _ = mx_weight_operands(w)
+    y = mx_mm(xq, wq, x.dtype)[:M]
+    if bias is not None:
+        y += bias.to(y.dtype)
+    return y.reshape(*x.shape[:-1], w.shape[0])
+
+
+def mx_forward_saving(x: torch.Tensor, w, bias=None):
+    """Forward of 'mxfp8_all': (y, x^T in MXFP8 for the weight gradient)."""
+    K = x.shape[-1]
+    M = x.numel() // K
+    xq, xt = _shared(x, None, "mx8+t", lambda: _mx2(_pad_rows(x.reshape(-1, K), 128).contiguous(), True, True))
+    wq, _ = mx_weight_operands(w)
+    y = mx_mm(xq, wq, x.dtype)[:M]
+    if bias is not None:
+        y += bias.to(y.dtype)
+    return y.reshape(*x.shape[:-1], w.shape[0]), xt
+
+
+def mx_backward(gy: torch.Tensor, w, xt: Mx8Operand | None, need_x: bool, need_w: bool):
+    N = gy.shape[-1]
+    g2 = gy.reshape(-1, N)
+    M = g2.shape[0]
+    gq, gt = _mx2(_pad_rows(g2, 128).contiguous(), need_x, need_w)
+    gx = gw = None
+    if need_x:
+        _, wt = mx_weight_operands(w)
+        gx = mx_mm(gq, wt, gy.dtype)[:M]
+    if need_w:
+        gw = mx_mm(gt, xt, w.dtype)
+    return gx, gw
