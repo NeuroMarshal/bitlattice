@@ -59,6 +59,8 @@ def get_compute(tensor=None) -> str:
 
 @contextlib.contextmanager
 def compute(policy: str):
+    """Compute policy inside the block. With activation checkpointing the forward is recomputed during backward:
+    run the backward inside the block too (or use :func:`set_compute`); the same holds for :func:`fp4_recipe`."""
     if policy not in POLICIES:
         raise ValueError(f"compute policy must be one of {POLICIES}")
     _context.append(policy)

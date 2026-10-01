@@ -254,3 +254,25 @@ def test_consumers_share_one_input_quantization(recipe):
     del x2
     gc.collect()
     assert len(bl.backend._SHARED) == n - 1          # the entry died with its input
+
+
+@pytest.mark.parametrize("recipe", RECIPES)
+def test_recipes_with_checkpoint_recomputation(recipe):
+    """Non-reentrant checkpointing recomputes the saved operands in backward (new rotations and stochastic draws):
+    the gradients must stay consistent with them."""
+    from torch.utils.checkpoint import checkpoint
+    torch.manual_seed(10)
+    M = 256
+    x = torch.randn(M, 256, device=DEV, dtype=torch.bfloat16)
+    w = LatticeTensor.from_float(torch.randn(128, 256, device=DEV) * 0.05, "nvfp4", method="rtn")
+    gy = torch.randn(M, 128, device=DEV, dtype=torch.bfloat16)
+    _, rdx, rdw = _grads(x, w, gy, "exact", "nvidia")
+    p = torch.nn.Parameter(w.detach())
+    xi = x.clone().requires_grad_(True)
+    with bl.compute("fp4_all"), bl.fp4_recipe(recipe):            # recomputation runs in backward: keep it inside
+        # an op before the layer: its input is a new tensor in the recomputation (as a norm output in a block)
+        y = checkpoint(lambda t: torch.nn.functional.linear(t * 1.0, p), xi, use_reentrant=False)
+        y.backward(gy)
+    for name, r, g in (("dx", rdx, xi.grad.float()), ("dw", rdw, p.grad.float())):
+        rel = ((g - r).norm() / r.norm()).item()
+        assert rel < 0.25, (recipe, name, rel)

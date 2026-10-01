@@ -218,8 +218,10 @@ class _LatticeLinear(torch.autograd.Function):
             ctx.x_meta = (x.shape, x.dtype)
             if need_w:
                 y, xt = backend.fp4_forward_saving(x, w, bias, ctx.recipe)
-                ctx.save_for_backward(xt.packed, xt.scales, xt.global_scale)
-                ctx.xt_meta = (xt.blocked, xt.rotate_seed)
+                # the rotation seed is saved as a tensor, not a ctx attribute: checkpointed recomputation replaces
+                # the saved tensors (a new x^T with a new rotation), and the seed must come with them
+                meta = torch.tensor([int(xt.blocked), xt.rotate_seed], dtype=torch.int64)
+                ctx.save_for_backward(xt.packed, xt.scales, xt.global_scale, meta)
                 return y
             ctx.save_for_backward()
             return backend.nvfp4_linear(x, w, bias, ctx.recipe)
@@ -236,7 +238,10 @@ class _LatticeLinear(torch.autograd.Function):
             from . import backend
             shape, dtype = ctx.x_meta
             saved = ctx.saved_tensors
-            xt = backend.Fp4Operand(*saved, *ctx.xt_meta) if saved else None
+            xt = None
+            if saved:
+                blocked, seed = saved[3].tolist()
+                xt = backend.Fp4Operand(*saved[:3], bool(blocked), seed)
             gx, gw = backend.fp4_backward(gy, w, xt, ctx.needs_input_grad[0],
                                           ctx.needs_input_grad[1] and xt is not None, ctx.recipe)
             gx = gx.to(dtype).reshape(shape) if gx is not None else None
