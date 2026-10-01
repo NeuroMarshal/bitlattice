@@ -256,3 +256,31 @@ def test_row_normalization_matches_reference_and_tiles():
     lin(torch.randn(4, 16, device=DEV)).square().mean().backward()
     opt.step()
     assert opt.state[lin.weight]["nv"].shape == (8,) and "nv" not in opt.state[lin.bias]
+
+
+@pytest.mark.parametrize("momentum", ["fp32", "bf16", "int8", "fp8", "nvfp4"])
+def test_low_precision_momentum_trains(momentum):
+    teacher, student = _teacher_student()
+    bl.quantize_(student, format="nvfp4", min_features=16, targets=(torch.nn.Linear,))
+    opt = bl.optim.build(student, "normuon", lr=1e-2, momentum=momentum, beta1=0.9)
+    losses = _train(student, teacher, opt)
+    start, end = sum(losses[:10]) / 10, sum(losses[-20:]) / 20
+    assert end < 0.35 * start, (momentum, start, end)
+    bits = opt.state_bits()["momentum"] / sum(p.numel() for p in student.parameters())
+    assert bits <= {"fp32": 32, "bf16": 16, "int8": 8.2, "fp8": 8.2, "nvfp4": 4.6}[momentum] + 1e-6, bits
+
+
+def test_quantized_momentum_tracks_fp32():
+    torch.manual_seed(0)
+    p32 = torch.nn.Parameter(torch.randn(64, 256, device=DEV))
+    st32, st8 = {}, {}
+    opt = bl.Lattice([p32], momentum="int8")
+    g = {"beta1": 0.9, "momentum": "fp32"}
+    m_ref = torch.zeros(64, 256, device=DEV)
+    for step in range(1, 30):
+        G = torch.randn(64, 256, device=DEV) * (1 + step % 3)
+        m_ref.mul_(0.9).add_(G, alpha=0.1)
+        st8["step"] = step
+        m8 = opt._momentum(G, st8, {"beta1": 0.9, "momentum": "int8"}, 0).clone()
+    rel = ((m8 - m_ref).norm() / m_ref.norm()).item()
+    assert rel < 0.02, rel

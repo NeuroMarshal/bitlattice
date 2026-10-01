@@ -1,7 +1,8 @@
 """Lattice optimizer: updates every weight directly in its storage format, without master weights.
 
 One step of a parameter W with gradient G:
-    m = momentum(G)                        none | fp32 | ternary
+    m = momentum(G)                        none | fp32 | ternary | bf16 | int8 | fp8 | nvfp4 (stored formats of
+                                           m; bf16 / int8 / nvfp4 with stochastic rounding, fp8 to nearest)
     D = direction(m), RMS-clipped          muon | muon_block | factored | sinkhorn | colnorm | sign | raw
         optional neuron-wise normalization of matrix directions (normalize='row', NorMuon): every row divided by
         the root of an exponential average of its mean square (one fp32 value per row of state)
@@ -26,7 +27,8 @@ from ..tensor import LatticeTensor
 __all__ = ["Lattice", "DEFAULTS", "DIRECTIONS", "MOMENTA", "ROUNDINGS", "SCALE_RULES"]
 
 DIRECTIONS = ("muon_block", "muon", "factored", "sinkhorn", "colnorm", "sign", "raw")
-MOMENTA = ("none", "fp32", "ternary")
+MOMENTA = ("none", "fp32", "ternary", "bf16", "int8", "fp8", "nvfp4")
+_MOM_BLOCK = 256                # elements per scale of int8 / fp8 momentum
 ROUNDINGS = ("sr", "strat", "rtn")
 SCALE_RULES = ("fit", "fit_latent", "fixed")
 
@@ -172,7 +174,7 @@ class Lattice(torch.optim.Optimizer):
     # ------------------------------------------------------------------------------------------------------------
     # host-memory state
 
-    _OFFLOAD = ("phase", "hi_phase", "m", "mq")
+    _OFFLOAD = ("phase", "hi_phase", "m", "mq", "mb", "m8", "m8s", "m4p", "m4s", "m4g")
 
     def _offloading(self, p: torch.Tensor) -> bool:
         return self.state_device == "cpu" and p.is_cuda
@@ -268,6 +270,13 @@ class Lattice(torch.optim.Optimizer):
                 st["m"] = torch.zeros_like(X)
             st["m"].mul_(g["beta1"]).add_(X, alpha=1 - g["beta1"])
             return st["m"]
+        if mode in ("bf16", "int8", "fp8", "nvfp4"):
+            if mode == "nvfp4" and (X.shape[1] % 16 or not (X.is_cuda and _ops.HAVE_EXT)):
+                mode = "int8"                              # rows not made of 16-blocks (e.g. odd-sized biases)
+            m = self._load_momentum(st, mode, X)
+            m.mul_(g["beta1"]).add_(X, alpha=1 - g["beta1"])
+            self._store_momentum(st, mode, m, (self.seed + 7919 * pid + 104729 * st["step"]) & 0x7FFFFFFF)
+            return m
         pk = X.abs().amax()
         X = X / torch.where(pk > 0, pk, torch.ones_like(pk))
         if "mq" not in st:
@@ -281,6 +290,51 @@ class Lattice(torch.optim.Optimizer):
         st["mq"] = (fl + (u < q - fl).float()).clamp(-1, 1).to(torch.int8)
         st["ms"] = s
         return m
+
+    # momentum stored in a low-precision format: dequantized to fp32 for the update, re-quantized after it
+    def _load_momentum(self, st: dict, mode: str, X: torch.Tensor) -> torch.Tensor:
+        rows, cols = X.shape
+        if mode == "bf16":
+            return st["mb"].float() if "mb" in st else torch.zeros_like(X)
+        if mode in ("int8", "fp8"):
+            if "m8" not in st:
+                return torch.zeros_like(X)
+            return (st["m8"].float() * st["m8s"][:, None]).reshape(-1)[:X.numel()].view(rows, cols)
+        if "m4p" not in st:
+            return torch.zeros_like(X)
+        return _ops.dequantize(st["m4p"], st["m4s"], st["m4g"], None, F.get("nvfp4"), rows, cols, torch.float32)
+
+    def _store_momentum(self, st: dict, mode: str, m: torch.Tensor, seed: int) -> None:
+        gen = self._generator(m.device, seed)
+        if mode == "bf16":                                   # stochastic rounding: random low 16 bits, truncate
+            bits = m.contiguous().view(torch.int32)
+            r = torch.randint(0, 1 << 16, bits.shape, device=m.device, dtype=torch.int32, generator=gen)
+            st["mb"] = ((bits + r) & -65536).view(torch.float32).to(torch.bfloat16)
+            return
+        if mode in ("int8", "fp8"):
+            flat = m.reshape(-1)
+            fb = torch.nn.functional.pad(flat, (0, (-flat.numel()) % _MOM_BLOCK)).view(-1, _MOM_BLOCK)
+            top = 127.0 if mode == "int8" else 448.0
+            sc = (fb.abs().amax(1) / top).clamp_min(1e-30)
+            q = fb / sc[:, None]
+            if mode == "int8":
+                u = torch.rand(q.shape, device=m.device, generator=gen)
+                st["m8"] = torch.floor(q + u).clamp_(-127, 127).to(torch.int8)
+            else:
+                st["m8"] = q.to(torch.float8_e4m3fn)
+            st["m8s"] = sc
+            return
+        rows, cols = m.shape
+        packed, scales, gs = torch.ops.bitlattice.nvfp4_quantize(m.contiguous(), False, 1, True, False, False, seed)
+        st["m4p"], st["m4s"], st["m4g"] = packed, scales.view(torch.float8_e4m3fn), gs
+
+    def _generator(self, device: torch.device, seed: int) -> torch.Generator:
+        gens = self.__dict__.setdefault("_gens", {})
+        gen = gens.get(device)
+        if gen is None:
+            gen = gens[device] = torch.Generator(device=device)
+        gen.manual_seed(seed)
+        return gen
 
     def _direction(self, G: torch.Tensor, st: dict, g: dict, matrix: bool) -> torch.Tensor:
         kind = g["direction"] if matrix else g["vector_direction"]
@@ -510,6 +564,12 @@ class Lattice(torch.optim.Optimizer):
                     out["momentum"] += 32 * n
                 if "mq" in st:
                     out["momentum"] += 2 * n + 32 * st["ms"].numel()
+                if "mb" in st:
+                    out["momentum"] += 16 * n
+                if "m8" in st:
+                    out["momentum"] += 8 * n + 32 * st["m8s"].numel()
+                if "m4p" in st:
+                    out["momentum"] += 4 * n + 8 * st["m4s"].numel() + 32
         out["total"] = sum(out.values())
         return out
 
