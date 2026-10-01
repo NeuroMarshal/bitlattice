@@ -89,12 +89,28 @@ class _LinearCE(torch.autograd.Function):
         tgt = torch.zeros(n, dtype=torch.float32, device=h.device)
         valid = y != ignore_index
         ysafe = torch.where(valid, y, torch.zeros_like(y))
+        V = W.shape[0]
         for s in range(0, n, chunk):
-            logits = (h[s:s + chunk].to(dtype) @ W.t()).float()
-            if bias is not None:
-                logits += bias.float()
-            lse[s:s + chunk] = torch.logsumexp(logits, -1)
-            tgt[s:s + chunk] = logits.gather(1, ysafe[s:s + chunk, None]).squeeze(1)
+            hc = h[s:s + chunk].to(dtype)
+            c = hc.shape[0]
+            vt = max(128, min(V, _VOCAB_TILE_BYTES // (4 * c)))
+            vt -= vt % 128 if vt < V else 0
+            m = torch.full((c,), float("-inf"), device=h.device)
+            z = torch.zeros(c, device=h.device)
+            yc = ysafe[s:s + chunk]
+            tg = torch.zeros(c, device=h.device)
+            for v0 in range(0, V, vt):                          # online log-sum-exp over vocabulary tiles
+                v1 = min(V, v0 + vt)
+                L = (hc @ W[v0:v1].t()).float()
+                if bias is not None:
+                    L += bias[v0:v1].float()
+                inside = (yc >= v0) & (yc < v1)
+                tg += torch.where(inside, L.gather(1, (yc - v0).clamp(0, v1 - v0 - 1)[:, None]).squeeze(1), 0.0)
+                m_new = torch.maximum(m, L.amax(1))
+                z = z * torch.exp(m - m_new) + L.sub_(m_new[:, None]).exp_().sum(1)
+                m = m_new
+            lse[s:s + chunk] = m + z.log()
+            tgt[s:s + chunk] = tg
         count = valid.sum().clamp_min(1)
         loss = ((lse - tgt) * valid).sum() / count
         ctx.save_for_backward(hidden, lse, ysafe, valid, count)
