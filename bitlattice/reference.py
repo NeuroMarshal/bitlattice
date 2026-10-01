@@ -495,3 +495,12 @@ def sinkhorn_direction(G: torch.Tensor, iters: int = 2) -> torch.Tensor:
 def clip_rms(U: torch.Tensor, clip: float = 1.0) -> torch.Tensor:
     rho = U.square().mean().sqrt()
     return U / torch.clamp(rho / clip, min=1.0)
+
+
+def row_normalize(U: torch.Tensor, v: torch.Tensor, k: int, beta: float = 0.95, eps: float = 1e-8,
+                  clip: float = 1.0) -> torch.Tensor:
+    """Neuron-wise normalization (NorMuon): v <- beta v + (1 - beta) mean_cols(U^2) (in place), U / (sqrt(v / (1 -
+    beta^k)) + eps) per row, then the RMS clip."""
+    v.mul_(beta).add_(U.square().mean(1), alpha=1 - beta)
+    rowf = 1.0 / ((v / (1 - beta ** max(k, 1))).sqrt() + eps)
+    return clip_rms(U * rowf[:, None], clip)

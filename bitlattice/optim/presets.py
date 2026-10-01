@@ -17,6 +17,11 @@ PRESETS: dict[str, dict[str, Any]] = {
     # optimizer ablation; for large models, where the orthogonalization would dominate the step
     "muon_fast": dict(direction="muon_block", phase_bits=2, block=(256, None), ns_dtype="fp16",
                       ns_coeffs="polar_express"),
+    # neuron-wise normalized Muon (NorMuon, arXiv 2510.05491): every row of the orthogonalized direction divided by the
+    # root of an exponential average of its mean square (one fp32 value per row), evening out per-neuron step sizes
+    "normuon": dict(direction="muon_block", phase_bits=2, normalize="row"),
+    "normuon_fast": dict(direction="muon_block", phase_bits=2, block=(256, None), ns_dtype="fp16",
+                         ns_coeffs="polar_express", normalize="row"),
     # same with an 8-bit phase: ternary / binary / 2-bit weights
     "muon_precise": dict(direction="muon_block", phase_bits=8),
     # factored (Adafactor-like, no momentum) direction with a 1 / 2 / 8-bit phase

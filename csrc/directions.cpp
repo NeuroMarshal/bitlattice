@@ -139,9 +139,13 @@ Tensor sinkhorn(const Tensor& G, int64_t iters) {
 }  // namespace
 
 // ns_dtype: 0 fp32, 1 bf16, 2 fp16
+// row_state: neuron-wise normalization (NorMuon): v <- beta * v + (1 - beta) * mean_cols(D^2) per row, D / (sqrt(v / (1 -
+// beta^k)) + eps); fused into the final scaling pass (the per-row sums of squares give both the row factors and the
+// RMS of the result)
 Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::optional<Tensor> c, int64_t k, double beta2,
                     int64_t block, int64_t ns_steps, int64_t ns_dtype, int64_t sinkhorn_iters, double clip,
-                    int64_t block_cols, int64_t ns_coeffs, int64_t ns_algo) {
+                    int64_t block_cols, int64_t ns_coeffs, int64_t ns_algo, std::optional<Tensor> row_state,
+                    int64_t row_k, double row_beta, double row_eps) {
   Tensor U;
   double scale = 1.0;
   switch (kind) {
@@ -164,10 +168,24 @@ Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::option
       break;
     default: TORCH_CHECK(false, "unknown direction ", kind);
   }
-  // D = scale * U / max(1, RMS(scale * U) / clip): one fp32 reduction and one pass into a fresh fp32 tensor
-  Tensor rho = at::linalg_vector_norm(U, 2, std::nullopt, false, at::kFloat)
-                   .mul_(scale / std::sqrt(static_cast<double>(std::max<int64_t>(U.numel(), 1))));
-  Tensor f = at::clamp_min(rho / clip, 1.0).reciprocal_().mul_(scale);
   Tensor out = at::empty(U.sizes(), U.options().dtype(at::kFloat));
+  const double n = static_cast<double>(std::max<int64_t>(U.numel(), 1));
+  if (row_state.has_value()) {
+    Tensor v = *row_state;
+    TORCH_CHECK(U.dim() == 2 && v.numel() == U.size(0) && v.scalar_type() == at::kFloat, "row state: fp32 [rows]");
+    const double cols = static_cast<double>(std::max<int64_t>(U.size(1), 1));
+    // mean square of scale * U per row
+    Tensor msq = at::linalg_vector_norm(U, 2, at::IntArrayRef{1}, false, at::kFloat).square_().mul_(scale * scale / cols);
+    v.mul_(row_beta).add_(msq, 1.0 - row_beta);
+    const double bc = 1.0 - std::pow(row_beta, static_cast<double>(std::max<int64_t>(row_k, 1)));
+    Tensor rowf = (v / bc).sqrt_().add_(row_eps).reciprocal_();                    // [rows]
+    // RMS after the row normalization, then the clip
+    Tensor rho = (msq * rowf.square()).mean().sqrt_();
+    Tensor f = at::clamp_min(rho / clip, 1.0).reciprocal_().mul_(scale);
+    return at::mul_out(out, U, rowf.mul_(f).unsqueeze(1));
+  }
+  // D = scale * U / max(1, RMS(scale * U) / clip): one fp32 reduction and one pass into a fresh fp32 tensor
+  Tensor rho = at::linalg_vector_norm(U, 2, std::nullopt, false, at::kFloat).mul_(scale / std::sqrt(n));
+  Tensor f = at::clamp_min(rho / clip, 1.0).reciprocal_().mul_(scale);
   return at::mul_out(out, U, f);
 }

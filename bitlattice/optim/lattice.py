@@ -3,6 +3,8 @@
 One step of a parameter W with gradient G:
     m = momentum(G)                        none | fp32 | ternary
     D = direction(m), RMS-clipped          muon | muon_block | factored | sinkhorn | colnorm | sign | raw
+        optional neuron-wise normalization of matrix directions (normalize='row', NorMuon): every row divided by
+        the root of an exponential average of its mean square (one fp32 value per row of state)
     t = latent(W, phase) * (1 - lr*wd) - lr*D
     refit group scales (quantized formats), then project t back to (code, phase) with unbiased rounding.
 Every option can be overridden per parameter group.
@@ -32,6 +34,7 @@ DEFAULTS: dict[str, Any] = dict(
     lr=3e-3, direction="muon_block", vector_direction="factored", phase_bits=2, rounding="sr", scale_rule="fit",
     momentum="none", beta1=0.9, beta2=0.95, weight_decay=0.0, clip=1.0, block=512, ns_steps=5, ns_dtype="bf16",
     ns_coeffs="muon", ns_algo="auto", sinkhorn_iters=2, trust=0.01, trust_lr=1.0, strata=16, tile_elems=1 << 24,
+    normalize="none", row_beta=0.95, row_eps=1e-8,
 )
 
 
@@ -48,6 +51,9 @@ def _validate(g: dict) -> None:
         raise ValueError("phase_bits must be in [0, 8]")
     if g["vector_direction"] in ("muon", "muon_block"):
         raise ValueError("vector_direction cannot be a matrix direction")
+    if g["normalize"] not in ("none", "row"):
+        raise ValueError("normalize must be 'none' or 'row'")
+
 
 
 def _restrict_rows(G: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
@@ -65,6 +71,17 @@ def _restrict_rows(G: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
 
 def _ns(g: dict) -> dict:
     return {"ns_coeffs": g["ns_coeffs"], "ns_algo": g["ns_algo"]}
+
+
+def _row_norm(g: dict, st: dict, rows: int, device, sl=None) -> dict:
+    """Keyword arguments of ``_ops.direction`` for the neuron-wise normalization (state created on first use);
+    ``sl``: a slice or index tensor of the rows being updated."""
+    if g["normalize"] != "row" or g["direction"] == "factored":     # factored directions are already adaptive
+        return {}
+    if "nv" not in st:
+        st["nv"] = torch.zeros(rows, device=device)
+    v = st["nv"] if sl is None else st["nv"][sl]
+    return {"row_state": v, "row_k": st["step"], "row_beta": g["row_beta"], "row_eps": g["row_eps"]}
 
 
 class Lattice(torch.optim.Optimizer):
@@ -276,8 +293,9 @@ class Lattice(torch.optim.Optimizer):
                 st["k"] = 0
             st["k"] += 1
             r, c = st["r"], st["c"]
+        rn = _row_norm(g, st, R.view2d(G).shape[0], G.device) if matrix else {}
         return _ops.direction(G, kind, r, c, st.get("k", 1), g["beta2"], g["block"], g["ns_steps"], g["ns_dtype"],
-                              g["sinkhorn_iters"], g["clip"], **_ns(g))
+                              g["sinkhorn_iters"], g["clip"], **_ns(g), **rn)
 
     def _update(self, p: torch.Tensor, g: dict) -> None:
         p._bl_version = getattr(p, "_bl_version", 0) + 1          # invalidates cached derived operands
@@ -355,7 +373,8 @@ class Lattice(torch.optim.Optimizer):
                 D = torch.ops.bitlattice.factored_apply(G2, a, b, r0, n)
             else:
                 D = _ops.direction(G2[r0:r0 + n], kind, block=g["block"], ns_steps=g["ns_steps"],
-                                   ns_dtype=g["ns_dtype"], clip=g["clip"], **_ns(g))
+                                   ns_dtype=g["ns_dtype"], clip=g["clip"], **_ns(g),
+                                   **_row_norm(g, st, rows, p.device, slice(r0, r0 + n)))
             if quant:
                 zeros = p.zeros[r0:r0 + n] if p.zeros is not None else None
                 sc = _ops.step_quantized(p.packed[r0:r0 + n], st["phase"][r0:r0 + n] if bits else None,
@@ -398,8 +417,14 @@ class Lattice(torch.optim.Optimizer):
             D = _ops.direction(vals, "factored", r_sub, st["c"], st["k"], g["beta2"], clip=g["clip"])
             st["r"][rows] = r_sub
         else:
+            rn = _row_norm(g, st, n_rows, p.device)
+            if rn:
+                v_sub = st["nv"][rows].contiguous()
+                rn["row_state"] = v_sub
             D = _ops.direction(vals, kind, block=g["block"], ns_steps=g["ns_steps"], ns_dtype=g["ns_dtype"], **_ns(g),
-                               sinkhorn_iters=g["sinkhorn_iters"], clip=g["clip"])
+                               sinkhorn_iters=g["sinkhorn_iters"], clip=g["clip"], **rn)
+            if rn:
+                st["nv"][rows] = v_sub
         bits = g["phase_bits"]
         cb = _ops.phase_container(bits)
         kw = dict(lr=g["lr"], weight_decay=g["weight_decay"], phase_bits=bits, rounding=g["rounding"],
@@ -479,6 +504,8 @@ class Lattice(torch.optim.Optimizer):
                 out["phase"] += n * g["phase_bits"]
                 if "r" in st:
                     out["factors"] += 32 * (st["r"].numel() + st["c"].numel())
+                if "nv" in st:
+                    out["factors"] += 32 * st["nv"].numel()
                 if "m" in st:
                     out["momentum"] += 32 * n
                 if "mq" in st:

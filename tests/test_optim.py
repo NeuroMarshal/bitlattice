@@ -40,7 +40,7 @@ def _train(student, teacher, opt, steps=400, bs=256, d_in=64, seed=2):
 
 
 @pytest.mark.parametrize("fmt", ["bf16", "int8", "nvfp4", "int4", "mxfp4"])
-@pytest.mark.parametrize("preset", ["muon", "muon_fast", "balanced", "light"])
+@pytest.mark.parametrize("preset", ["muon", "muon_fast", "balanced", "light", "normuon"])
 def test_trains_in_format(fmt, preset):
     teacher, student = _teacher_student()
     if fmt != "bf16":
@@ -223,3 +223,36 @@ def test_tied_dense_and_sparse_gradients_accumulate():
     assert emb.weight.grad is not None and emb.weight.grad.shape == (128, 64)
     opt = bl.Lattice([emb.weight], lr=1e-3, direction="factored")
     opt.step()
+
+
+def test_row_normalization_matches_reference_and_tiles():
+    from bitlattice import _ops, reference as R
+    torch.manual_seed(0)
+    G = torch.randn(96, 256, device=DEV) * torch.linspace(0.1, 3.0, 96, device=DEV)[:, None]
+    for kind in ("muon_block", "sign", "raw"):
+        v1 = torch.zeros(96, device=DEV)
+        v2 = torch.zeros(96, device=DEV)
+        for k in (1, 2, 3):
+            D = _ops.direction(G * k, kind, block=64, ns_dtype="fp32", row_state=v1, row_k=k, row_beta=0.9)
+            U = _ops.direction(G * k, kind, block=64, ns_dtype="fp32", clip=1e30)     # unclipped direction
+            ref = R.row_normalize(U, v2, k, 0.9, 1e-8, 1.0)
+            assert torch.allclose(D, ref, rtol=1e-4, atol=1e-5), kind
+        assert torch.allclose(v1, v2, rtol=1e-4)
+        rms = D.square().mean(1).sqrt()
+        assert rms.max() / rms.min() < 1.5                       # rows evened out (input rows span 30x)
+    w = torch.randn(96, 256, device=DEV) * 0.05
+    p1 = torch.nn.Parameter(LatticeTensor.from_float(w, "nvfp4", dtype=torch.bfloat16))
+    p2 = torch.nn.Parameter(LatticeTensor.from_float(w, "nvfp4", dtype=torch.bfloat16))
+    o1 = bl.Lattice([p1], lr=1e-2, normalize="row", block=(32, None))
+    o2 = bl.Lattice([p2], lr=1e-2, normalize="row", block=(32, None), tile_elems=32 * 256)
+    for s in range(3):
+        g = (torch.randn(96, 256, device=DEV) * (s + 1)).to(torch.bfloat16)
+        p1.grad, p2.grad = g.clone(), g.clone()
+        o1.step()
+        o2.step()
+    assert torch.allclose(o1.state[p1]["nv"], o2.state[p2]["nv"], rtol=1e-3)
+    lin = torch.nn.Linear(16, 8).to(DEV)
+    opt = bl.optim.build(lin, "normuon")
+    lin(torch.randn(4, 16, device=DEV)).square().mean().backward()
+    opt.step()
+    assert opt.state[lin.weight]["nv"].shape == (8,) and "nv" not in opt.state[lin.bias]

@@ -110,15 +110,20 @@ def block_shape(block) -> tuple[int, int]:
 
 def direction(G, kind: str, r=None, c=None, k: int = 1, beta2: float = 0.95, block=0, ns_steps: int = 5,
               ns_dtype: str = "bf16", sinkhorn_iters: int = 2, clip: float = 1.0, ns_coeffs: str = "muon",
-              ns_algo: str = "auto") -> torch.Tensor:
-    """Update direction as float32 [rows, cols], RMS clipped to ``clip``. ``block``: int (square) or (rows, cols)."""
-    if kind == "factored" and HAVE_EXT and G.is_cuda and (G.numel() // max(1, G.shape[0] if G.dim() > 1 else 1)) % 4 == 0:
+              ns_algo: str = "auto", row_state=None, row_k: int = 1, row_beta: float = 0.95,
+              row_eps: float = 1e-8) -> torch.Tensor:
+    """Update direction as float32 [rows, cols], RMS clipped to ``clip``. ``block``: int (square) or (rows, cols).
+    ``row_state`` (fp32 [rows], updated in place): neuron-wise normalization of the direction (NorMuon) with an
+    exponential average (``row_beta``, step ``row_k``) of the mean square of every row."""
+    if kind == "factored" and HAVE_EXT and G.is_cuda and (G.numel() // max(1, G.shape[0] if G.dim() > 1 else 1)) % 4 == 0 \
+            and row_state is None:
         return torch.ops.bitlattice.factored_direction(G, r, c, int(k), float(beta2), float(clip))
     br, bc = block_shape(block) if kind == "muon_block" else (0, 0)
     if HAVE_EXT:
         return torch.ops.bitlattice.direction(G, _DIRECTION[kind], r, c, int(k), float(beta2), br, int(ns_steps),
                                               _NS_DTYPE[ns_dtype], int(sinkhorn_iters), float(clip), bc,
-                                              _NS_COEFFS[ns_coeffs], _NS_ALGO[ns_algo])
+                                              _NS_COEFFS[ns_coeffs], _NS_ALGO[ns_algo], row_state, int(row_k),
+                                              float(row_beta), float(row_eps))
     if kind in ("muon", "muon_block"):
         U = R.muon_direction(G, (br, bc), ns_steps,
                              {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[ns_dtype],
@@ -135,6 +140,8 @@ def direction(G, kind: str, r=None, c=None, k: int = 1, beta2: float = 0.95, blo
         U = g / (g.square().mean(0, keepdim=True).sqrt() + 1e-30)
     else:
         U = R.view2d(G).float()
+    if row_state is not None:
+        return R.row_normalize(U, row_state, row_k, row_beta, row_eps, clip)
     return R.clip_rms(U, clip)
 
 
