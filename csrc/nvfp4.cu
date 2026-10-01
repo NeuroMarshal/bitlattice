@@ -402,7 +402,8 @@ __device__ __forceinline__ float global_of(const float* amax, const float* given
 template <typename T, bool kAmax>
 __global__ void __launch_bounds__(256) dual_kernel(const T* __restrict__ x, int64_t M, int64_t K, Side row, Side col,
                                                    bool mae, float* amax, const float* given, float* g_out,
-                                                   uint8_t* rp, ScaleOut rs, uint8_t* cp, ScaleOut cs) {
+                                                   uint8_t* rp, ScaleOut rs, uint8_t* cp, ScaleOut cs,
+                                                   float* amax_out) {
   using E = typename Stage<T>::type;
   constexpr int kSwz = Stage<T>::kSwz;
   constexpr int kPer = 16 / sizeof(E);                       // elements per 16-byte vector
@@ -445,10 +446,9 @@ __global__ void __launch_bounds__(256) dual_kernel(const T* __restrict__ x, int6
       }
       if (row.rotate) rotate_masked(v, lane8, rmask);
       const int64_t orow = r0 + r;
-      if (kAmax) {
 #pragma unroll
-        for (int i = 0; i < 16; ++i) mr = fmaxf(mr, fabsf(v[i]));
-      } else {
+      for (int i = 0; i < 16; ++i) mr = fmaxf(mr, fabsf(v[i]));
+      if (!kAmax) {
         const int64_t b = orow * (K / 16) + k0 / 16 + lane8;
         uint8_t s8;
         const uint64_t out = quantize16(v, gr, ro, static_cast<uint64_t>(b) * 16, static_cast<uint64_t>(b), lane8,
@@ -469,10 +469,9 @@ __global__ void __launch_bounds__(256) dual_kernel(const T* __restrict__ x, int6
       }
       if (col.rotate) rotate_masked(v, lane8, cmask);
       const int64_t ocol = k0 + c;
-      if (kAmax) {
 #pragma unroll
-        for (int i = 0; i < 16; ++i) mc = fmaxf(mc, fabsf(v[i]));
-      } else {
+      for (int i = 0; i < 16; ++i) mc = fmaxf(mc, fabsf(v[i]));
+      if (!kAmax) {
         const int64_t b = ocol * (M / 16) + r0 / 16 + lane8;
         uint8_t s8;
         const uint64_t out = quantize16(v, gc, co, static_cast<uint64_t>(b) * 16, static_cast<uint64_t>(b), lane8,
@@ -482,15 +481,18 @@ __global__ void __launch_bounds__(256) dual_kernel(const T* __restrict__ x, int6
       }
     }
   }
-  if (kAmax) {
+  // the amax pass reduces into ``amax``; the quantization pass reports the amax it saw into ``amax_out`` (delayed
+  // scaling: the next call's global scales)
+  float* dst = kAmax ? amax : amax_out;
+  if (dst) {
 #pragma unroll
     for (int m = 16; m > 0; m >>= 1) {
       mr = fmaxf(mr, __shfl_xor_sync(0xffffffffu, mr, m));
       mc = fmaxf(mc, __shfl_xor_sync(0xffffffffu, mc, m));
     }
     if ((threadIdx.x & 31) == 0) {
-      if (row.on) atomic_max_pos(amax, mr);
-      if (col.on) atomic_max_pos(amax + 1, mc);
+      if (row.on) atomic_max_pos(dst, mr);
+      if (col.on) atomic_max_pos(dst + 1, mc);
     }
   }
 }
@@ -583,14 +585,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bl_nvfp4_quantize(at::Tensor x, b
 
 // Both layouts of x [M, K] (M, K multiples of 128) from one read per pass. row / col = {on, mode, four_over_six,
 // rotate, seed, rotate_seed}; a side that is off returns empty tensors. Global scales: given ([2]: row, col) or the
-// amax of each (rotated) side / (6 * (four_over_six ? 256 : 448)), computed by a first pass over x.
+// amax of each (rotated) side / (6 * (four_over_six ? 256 : 448)), computed by a first pass over x. ``amax_out``
+// (zeroed [2]): receives the amax of each (rotated) side as seen by the quantization pass.
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> bl_nvfp4_quantize2(
     at::Tensor x, std::vector<int64_t> row, std::vector<int64_t> col, bool mae, std::optional<at::Tensor> global_scales,
-    bool blocked) {
+    bool blocked, std::optional<at::Tensor> amax_out) {
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 2, "x must be a contiguous 2-D CUDA tensor");
   TORCH_CHECK(row.size() == 6 && col.size() == 6, "row / col: {on, mode, four_over_six, rotate, seed, rotate_seed}");
   const int64_t M = x.size(0), K = x.size(1);
   TORCH_CHECK(M % 128 == 0 && K % 128 == 0, "both dimensions must be multiples of 128");
+  TORCH_CHECK(!amax_out.has_value() || (amax_out->is_cuda() && amax_out->scalar_type() == at::kFloat &&
+                                        amax_out->numel() == 2 && amax_out->is_contiguous()),
+              "amax_out: zero-initialized float32 [2] (row, column)");
   const c10::cuda::CUDAGuard guard(x.device());
   auto side = [](const std::vector<int64_t>& v) {
     return Side{v[0] != 0, static_cast<int>(v[1]), v[2] != 0, v[3] != 0, static_cast<uint32_t>(v[4]),
@@ -617,10 +623,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
       cudaFuncSetAttribute(k_amax, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
       cudaFuncSetAttribute(k_quant, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
     }
+    float* ao = amax_out.has_value() ? amax_out->data_ptr<float>() : nullptr;
     if (!gp) k_amax<<<grid, 256, smem, stream>>>(ptr, M, K, rs, cs, mae, amax.data_ptr<float>(), nullptr, nullptr,
-                                                 nullptr, rso, nullptr, cso);
+                                                 nullptr, rso, nullptr, cso, nullptr);
     k_quant<<<grid, 256, smem, stream>>>(ptr, M, K, rs, cs, mae, amax.data_ptr<float>(), gp, g.data_ptr<float>(),
-                                         rp.data_ptr<uint8_t>(), rso, cp.data_ptr<uint8_t>(), cso);
+                                         rp.data_ptr<uint8_t>(), rso, cp.data_ptr<uint8_t>(), cso, ao);
   };
   if (x.scalar_type() == at::kBFloat16) launch(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()));
   else if (x.scalar_type() == at::kHalf) launch(reinterpret_cast<const __half*>(x.data_ptr<at::Half>()));

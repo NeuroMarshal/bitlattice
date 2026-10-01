@@ -137,3 +137,12 @@ def test_blocked_scales_match_tiled_layout(shape):
         b = torch.ops.bitlattice.nvfp4_quantize2(x, [1, 0, 1, 0, 0, -1], [1, 2, 0, 1, 3, 7], False, None, True)
         assert torch.equal(to_blocked(a[1]).view(torch.uint8), b[1].view(torch.uint8))
         assert torch.equal(to_blocked(a[4]).view(torch.uint8), b[4].view(torch.uint8))
+
+
+def test_dual_layout_reports_seen_amax():
+    x = _data(256, 384)
+    seen = torch.zeros(2, device=DEV)
+    torch.ops.bitlattice.nvfp4_quantize2(x, [1, 0, 1, 0, 0, -1], [1, 2, 0, 1, 3, 7], False, None, True, seen)
+    ref_col = Q.rht128(x.float().t().contiguous(), 7).abs().amax()
+    assert torch.allclose(seen[0], x.float().abs().amax(), rtol=1e-6)
+    assert torch.allclose(seen[1], ref_col, rtol=1e-5)

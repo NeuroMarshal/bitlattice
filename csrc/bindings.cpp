@@ -34,7 +34,8 @@ std::tuple<Tensor, Tensor, Tensor> bl_nvfp4_quantize(Tensor x, bool transpose, i
 std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> bl_nvfp4_quantize2(Tensor x, std::vector<int64_t> row,
                                                                              std::vector<int64_t> col, bool mae,
                                                                              std::optional<Tensor> global_scales,
-                                                                             bool blocked);
+                                                                             bool blocked,
+                                                                             std::optional<Tensor> amax_out);
 Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::optional<Tensor> c, int64_t k, double beta2,
                     int64_t block, int64_t ns_steps, int64_t ns_dtype, int64_t sinkhorn_iters, double clip,
                     int64_t block_cols, int64_t ns_coeffs, int64_t ns_algo, std::optional<Tensor> row_state,
@@ -71,7 +72,7 @@ TORCH_LIBRARY(bitlattice, m) {
         "int rotate_seed=-1, bool blocked=False) "
         "-> (Tensor, Tensor, Tensor)");
   m.def("nvfp4_quantize2(Tensor x, int[] row, int[] col, bool mae=False, Tensor? global_scales=None, "
-        "bool blocked=False) "
+        "bool blocked=False, Tensor(a!)? amax_out=None) "
         "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
 }
 

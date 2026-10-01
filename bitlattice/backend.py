@@ -87,6 +87,11 @@ class Fp4Recipe:
                                         backward (MS-EDEN with MS-EDEN gradients), or quantized once per weight
                                         version (round to nearest, one rotation per version; as the transposed
                                         weight of the NVIDIA recipe)
+    scale_source     'current' | 'delayed'   per-tensor scales from an amax pass over the operand (exact), or from
+                                        the amax the previous call of the same layer saw (times ``scale_margin``;
+                                        no extra pass; values beyond the range saturate). Applies to the one-read
+                                        kernels of the 128-rotation recipes; the first call of a layer is exact
+    scale_margin     float               headroom of delayed scales
     """
 
     activations: str = "rtn"
@@ -96,6 +101,8 @@ class Fp4Recipe:
     backward_4over6: bool = False
     select: str = "mse"
     dgrad_weight: str = "requantize"
+    scale_source: str = "current"
+    scale_margin: float = 2.0
 
     def __post_init__(self):
         if self.activations not in ("rtn", "4over6"):
@@ -110,6 +117,10 @@ class Fp4Recipe:
             raise ValueError("select must be 'mse' or 'mae'")
         if self.dgrad_weight not in ("requantize", "cached"):
             raise ValueError("dgrad_weight must be 'requantize' or 'cached'")
+        if self.scale_source not in ("current", "delayed"):
+            raise ValueError("scale_source must be 'current' or 'delayed'")
+        if not self.scale_margin >= 1.0:
+            raise ValueError("scale_margin must be >= 1")
 
     @property
     def legacy(self) -> bool:
@@ -125,6 +136,8 @@ FP4_RECIPES: dict[str, Fp4Recipe] = {
                               backward_4over6=True),
     "quartet2_fast": Fp4Recipe(activations="4over6", gradients="eden", rotation=128, rotate_dgrad=True,
                                dgrad_weight="cached"),
+    "quartet2_delayed": Fp4Recipe(activations="4over6", gradients="eden", rotation=128, rotate_dgrad=True,
+                                  dgrad_weight="cached", scale_source="delayed"),
 }
 _recipe_default = [FP4_RECIPES["nvidia"]]
 _recipe_context: list[Fp4Recipe] = []
@@ -374,9 +387,25 @@ def _side(on: bool, mode: int = _RTN, four_over_six: bool = False, rotate_seed: 
     return [int(on), mode, int(four_over_six), int(rotate_seed >= 0), seed, rotate_seed]
 
 
-def _q2(x2: torch.Tensor, row: list, col: list, recipe: Fp4Recipe) -> tuple[Fp4Operand | None, Fp4Operand | None]:
-    """Row and column (x2^T) operands of x2 [M, K] (both multiples of 128) from one read of x2 per pass."""
-    rp, rs, rg, cp, cs, cg = torch.ops.bitlattice.nvfp4_quantize2(x2, row, col, recipe.select == "mae", None, True)
+def _q2(x2: torch.Tensor, row: list, col: list, recipe: Fp4Recipe, site: dict | None = None
+        ) -> tuple[Fp4Operand | None, Fp4Operand | None]:
+    """Row and column (x2^T) operands of x2 [M, K] (both multiples of 128) from one read of x2 per pass. ``site``:
+    the delayed-scaling state of this operand (amax of the previous call, sides seen)."""
+    given = seen = None
+    if recipe.scale_source == "delayed" and site is not None:
+        on = (bool(row[0]), bool(col[0]))
+        hist, known = site.get("amax"), site.get("known", (False, False))
+        if hist is not None and all(known[i] for i in range(2) if on[i]):
+            f = [recipe.scale_margin / (6.0 * (256.0 if side[2] else 448.0)) for side in (row, col)]
+            given = torch.stack([hist[0] * f[0], hist[1] * f[1]]).clamp_min(1e-30)    # device ops only, no sync
+        seen = torch.zeros(2, device=x2.device)
+    rp, rs, rg, cp, cs, cg = torch.ops.bitlattice.nvfp4_quantize2(x2, row, col, recipe.select == "mae", given, True,
+                                                                  seen)
+    if seen is not None:
+        hist = site.get("amax")
+        site["amax"] = seen if hist is None else torch.stack([seen[i] if on[i] else hist[i] for i in range(2)])
+        known = site.get("known", (False, False))
+        site["known"] = (known[0] or on[0], known[1] or on[1])
     return (Fp4Operand(rp, rs, rg, True, row[5] if row[3] else -1) if row[0] else None,
             Fp4Operand(cp, cs, cg, True, col[5] if col[3] else -1) if col[0] else None)
 
@@ -444,14 +473,20 @@ def fp4_forward_saving(x: torch.Tensor, w, bias, recipe: Fp4Recipe | None = None
     recipe = recipe or get_fp4_recipe(w)
     K = x.shape[-1]
     M = x.numel() // K
-    xq, xt = _shared(x, recipe, "fwd+t", lambda: _input_operands(x, recipe))
+    xq, xt = _shared(x, recipe, "fwd+t", lambda: _input_operands(x, recipe, _site(w, "x")))
     y = fp4_mm(xq, weight_operand(w), x.dtype)[:M]
     if bias is not None:
         y += bias.to(y.dtype)
     return y.reshape(*x.shape[:-1], w.shape[0]), xt
 
 
-def _input_operands(x: torch.Tensor, recipe: Fp4Recipe) -> tuple[Fp4Operand, Fp4Operand]:
+def _site(w, role: str) -> dict:
+    """Per-weight state of an operand site (delayed scaling)."""
+    sites = w.__dict__.setdefault("_bl_sites", {})
+    return sites.setdefault(role, {})
+
+
+def _input_operands(x: torch.Tensor, recipe: Fp4Recipe, site: dict | None = None) -> tuple[Fp4Operand, Fp4Operand]:
     """Forward operand of x and its (rotated) transposed operand for the weight gradient."""
     K = x.shape[-1]
     x2 = _pad_rows(x.reshape(-1, K), _pad_to(recipe)).contiguous()
@@ -460,7 +495,7 @@ def _input_operands(x: torch.Tensor, recipe: Fp4Recipe) -> tuple[Fp4Operand, Fp4
         mode = _EDEN if recipe.gradients == "eden" else _RTN
         fos = recipe.backward_4over6 or (mode == _RTN and recipe.activations == "4over6")
         return _q2(x2, _side(True, _RTN, recipe.activations == "4over6"), _side(True, mode, fos, _seed(), _seed()),
-                   recipe)
+                   recipe, site)
     xq = _act_operand(x2, recipe)
     if recipe.rotation == 16:
         # |x H/4| <= 4 max|x| for the orthogonal 16x16 rotation: the row-wise global scale bounds the rotated one
@@ -495,7 +530,7 @@ def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool
             wt = weight_t_rotated_operand(w, b46)
         r = wt.rotate_seed if wt is not None else _seed()
         gq, gt = _q2(g2p, _side(need_x, mode, b46, r, _seed()),
-                     _side(need_w, mode, b46, xt.rotate_seed if need_w else -1, _seed()), recipe)
+                     _side(need_w, mode, b46, xt.rotate_seed if need_w else -1, _seed()), recipe, _site(w, "g"))
         if need_x:
             if wt is None:
                 wt = _q(None, mode=_EDEN if mode == _EDEN else _RTN, four_over_six=b46, recipe=recipe, rotate_seed=r,

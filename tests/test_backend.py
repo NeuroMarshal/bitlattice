@@ -140,7 +140,7 @@ def test_transposed_requantization_matches_dense_transpose():
     assert ((wt - ref).norm() / ref.norm()).item() < 0.12
 
 
-RECIPES = ("nvidia", "4over6", "quartet2", "quartet2_4o6", "quartet2_fast")
+RECIPES = ("nvidia", "4over6", "quartet2", "quartet2_4o6", "quartet2_fast", "quartet2_delayed")
 
 
 def _grads(x, w, gy, policy, recipe):
@@ -276,3 +276,22 @@ def test_recipes_with_checkpoint_recomputation(recipe):
     for name, r, g in (("dx", rdx, xi.grad.float()), ("dw", rdw, p.grad.float())):
         rel = ((g - r).norm() / r.norm()).item()
         assert rel < 0.25, (recipe, name, rel)
+
+
+def test_delayed_scales_follow_the_previous_call():
+    torch.manual_seed(11)
+    w = LatticeTensor.from_float(torch.randn(128, 256, device=DEV) * 0.05, "nvfp4")
+    p = torch.nn.Parameter(w.detach())                 # one parameter: its sites carry the amax between calls
+    rel = []
+    for scale in (1.0, 1.0, 1.0, 1.5):                 # the last call exceeds the previous amax, within the margin
+        x = (torch.randn(256, 256, device=DEV) * scale).to(torch.bfloat16)
+        gy = torch.randn(256, 128, device=DEV, dtype=torch.bfloat16)
+        _, rdx, rdw = _grads(x, w, gy, "exact", "nvidia")
+        p.grad = None
+        xi = x.clone().requires_grad_(True)
+        with bl.compute("fp4_all"), bl.fp4_recipe("quartet2_delayed"):
+            torch.nn.functional.linear(xi, p).backward(gy)
+        dx, dw = xi.grad.float(), p.grad.float()
+        rel.append(max(((dx - rdx).norm() / rdx.norm()).item(), ((dw - rdw).norm() / rdw.norm()).item()))
+    assert p._bl_sites["x"]["known"] == (True, True) and p._bl_sites["g"]["known"] == (True, True)
+    assert max(rel) < 0.25, rel
