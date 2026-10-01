@@ -26,6 +26,9 @@ std::tuple<Tensor, Tensor, Tensor> bl_quantize_nvfp4_t(Tensor x, std::optional<T
                                                        int64_t step, std::optional<Tensor> global_scale);
 std::tuple<Tensor, Tensor, Tensor> bl_requantize_nvfp4_t(Tensor packed, Tensor scales, Tensor global_scale);
 Tensor bl_scale_(Tensor y, Tensor alpha);
+Tensor bl_causal_conv1d_fwd(Tensor x, Tensor weight, std::optional<Tensor> bias, bool silu_act);
+std::tuple<Tensor, Tensor, Tensor> bl_causal_conv1d_bwd(Tensor x, Tensor weight, std::optional<Tensor> bias, Tensor dy,
+                                                        bool silu_act);
 std::tuple<Tensor, Tensor, Tensor> bl_nvfp4_quantize(Tensor x, bool transpose, int64_t mode, bool four_over_six,
                                                      bool mae, bool rotate, int64_t seed,
                                                      std::optional<Tensor> global_scale,
@@ -74,6 +77,8 @@ TORCH_LIBRARY(bitlattice, m) {
   m.def("nvfp4_quantize2(Tensor x, int[] row, int[] col, bool mae=False, Tensor? global_scales=None, "
         "bool blocked=False, Tensor(a!)? amax_out=None) "
         "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+  m.def("causal_conv1d_fwd(Tensor x, Tensor weight, Tensor? bias, bool silu_act) -> Tensor");
+  m.def("causal_conv1d_bwd(Tensor x, Tensor weight, Tensor? bias, Tensor dy, bool silu_act) -> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
@@ -89,6 +94,8 @@ TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
   m.impl("scale_", &bl_scale_);
   m.impl("nvfp4_quantize", &bl_nvfp4_quantize);
   m.impl("nvfp4_quantize2", &bl_nvfp4_quantize2);
+  m.impl("causal_conv1d_fwd", &bl_causal_conv1d_fwd);
+  m.impl("causal_conv1d_bwd", &bl_causal_conv1d_bwd);
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CompositeExplicitAutograd, m) { m.impl("direction", &bl_direction); }
