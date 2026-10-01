@@ -8,16 +8,16 @@ Bitlattice works on ordinary `torch.nn.Module` models. Whatever it changes is vi
 Bitlattice modules in `print(model)`, quantized weights are `LatticeTensor` parameters, and `bl.explain(model)`
 lists, per layer, the format, how it computes, conversions, whether it trains and its memory.
 
-## Two worlds: automatic and explicit
+## Two worlds: plain defaults and explicit requirements
 
-- **Not specified → chosen automatically.** Every setting has an automatic value: the runtime picks the best route
-  the hardware and shapes allow (for example FP4 tensor cores for NVFP4 weights, MXFP8 for other formats, exact
-  bf16 otherwise) and logs the choice once per layer (logger `bitlattice`). `bl.explain` shows the choice and why.
+- **Not specified → the plain default.** Everything behaves the way one would expect first: the model is not
+  converted, computation is exact, nothing is compressed, state stays on the GPU. Defaults are chosen for
+  consistency and least surprise, not for speed — every optimization is switched on by you. Where the runtime has
+  to choose something (device placement, one of several equivalent kernels), it logs the choice (logger
+  `bitlattice`) and `bl.explain` shows it. Settings without a sensible default are required arguments.
 - **Specified → required.** A setting you give explicitly is a requirement: if it cannot be met (no FP4 tensor
   cores, a dimension that does not fit a kernel), you get an error that says why — when configuring if it can be
   known then, otherwise at first use. There are no silent fallbacks.
-
-Write the essentials and let the runtime fill in the rest, or pin everything down and get every mismatch reported.
 
 ## One way to do one thing
 
