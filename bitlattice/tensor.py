@@ -245,7 +245,7 @@ class _LatticeLinear(torch.autograd.Function):
             gx, gw = backend.fp4_backward(gy, w, xt, ctx.needs_input_grad[0],
                                           ctx.needs_input_grad[1] and xt is not None, ctx.recipe)
             gx = gx.to(dtype).reshape(shape) if gx is not None else None
-            gw = gw.to(w.dtype) if gw is not None else None
+            gw = gw.to(w.dtype) if gw is not None else None          # None: deferred (backend.defer_wgrad)
             return gx, gw, gb
         (x,) = ctx.saved_tensors
         W = w.dequantize(gy.dtype)

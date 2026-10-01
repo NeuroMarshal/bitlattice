@@ -295,3 +295,22 @@ def test_delayed_scales_follow_the_previous_call():
         rel.append(max(((dx - rdx).norm() / rdx.norm()).item(), ((dw - rdw).norm() / rdw.norm()).item()))
     assert p._bl_sites["x"]["known"] == (True, True) and p._bl_sites["g"]["known"] == (True, True)
     assert max(rel) < 0.25, rel
+
+
+@pytest.mark.parametrize("recipe", ["quartet2", "quartet2_fast"])
+def test_deferred_weight_gradients_match_accumulated(recipe):
+    torch.manual_seed(12)
+    w = LatticeTensor.from_float(torch.randn(128, 256, device=DEV) * 0.05, "nvfp4")
+    xs = [(torch.randn(128, 256, device=DEV) * s).to(torch.bfloat16) for s in (1.0, 3.0, 0.5)]
+    gys = [torch.randn(128, 128, device=DEV, dtype=torch.bfloat16) for _ in xs]
+    ref = sum(_grads(x, w, gy, "exact", "nvidia")[2] for x, gy in zip(xs, gys))
+    p = torch.nn.Parameter(w.detach())
+    with bl.compute("fp4_all"), bl.fp4_recipe(recipe):
+        with bl.backend.defer_wgrad():
+            for x, gy in zip(xs, gys):
+                torch.nn.functional.linear(x.clone().requires_grad_(True), p).backward(gy)
+        assert p.grad is None and bl.backend.pending_wgrad() == [p]
+        assert bl.backend.flush_wgrad() == 1
+    rel = ((p.grad.float() - ref).norm() / ref.norm()).item()
+    assert rel < 0.25, rel
+    assert not bl.backend.pending_wgrad()

@@ -34,7 +34,8 @@ from . import formats as F
 
 __all__ = ["POLICIES", "set_compute", "get_compute", "compute", "fp4_supported", "to_blocked", "nvfp4_linear",
            "fp4_policy", "quantize_fp4", "fp4_mm", "rht_last", "Fp4Operand", "Fp4Recipe", "FP4_RECIPES",
-           "set_fp4_recipe", "get_fp4_recipe", "fp4_recipe", "is_nvfp4"]
+           "set_fp4_recipe", "get_fp4_recipe", "fp4_recipe", "is_nvfp4", "defer_wgrad", "flush_wgrad",
+           "pending_wgrad", "clear_shared"]
 
 POLICIES = ("exact", "fp4", "fp4_all")
 # process-wide rather than thread-local: the backward pass (and checkpoint recomputation) runs on autograd worker
@@ -368,23 +369,27 @@ def _seed() -> int:
 
 
 def _q(x2: torch.Tensor, *, transpose: bool = False, mode: int = _RTN, four_over_six: bool = False,
-       recipe: Fp4Recipe | None = None, rotate_seed: int = -1, seed: int = 0, w=None) -> Fp4Operand:
+       recipe: Fp4Recipe | None = None, rotate_seed: int = -1, seed: int = 0, w=None, pow2: bool = False
+       ) -> Fp4Operand:
     """NVFP4 operand from the general kernel: rows of x2 (or of x2^T), optionally rotated (128) with
-    ``rotate_seed``; ``w``: an NVFP4 weight given by its codes (transposed re-quantization)."""
+    ``rotate_seed``; ``w``: an NVFP4 weight given by its codes (transposed re-quantization); ``pow2``: global scale
+    rounded up to a power of two."""
     mae = recipe is not None and recipe.select == "mae"
     rot = rotate_seed >= 0
     if w is not None:
         packed, scales, g = torch.ops.bitlattice.nvfp4_quantize(w.packed, True, mode, four_over_six, mae, rot, seed,
                                                                 None, w.scales, w.global_scale,
-                                                                rotate_seed if rot else -1, True)
+                                                                rotate_seed if rot else -1, True, pow2)
     else:
         packed, scales, g = torch.ops.bitlattice.nvfp4_quantize(x2, transpose, mode, four_over_six, mae, rot, seed,
-                                                                None, None, None, rotate_seed if rot else -1, True)
+                                                                None, None, None, rotate_seed if rot else -1, True,
+                                                                pow2)
     return Fp4Operand(packed, scales, g, True, rotate_seed)
 
 
-def _side(on: bool, mode: int = _RTN, four_over_six: bool = False, rotate_seed: int = -1, seed: int = 0) -> list:
-    return [int(on), mode, int(four_over_six), int(rotate_seed >= 0), seed, rotate_seed]
+def _side(on: bool, mode: int = _RTN, four_over_six: bool = False, rotate_seed: int = -1, seed: int = 0,
+          pow2: bool = False) -> list:
+    return [int(on), mode, int(four_over_six), int(rotate_seed >= 0), seed, rotate_seed, int(pow2)]
 
 
 def _q2(x2: torch.Tensor, row: list, col: list, recipe: Fp4Recipe, site: dict | None = None
@@ -494,8 +499,10 @@ def _input_operands(x: torch.Tensor, recipe: Fp4Recipe, site: dict | None = None
         # one read of x for both
         mode = _EDEN if recipe.gradients == "eden" else _RTN
         fos = recipe.backward_4over6 or (mode == _RTN and recipe.activations == "4over6")
-        return _q2(x2, _side(True, _RTN, recipe.activations == "4over6"), _side(True, mode, fos, _seed(), _seed()),
-                   recipe, site)
+        # the weight-gradient operands get power-of-two global scales: micro-batches can then be concatenated
+        # exactly into one GEMM (deferred weight gradients)
+        return _q2(x2, _side(True, _RTN, recipe.activations == "4over6"),
+                   _side(True, mode, fos, _seed(), _seed(), pow2=True), recipe, site)
     xq = _act_operand(x2, recipe)
     if recipe.rotation == 16:
         # |x H/4| <= 4 max|x| for the orthogonal 16x16 rotation: the row-wise global scale bounds the rotated one
@@ -505,7 +512,8 @@ def _input_operands(x: torch.Tensor, recipe: Fp4Recipe, site: dict | None = None
     else:
         mode = _EDEN if recipe.gradients == "eden" else _RTN
         fos = recipe.backward_4over6 or (mode == _RTN and recipe.activations == "4over6")
-        xt = _q(x2, transpose=True, mode=mode, four_over_six=fos, recipe=recipe, rotate_seed=_seed(), seed=_seed())
+        xt = _q(x2, transpose=True, mode=mode, four_over_six=fos, recipe=recipe, rotate_seed=_seed(), seed=_seed(),
+                pow2=True)
     return xq, xt
 
 
@@ -530,14 +538,15 @@ def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool
             wt = weight_t_rotated_operand(w, b46)
         r = wt.rotate_seed if wt is not None else _seed()
         gq, gt = _q2(g2p, _side(need_x, mode, b46, r, _seed()),
-                     _side(need_w, mode, b46, xt.rotate_seed if need_w else -1, _seed()), recipe, _site(w, "g"))
+                     _side(need_w, mode, b46, xt.rotate_seed if need_w else -1, _seed(), pow2=True), recipe,
+                     _site(w, "g"))
         if need_x:
             if wt is None:
                 wt = _q(None, mode=_EDEN if mode == _EDEN else _RTN, four_over_six=b46, recipe=recipe, rotate_seed=r,
                         seed=_seed(), w=w)
             gx = fp4_mm(gq, wt, gy.dtype)[:M]
         if need_w:
-            gw = fp4_mm(gt, xt, w.dtype)
+            gw = _weight_grad(w, gt, xt)
         return gx, gw
     if need_x:
         if recipe.rotate_dgrad and N % 128 == 0:
@@ -559,11 +568,83 @@ def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool
         if xt.rotate_seed >= 0:                                                        # g^T rotated (128), [N, Mp]
             mode = _EDEN if recipe.gradients == "eden" else _SR
             gt = _q(g2p, transpose=True, mode=mode, four_over_six=b46, recipe=recipe, rotate_seed=xt.rotate_seed,
-                    seed=_seed())
+                    seed=_seed(), pow2=True)
         else:
             seed = _seed()                                                             # g^T rotated (16), [N, Mp]
             bound = gq.global_scale * (4.0 * (256.0 / 448.0 if b46 else 1.0)) if gq is not None else None
             gt = Fp4Operand(*torch.ops.bitlattice.quantize_nvfp4_t(g2p, _hadamard16(g2p.device, torch.float32), seed,
                                                                    0, bound))
-        gw = fp4_mm(gt, xt, w.dtype)
+            return gx, fp4_mm(gt, xt, w.dtype)                  # not power-of-two scaled: never deferred
+        gw = _weight_grad(w, gt, xt)
     return gx, gw
+
+
+# ---- deferred weight gradients ------------------------------------------------------------------------------------
+# With micro-batches, every backward of a layer adds its weight gradient to .grad (a full read-modify-write of the
+# gradient per micro-batch) from a GEMM over that micro-batch's tokens only. Inside ``defer_wgrad()`` the FP4 path of
+# the 128-rotation recipes keeps the quantized operands (Eᵀ, xᵀ: power-of-two global scales) instead; ``flush_wgrad``
+# folds their scales to a common global scale (exact: powers of two shift E4M3 exponents), concatenates them along the
+# token axis and runs one GEMM over all micro-batches. Deferred work can also be scheduled into pipeline bubbles
+# (the weight-gradient half of a split backward).
+
+_defer_wgrad = [0]
+_PENDING: "OrderedDict" = OrderedDict()             # id(param) -> (weakref(param), [(gt, xt), ...])
+
+
+@contextlib.contextmanager
+def defer_wgrad():
+    """Keep the weight-gradient operands of FP4 layers instead of computing their gradients (see flush_wgrad)."""
+    _defer_wgrad[0] += 1
+    try:
+        yield
+    finally:
+        _defer_wgrad[0] -= 1
+
+
+def _weight_grad(w, gt: Fp4Operand, xt: Fp4Operand):
+    if not _defer_wgrad[0]:
+        return fp4_mm(gt, xt, w.dtype)
+    entry = _PENDING.get(id(w))
+    if entry is None or entry[0]() is not w:
+        entry = _PENDING[id(w)] = (weakref.ref(w), [])
+    entry[1].append((gt, xt))
+    return None
+
+
+def _concat(ops: list) -> Fp4Operand:
+    """Operands [rows, K_j] with power-of-two global scales and blocked scales -> one operand [rows, sum K_j]."""
+    if len(ops) == 1:
+        return ops[0]
+    g = torch.stack([o.global_scale.reshape(()) for o in ops]).amax()
+    packed = torch.cat([o.packed for o in ops], 1)
+    rows = ops[0].packed.shape[0]
+    nr = -(-rows // 128)
+    tiles = []
+    for o in ops:
+        f = (o.global_scale.reshape(()) / g)                       # a power of two <= 1: exact in E4M3 (normal range)
+        s = (o.scales.view(torch.float8_e4m3fn).float() * f).to(torch.float8_e4m3fn)
+        tiles.append(s.view(nr, -1, 512))
+    return Fp4Operand(packed, torch.cat(tiles, 1).reshape(-1), g.reshape(1), True)
+
+
+def pending_wgrad() -> list:
+    """Parameters with deferred weight gradients."""
+    return [ref() for ref, _ in _PENDING.values() if ref() is not None]
+
+
+def flush_wgrad(params=None, optimizer=None) -> int:
+    """Compute deferred weight gradients (all, or of ``params``) with one GEMM per parameter, add them to ``.grad``
+    and, for a fused-backward optimizer, apply its update. Returns the number of parameters flushed."""
+    keys = list(_PENDING) if params is None else [id(p) for p in params if id(p) in _PENDING]
+    n = 0
+    for k in keys:
+        ref, items = _PENDING.pop(k)
+        p = ref()
+        if p is None or not items:
+            continue
+        gw = fp4_mm(_concat([gt for gt, _ in items]), _concat([xt for _, xt in items]), p.dtype)
+        p.grad = gw if p.grad is None else p.grad.add_(gw)
+        if optimizer is not None and getattr(optimizer, "fused_backward", False):
+            optimizer._on_grad(p)
+        n += 1
+    return n

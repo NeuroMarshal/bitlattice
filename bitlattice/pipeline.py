@@ -30,6 +30,8 @@ import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
+from . import backend
+
 from . import parallel as P
 
 __all__ = ["init", "train_step", "is_main"]
@@ -224,7 +226,8 @@ class _RunAhead:
 
 def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = None, *, micro: int = 4,
                optimizer=None, backward: bool = True, chunk: int = 1024, run_ahead: int = 3,
-               extra_loss=None, offload_activations: bool = False, checkpoint_head="auto") -> torch.Tensor:
+               extra_loss=None, offload_activations: bool = False, checkpoint_head="auto",
+               defer_wgrad: bool = False) -> torch.Tensor:
     """Forward (and backward) of a causal LM batch over all processes; returns the mean next-token loss (the same
     value on every process). Every process must call it with the same ``input_ids`` / ``labels``.
 
@@ -241,7 +244,10 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                  tokens per step beyond one unit's working set.
     checkpoint_head -- recompute the head (final norm, loss over the vocabulary, extra heads) in backward instead of
                  keeping its activations; 'auto': only when the output layer is trained (a frozen one gets its input
-                 gradient in forward, so extra heads should checkpoint their own blocks)."""
+                 gradient in forward, so extra heads should checkpoint their own blocks).
+    defer_wgrad -- FP4 layers keep their weight-gradient operands over a unit's micro-batches and compute the
+                 gradient once after the last one (one GEMM over all micro-batches' tokens, no accumulation into
+                 .grad per micro-batch; ``bitlattice.backend.defer_wgrad``)."""
     me = dist.get_rank()
     dev = model.bl_local_device
     segs = getattr(model, "_bl_pipeline_plan", None)
@@ -355,7 +361,7 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                     for m in range(M):
                         defer = (optimizer.accumulate() if optimizer is not None and m < M - 1
                                  else contextlib.nullcontext())
-                        with defer:
+                        with defer, (backend.defer_wgrad() if defer_wgrad else contextlib.nullcontext()):
                             if seg.items[j][0] == "head":
                                 torch.autograd.backward(losses[m])
                             else:
@@ -374,6 +380,8 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                             keep.append((dist.isend(gi, seg.prev, group=_group(me, seg.prev)), None))
                         ahead.tick()
                         _prune(keep)
+                    if defer_wgrad:
+                        backend.flush_wgrad(optimizer=optimizer)        # this unit's weight gradients, then updates
                     if _DEBUG:
                         live = sum(1 for p in model.parameters() if p.grad is not None)
                         _log("bwd unit", s, j, "done:", f"{torch.cuda.memory_allocated() / 2 ** 30:.2f} GiB,",

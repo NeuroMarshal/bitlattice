@@ -52,3 +52,24 @@ def test_two_process_pipeline_matches_single_gpu(dense_dir, tmp_path, offload):
     assert abs(piped[0] - ref[0]) <= 1e-3 * ref[0]
     assert piped[-1] < 0.8 * piped[0]
     assert all(abs(a - b) <= 0.05 * a for a, b in zip(ref, piped)), (ref, piped)
+
+
+def _pipe(dense_dir, tmp_path, tag, extra):
+    out = tmp_path / f"{tag}.jsonl"
+    args = ["--model", dense_dir, "--steps", "8", "--batch", "4", "--micro", "2", "--seq", "127", "--preset", "muon",
+            "--lr", "3e-3", "--data", "fixed", "--json", str(out)] + extra
+    env = dict(os.environ, PYTHONPATH=ROOT)
+    subprocess.run([sys.executable, "-m", "torch.distributed.run", "--nproc-per-node", "2",
+                    os.path.join(ROOT, "bench", "pipeline_train.py"), *args], check=True, env=env, cwd=ROOT,
+                   timeout=600)
+    return json.loads(out.read_text().splitlines()[-1])["losses"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not bl.backend.fp4_supported(0), reason="needs FP4 tensor cores")
+def test_pipeline_deferred_weight_gradients(dense_dir, tmp_path):
+    fp4 = ["--compute", "fp4_all", "--fp4-recipe", "quartet2_fast"]
+    plain = _pipe(dense_dir, tmp_path, "plain", fp4)
+    deferred = _pipe(dense_dir, tmp_path, "deferred", fp4 + ["--defer-wgrad"])
+    assert abs(plain[0] - deferred[0]) <= 1e-3 * plain[0]
+    assert deferred[-1] < 0.9 * deferred[0]
+    assert all(abs(a - b) <= 0.05 * a for a, b in zip(plain, deferred)), (plain, deferred)
