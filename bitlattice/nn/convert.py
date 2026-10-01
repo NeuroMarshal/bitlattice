@@ -20,8 +20,10 @@ Conversions:
     rms_norm          lean RMSNorm: keeps the input and one fp32 value per row (reference norms keep fp32 copies)
     gated_rms_norm    lean normalize-then-gate RMSNorm (linear-attention output norms)
     gated_delta_net   GatedDeltaNet layer (Qwen3.5 / Qwen3-Next): fused causal convolution, q / k in their own
-                      heads (no repeated copies), optional pieces of ``seq_chunk`` tokens for the delta rule; calls
-                      with a cache (generation) go to the original module
+                      heads (no repeated copies); ``seq_chunk``: the delta rule over pieces of that many tokens;
+                      ``chunk``: the whole layer over pieces of that many tokens (convolution inputs and recurrent
+                      state carried between pieces), each piece recomputed in backward -- the layer keeps its input
+                      only; calls with a cache (generation) go to the original module
     token_chunks      a position-wise module (MLP) over pieces of ``chunk`` tokens, each recomputed in backward
     attention_chunks  a causal self-attention layer (q/k/v/o projections, optional q/k norms and output gate, e.g.
                       Qwen3 / Qwen3.5) over pieces of ``chunk`` queries: keys and values are projected once for
@@ -144,12 +146,14 @@ class GatedDeltaNet(Converted):
     _COPY = ("hidden_size", "num_v_heads", "num_k_heads", "head_k_dim", "head_v_dim", "key_dim", "value_dim",
              "conv_kernel_size", "layer_idx", "activation", "layer_norm_epsilon", "conv_dim", "layer_type")
 
-    def __init__(self, original, seq_chunk: int = 0):
+    def __init__(self, original, seq_chunk: int = 0, chunk: int = 0):
         super().__init__(original)
         for k in self._COPY:
             if hasattr(original, k):
                 setattr(self, k, getattr(original, k))
-        self.seq_chunk = int(seq_chunk)
+        self.seq_chunk, self.chunk = int(seq_chunk), int(chunk)
+        if self.chunk < 0 or self.chunk % 64:
+            raise ValueError("chunk must be 0 or a positive multiple of 64")
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule
         from .sequence import sequence_chunked
         self._rule = sequence_chunked(chunk_gated_delta_rule, self.seq_chunk) if self.seq_chunk else \
@@ -158,28 +162,47 @@ class GatedDeltaNet(Converted):
     def forward(self, hidden_states, cache_params=None, attention_mask=None, **kwargs):
         if cache_params is not None or kwargs.get("cu_seq_lens_q") is not None:
             return self.original(hidden_states, cache_params=cache_params, attention_mask=attention_mask, **kwargs)
-        from .conv import causal_conv1d
         if attention_mask is not None and attention_mask.dim() == 2 and hidden_states.shape[1] > 1:
             hidden_states = (hidden_states * attention_mask[:, :, None]).to(hidden_states.dtype)
-        B, T, _ = hidden_states.shape
-        mixed = self.in_proj_qkv(hidden_states).transpose(1, 2)
-        z = self.in_proj_z(hidden_states)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
-        mixed = causal_conv1d(mixed, self.conv1d.weight.squeeze(1), self.conv1d.bias,
-                              self.activation).transpose(1, 2)
-        q, k, v = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-        q = q.reshape(B, T, -1, self.head_k_dim)
-        k = k.reshape(B, T, -1, self.head_k_dim)
-        v = v.reshape(B, T, -1, self.head_v_dim)
+        T = hidden_states.shape[1]
+        if not self.chunk or T <= self.chunk:
+            return self._piece(hidden_states, None, None, last=True)[0]
+        # the layer over pieces of `chunk` tokens: the convolution continues from the previous piece's last inputs,
+        # the recurrence from its final state; with gradients each piece is recomputed in backward
+        ckpt = torch.is_grad_enabled() and self.training
+        outs, tail, state = [], None, None
+        for s in range(0, T, self.chunk):
+            x, last = hidden_states[:, s:s + self.chunk], s + self.chunk >= T
+            args = (x, tail, state, last)
+            o, tail, state = _checkpoint(self._piece, *args, use_reentrant=False) if ckpt else self._piece(*args)
+            outs.append(o)
+        return torch.cat(outs, 1)
+
+    def _piece(self, x, tail, state, last: bool):
+        """(output, convolution inputs of the last tokens, final recurrent state) of tokens x [B, L, D] that follow
+        the tokens whose convolution inputs are ``tail`` and recurrent state is ``state`` (None: sequence start)."""
+        from .conv import causal_conv1d
+        B, L, _ = x.shape
+        mixed = self.in_proj_qkv(x)
+        z = self.in_proj_z(x)
+        b = self.in_proj_b(x)
+        a = self.in_proj_a(x)
+        ext = mixed if tail is None else torch.cat([tail, mixed], 1)
+        conv = causal_conv1d(ext.transpose(1, 2), self.conv1d.weight.squeeze(1), self.conv1d.bias,
+                             self.activation).transpose(1, 2)[:, ext.shape[1] - L:]
+        q, k, v = torch.split(conv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = q.reshape(B, L, -1, self.head_k_dim)
+        k = k.reshape(B, L, -1, self.head_k_dim)
+        v = v.reshape(B, L, -1, self.head_v_dim)
         g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
-        o, _ = self._rule(q, k, v, g=g, beta=b.sigmoid(), initial_state=None, output_final_state=False,
-                          use_qk_l2norm_in_kernel=True)
-        o = self.norm(o.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)).reshape(B, T, -1)
-        return self.out_proj(o)
+        o, state = self._rule(q, k, v, g=g, beta=b.sigmoid(), initial_state=state, output_final_state=not last,
+                              use_qk_l2norm_in_kernel=True)
+        o = self.norm(o.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)).reshape(B, L, -1)
+        keep = self.conv1d.weight.shape[-1] - 1
+        return self.out_proj(o), (None if last else ext[:, ext.shape[1] - keep:]), state
 
     def settings(self):
-        return f"seq_chunk={self.seq_chunk}"
+        return f"seq_chunk={self.seq_chunk}, chunk={self.chunk}"
 
 
 _PLAIN_KWARGS = {"position_ids", "cache_position", "use_cache", "output_attentions", "past_key_values",
@@ -451,12 +474,13 @@ _CONVERSIONS: dict[str, Conversion] = {
         lambda m, new: (torch.randn(4, m.weight.shape[0], device=_device(m), dtype=_wdtype(m)),
                         torch.randn(4, m.weight.shape[0], device=_device(m), dtype=_wdtype(m)))),
     "gated_delta_net": Conversion(
-        "GatedDeltaNet: fused convolution, q / k in their own heads, optional seq_chunk pieces",
+        "GatedDeltaNet: fused convolution, q / k in their own heads; seq_chunk: rule over pieces; chunk: whole layer "
+        "over pieces recomputed in backward",
         lambda m: all(hasattr(m, k) for k in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "conv1d",
                                               "A_log", "dt_bias", "norm", "out_proj")),
-        lambda m, seq_chunk=0: GatedDeltaNet(m, seq_chunk),
-        lambda m, new: (torch.randn(1, max(128, 2 * new.seq_chunk + 64), m.hidden_size, device=_device(m),
-                                    dtype=_wdtype(m)) * 0.5,)),
+        lambda m, seq_chunk=0, chunk=0: GatedDeltaNet(m, seq_chunk, chunk),
+        lambda m, new: (torch.randn(1, max(128, 2 * max(new.seq_chunk, new.chunk) + 64), m.hidden_size,
+                                    device=_device(m), dtype=_wdtype(m)) * 0.5,)),
     "token_chunks": Conversion(
         "position-wise module over pieces of `chunk` tokens, each recomputed in backward",
         lambda m: _width(m) is not None,

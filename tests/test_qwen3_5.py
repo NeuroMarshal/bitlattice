@@ -60,3 +60,24 @@ def test_gated_attention_chunks_match_the_model():
     for (n, pa), (_, pb) in zip(a.named_parameters(), b.named_parameters()):
         if pa.grad is not None:
             assert ((pa.grad.float() - pb.grad.float()).norm() / pa.grad.float().norm().clamp_min(1e-6)) < 5e-2, n
+
+
+@pytest.mark.parametrize("chunk", [64, 128])
+def test_gated_delta_net_layer_pieces_match(chunk):
+    import copy
+    layer = _layer()
+    orig = copy.deepcopy(layer)
+    holder = torch.nn.ModuleList([layer])
+    bl.surgery.convert_(holder, "0", "gated_delta_net", chunk=chunk)
+    layer = holder[0]
+    layer.train()
+    x = torch.randn(2, 300, 256, device="cuda", dtype=torch.bfloat16)        # 300: a ragged last piece
+    outs = []
+    for m in (orig, layer):
+        xi = x.clone().requires_grad_(True)
+        y = m(xi)
+        y.float().square().mean().backward()
+        outs.append((y.float(), xi.grad.float(), m.in_proj_qkv.weight.grad.float(), m.conv1d.weight.grad.float(),
+                     m.A_log.grad.float()))
+    for a, b in zip(outs[1], outs[0]):
+        assert ((a - b).norm() / b.norm()).item() < 3e-2
