@@ -207,12 +207,18 @@ class _LatticeLinear(torch.autograd.Function):
         ctx.w = w
         ctx.has_bias = bias is not None
         ctx.policy = backend.fp4_policy(x, w)
+        # the input is kept only for the weight gradient: not when the weight is frozen, and not in the no-grad
+        # first pass of a checkpointed block (its recomputation saves it)
+        need_w = ctx.needs_input_grad[1]
         if ctx.policy == "fp4_all":
-            y, xt = backend.fp4_forward_saving(x, w, bias)
-            ctx.save_for_backward(xt.packed, xt.scales, xt.global_scale)
             ctx.x_meta = (x.shape, x.dtype)
-            return y
-        ctx.save_for_backward(x)
+            if need_w:
+                y, xt = backend.fp4_forward_saving(x, w, bias)
+                ctx.save_for_backward(xt.packed, xt.scales, xt.global_scale)
+                return y
+            ctx.save_for_backward()
+            return backend.nvfp4_linear(x, w, bias)
+        ctx.save_for_backward(x if need_w else None)
         if ctx.policy == "fp4":
             return backend.nvfp4_linear(x, w, bias)
         return torch.nn.functional.linear(x, w.dequantize(x.dtype), bias)
@@ -224,8 +230,10 @@ class _LatticeLinear(torch.autograd.Function):
         if ctx.policy == "fp4_all":
             from . import backend
             shape, dtype = ctx.x_meta
-            gx, gw = backend.fp4_backward(gy, w, backend.Fp4Operand(*ctx.saved_tensors), ctx.needs_input_grad[0],
-                                          ctx.needs_input_grad[1])
+            saved = ctx.saved_tensors
+            xt = backend.Fp4Operand(*saved) if saved else None
+            gx, gw = backend.fp4_backward(gy, w, xt, ctx.needs_input_grad[0],
+                                          ctx.needs_input_grad[1] and xt is not None)
             gx = gx.to(dtype).reshape(shape) if gx is not None else None
             gw = gw.to(w.dtype) if gw is not None else None
             return gx, gw, gb
@@ -233,7 +241,7 @@ class _LatticeLinear(torch.autograd.Function):
         W = w.dequantize(gy.dtype)
         gx = gy @ W if ctx.needs_input_grad[0] else None
         gw = None
-        if ctx.needs_input_grad[1]:
+        if ctx.needs_input_grad[1] and x is not None:
             gw = (gy.reshape(-1, gy.shape[-1]).t() @ x.reshape(-1, x.shape[-1])).to(w.dtype)
         return gx, gw, gb
 

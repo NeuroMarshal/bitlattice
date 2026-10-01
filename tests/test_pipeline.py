@@ -26,10 +26,11 @@ def dense_dir(tmp_path_factory):
     return str(path)
 
 
-def test_two_process_pipeline_matches_single_gpu(dense_dir, tmp_path):
+@pytest.mark.parametrize("offload", [False, True])
+def test_two_process_pipeline_matches_single_gpu(dense_dir, tmp_path, offload):
     out = tmp_path / "pipe.jsonl"
     args = ["--model", dense_dir, "--steps", "8", "--batch", "4", "--micro", "2", "--seq", "12", "--preset", "muon",
-            "--lr", "3e-3", "--data", "fixed", "--json", str(out)]
+            "--lr", "3e-3", "--data", "fixed", "--json", str(out)] + (["--offload"] if offload else [])
     env = dict(os.environ, PYTHONPATH=ROOT)
     subprocess.run([sys.executable, "-m", "torch.distributed.run", "--nproc-per-node", "2",
                     os.path.join(ROOT, "bench", "pipeline_train.py"), *args], check=True, env=env, cwd=ROOT,

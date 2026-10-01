@@ -206,10 +206,13 @@ def fp4_forward_saving(x: torch.Tensor, w, bias):
     K = x.shape[-1]
     x2 = _pad_rows(x.reshape(-1, K), 32).contiguous()
     M = x.numel() // K
-    y = fp4_mm(quantize_fp4(x2), weight_operand(w), x.dtype)[:M]
+    xq = quantize_fp4(x2)
+    y = fp4_mm(xq, weight_operand(w), x.dtype)[:M]
     if bias is not None:
         y += bias.to(y.dtype)
-    xt = Fp4Operand(*torch.ops.bitlattice.quantize_nvfp4_t(x2, _hadamard16(x2.device, torch.float32)))
+    # |x H/4| <= 4 max|x| for the orthogonal 16x16 rotation: the row-wise global scale bounds the rotated one
+    xt = Fp4Operand(*torch.ops.bitlattice.quantize_nvfp4_t(x2, _hadamard16(x2.device, torch.float32), -1, 0,
+                                                           xq.global_scale * 4.0))
     return y.reshape(*x.shape[:-1], w.shape[0]), xt
 
 
@@ -220,10 +223,14 @@ def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool
     M = g2.shape[0]
     g2p = _pad_rows(g2, 32).contiguous()
     gx = gw = None
+    gq = None
     if need_x:
-        gx = fp4_mm(quantize_fp4(g2p, stochastic=True), weight_t_operand(w), gy.dtype)[:M]
+        gq = quantize_fp4(g2p, stochastic=True)
+        gx = fp4_mm(gq, weight_t_operand(w), gy.dtype)[:M]
     if need_w:
         seed = next(_sr_counter) & 0x7FFFFFFF                                          # g^T rotated, [N, Mp]
-        gt = Fp4Operand(*torch.ops.bitlattice.quantize_nvfp4_t(g2p, _hadamard16(g2p.device, torch.float32), seed))
+        bound = gq.global_scale * 4.0 if gq is not None else None
+        gt = Fp4Operand(*torch.ops.bitlattice.quantize_nvfp4_t(g2p, _hadamard16(g2p.device, torch.float32), seed, 0,
+                                                               bound))
         gw = fp4_mm(gt, xt, w.dtype)
     return gx, gw

@@ -22,11 +22,13 @@ others, and with many transfers in flight the two processes deadlock. It is ther
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint
 
 from . import parallel as P
 
@@ -149,6 +151,61 @@ def _backward_released(out: torch.Tensor, grad: torch.Tensor) -> None:
         (out,), (grad,), False, False, (), True, True)
 
 
+def _head_loss(model, norm, head, labels, input_ids, chunk, extra_loss, y, e):
+    from .nn.loss import linear_cross_entropy
+    h = norm(y) if norm is not None else y
+    loss = linear_cross_entropy(h[:, :-1], head.weight, labels[:, 1:], getattr(head, "bias", None), chunk)
+    if extra_loss is not None:
+        loss = loss + extra_loss(model, y, input_ids, labels, e)
+    return loss
+
+
+class _ActivationOffload:
+    """Unit inputs kept in pinned host memory between the forward and the backward of a step.
+
+    ``put`` copies a tensor's data to host memory on a side stream and leaves the tensor object (still referenced
+    by the autograd graph and by checkpoint recomputation) with an empty GPU storage; ``prefetch`` starts the copy
+    back, ``restore`` makes the compute stream wait for it and reattaches the data. The backward visits units in a
+    known order, so the next unit's inputs are prefetched while the current one computes."""
+
+    def __init__(self, device: torch.device):
+        self.stream = torch.cuda.Stream(device=device)
+        self.host: dict = {}
+        self.ready: dict = {}
+
+    def put(self, key, t: torch.Tensor) -> None:
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream(t.device))
+        self.stream.wait_event(ev)
+        h = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+        data = t.data
+        with torch.cuda.stream(self.stream):
+            h.copy_(data, non_blocking=True)
+        data.record_stream(self.stream)
+        self.host[key] = (t, h)
+        t.data = torch.empty(0, dtype=t.dtype, device=t.device)
+
+    def prefetch(self, key) -> None:
+        if key not in self.host:
+            return
+        t, h = self.host.pop(key)
+        with torch.cuda.stream(self.stream):
+            g = h.to(t.device, non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record(self.stream)
+        self.ready[key] = (t, g, ev)
+
+    def restore(self, key) -> None:
+        self.prefetch(key)
+        if key not in self.ready:
+            return
+        t, g, ev = self.ready.pop(key)
+        cur = torch.cuda.current_stream(t.device)
+        cur.wait_event(ev)
+        g.record_stream(cur)
+        t.data = g
+
+
 class _RunAhead:
     """Bounds how far the host runs ahead of its GPU: at most ``window`` units (segment x micro-batch) are queued.
     Without the bound the command queue fills up, the host blocks inside a kernel launch, and NCCL's proxy thread,
@@ -167,7 +224,7 @@ class _RunAhead:
 
 def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = None, *, micro: int = 4,
                optimizer=None, backward: bool = True, chunk: int = 1024, run_ahead: int = 3,
-               extra_loss=None) -> torch.Tensor:
+               extra_loss=None, offload_activations: bool = False, checkpoint_head: bool = True) -> torch.Tensor:
     """Forward (and backward) of a causal LM batch over all processes; returns the mean next-token loss (the same
     value on every process). Every process must call it with the same ``input_ids`` / ``labels``.
 
@@ -178,7 +235,12 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
     run_ahead -- units of work (segment x micro-batch) the host may queue ahead of the GPU.
     extra_loss -- fn(model, hidden, input_ids, labels, next_embeds) -> loss added on the head's process, with
                  ``hidden`` the last block output (before the final norm) and ``next_embeds`` the input embeddings
-                 of tokens 1.. (detached; sent from the embedding's process), e.g. a multi-token-prediction head."""
+                 of tokens 1.. (detached; sent from the embedding's process), e.g. a multi-token-prediction head.
+    offload_activations -- keep the unit inputs (the only activations that live from forward to backward with
+                 checkpointed blocks) in pinned host memory: GPU memory then no longer grows with the number of
+                 tokens per step beyond one unit's working set.
+    checkpoint_head -- recompute the head (final norm, loss over the vocabulary, extra heads) in backward instead of
+                 keeping its activations."""
     me = dist.get_rank()
     dev = model.bl_local_device
     segs = getattr(model, "_bl_pipeline_plan", None)
@@ -200,6 +262,7 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
     grad = torch.enable_grad() if backward else torch.no_grad()
     ins, outs, losses, keep = {}, {}, {}, []
     ahead = _RunAhead(max(1, run_ahead))
+    offload = _ActivationOffload(dev) if offload_activations and backward else None
     head_owner = segs[-1].owner
     next_emb = {}
     if extra_loss is not None and embed_here:
@@ -228,7 +291,10 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                         _log("fwd recv", s, m, "from", seg.prev)
                         dist.irecv(y, seg.prev, group=_group(seg.prev, me)).wait()
                     elif j > 0 and y is not None:
+                        prev = y
                         y = y.detach()
+                        if offload is not None:
+                            _release(prev)              # the graph node keeps no data; the input owns it now
                     if y is not None:
                         if backward:
                             y.requires_grad_(True)
@@ -239,19 +305,23 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                         out = blocks[item[1]](y, **prep[m][1][item[1]])
                         y = out[0] if isinstance(out, tuple) else out
                     else:
-                        from .nn.loss import linear_cross_entropy
-                        h = norm(y) if norm is not None else y
-                        loss = linear_cross_entropy(h[:, :-1], head.weight, lab_mb[m][:, 1:],
-                                                    getattr(head, "bias", None), chunk)
+                        e = None
                         if extra_loss is not None:
                             e = next_emb.get(m)
                             if e is None:
                                 e = torch.empty(ids_mb[m].shape[0], ids_mb[m].shape[1] - 1, width, dtype=dtype,
                                                 device=dev)
                                 dist.irecv(e, segs[0].owner, group=_group(segs[0].owner, me, "aux")).wait()
-                            loss = loss + extra_loss(model, y, ids_mb[m], lab_mb[m], e)
+                        fn = functools.partial(_head_loss, model, norm, head, lab_mb[m], ids_mb[m], chunk,
+                                               extra_loss)
+                        # the head (final norm, vocabulary-wide loss, extra heads) is recomputed in backward, so only
+                        # its input lives from forward to backward
+                        loss = (checkpoint(fn, y, e, use_reentrant=False) if backward and checkpoint_head
+                                else fn(y, e))
                         losses[m] = loss * (n_tok[m] / sum(n_tok))
                         y = None
+                    if offload is not None and (s, j, m) in ins and item[0] == "block":
+                        offload.put((s, j, m), ins[(s, j, m)])
                     if y is not None:
                         outs[(s, j, m)] = (y, y.shape)
                         if j == last and seg.next is not None:
@@ -270,6 +340,14 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                     continue
                 last = len(seg.items) - 1
                 for j in reversed(range(len(seg.items))):
+                    if offload is not None:
+                        for m in range(M):
+                            offload.restore((s, j, m))
+                        nxt = (s, j - 1) if j > 0 else next(((t, len(segs[t].items) - 1) for t in
+                                                             reversed(range(s)) if segs[t].owner == me), None)
+                        if nxt is not None:
+                            for m in range(M):
+                                offload.prefetch((*nxt, m))
                     for m in range(M):
                         defer = (optimizer.accumulate() if optimizer is not None and m < M - 1
                                  else contextlib.nullcontext())
