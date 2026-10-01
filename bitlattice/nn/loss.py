@@ -218,9 +218,10 @@ def causal_lm_loss(model: torch.nn.Module, input_ids: torch.Tensor, labels: torc
     """Next-token loss of a Hugging Face causal LM computed with :func:`linear_cross_entropy`.
 
     ``labels`` defaults to ``input_ids``; positions equal to -100 are ignored. Uses ``model.get_decoder()`` (or
-    ``model.model``) for hidden states and ``model.get_output_embeddings()`` for the head."""
+    ``model.model``) for hidden states (without a cache unless ``use_cache`` is given) and
+    ``model.get_output_embeddings()`` for the head."""
     labels = input_ids if labels is None else labels
     backbone = model.get_decoder() if hasattr(model, "get_decoder") else model.model
-    hidden = backbone(input_ids=input_ids, **kwargs)[0]
+    hidden = backbone(input_ids=input_ids, **{"use_cache": False, **kwargs})[0]
     head = model.get_output_embeddings()
     return linear_cross_entropy(hidden[:, :-1], head.weight, labels[:, 1:], getattr(head, "bias", None), chunk)

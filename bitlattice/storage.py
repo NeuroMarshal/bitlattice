@@ -20,7 +20,8 @@ AUTO_STATE_FRACTION = 0.25
 def activations_in_ram(pin_memory: bool = True):
     """Context manager: CUDA tensors saved for backward are moved to host memory and brought back on use, with their
     layout (some kernels require the strides they were saved with, e.g. padded attention masks); broadcast
-    dimensions (stride 0) are stored once and expanded again."""
+    dimensions (stride 0) are stored once and expanded again. A view whose layout spans much more memory than its
+    elements (a slice of a larger tensor) is stored compactly instead."""
 
     def pack(t: torch.Tensor):
         if not t.is_cuda or type(t) is not torch.Tensor:
@@ -29,6 +30,9 @@ def activations_in_ram(pin_memory: bool = True):
         base = t
         for d in broadcast:
             base = base.narrow(d, 0, 1)
+        extent = 1 + sum((n - 1) * s for n, s in zip(base.shape, base.stride()) if n > 0)
+        if base.numel() and extent > base.numel() * 5 // 4 + 64:
+            base = base.contiguous()
         pin = pin_memory and torch.cuda.is_available()
         host = torch.empty_strided(base.size(), base.stride(), dtype=t.dtype, device="cpu", pin_memory=pin)
         host.copy_(base, non_blocking=pin)
@@ -46,11 +50,23 @@ def activations_in_ram(pin_memory: bool = True):
 
 
 def _state_estimate(p: torch.Tensor, g: dict) -> int:
-    b = (p.numel() * g.get("phase_bits", 0) + 7) // 8
-    if g.get("momentum") == "fp32":
-        b += p.numel() * 4
-    elif g.get("momentum") == "ternary":
-        b += p.numel()
+    """Bytes of per-parameter optimizer state: phase, momentum (in its stored format), factored second moments and
+    the per-row statistics of the neuron-wise normalization."""
+    n = p.numel()
+    rows = p.shape[0] if p.dim() >= 2 else 1
+    cols = n // max(rows, 1)
+    b = (n * g.get("phase_bits", 0) + 7) // 8
+    mom = g.get("momentum", "none")
+    if mom == "nvfp4" and cols % 16:
+        mom = "int8"
+    b += {"none": 0, "fp32": 4 * n, "bf16": 2 * n, "ternary": n + 4 * rows,
+          "int8": n + 4 * -(-n // 256), "fp8": n + 4 * -(-n // 256),
+          "nvfp4": n // 2 + n // 16 + 4}[mom]
+    matrix = p.dim() >= 2 and min(rows, cols) > 1
+    if (g.get("direction") if matrix else g.get("vector_direction")) == "factored":
+        b += 4 * (rows + cols)
+    if matrix and g.get("normalize") == "row":
+        b += 4 * rows
     return b
 
 

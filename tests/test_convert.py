@@ -234,3 +234,59 @@ def test_host_linear_head_streams_and_matches():
         assert torch.allclose(m(x).logits.float(), logits.float(), atol=2e-2, rtol=2e-2)
     bl.surgery.revert_(m, "lm_head")
     assert w.is_cuda
+
+
+def _qwen3(use_cache=False, layers=2):
+    transformers = pytest.importorskip("transformers")
+    cfg = transformers.Qwen3Config(vocab_size=128, hidden_size=128, intermediate_size=256, num_hidden_layers=layers,
+                                   num_attention_heads=4, num_key_value_heads=2, head_dim=32, use_cache=use_cache)
+    torch.manual_seed(0)
+    return transformers.Qwen3ForCausalLM(cfg).to(DEV, torch.bfloat16).train()
+
+
+def _grads(m, x):
+    m.zero_grad(set_to_none=True)
+    loss = bl.nn.causal_lm_loss(m, x)
+    loss.backward()
+    return loss.item(), {n: p.grad.float().clone() for n, p in m.named_parameters() if p.grad is not None}
+
+
+def test_checkpoint_passes_gradients_to_keyword_tensors():
+    a, b = _qwen3(), _qwen3()
+    bl.surgery.convert_(b, "*.self_attn", "checkpoint")             # called as self_attn(hidden_states=...)
+    x = torch.randint(0, 128, (2, 33), device=DEV)
+    (la, ga), (lb, gb) = _grads(a, x), _grads(b, x)
+    assert abs(la - lb) < 1e-3 and set(ga) == set(gb)
+    for n in ga:
+        assert torch.allclose(ga[n], gb[n], atol=1e-3, rtol=5e-2), n
+
+
+def test_conversions_inside_converted_modules_take_effect():
+    a, b = _qwen3(use_cache=True), _qwen3(use_cache=True)            # default config of HF models: a cache
+    bl.surgery.convert_(b, "re:layers\\.\\d+$", "checkpoint")
+    bl.surgery.convert_(b, "*.self_attn", "attention_chunks", chunk=8)
+    assert all(isinstance(layer.original.self_attn, bl.nn.AttentionChunks) for layer in b.model.layers)
+    calls = []
+    b.model.layers[0].self_attn.register_forward_hook(lambda *_: calls.append(1))
+    x = torch.randint(0, 128, (2, 33), device=DEV)
+    (la, ga), (lb, gb) = _grads(a, x), _grads(b, x)
+    assert calls and abs(la - lb) < 1e-2
+    for n in ga:
+        assert torch.allclose(ga[n], gb[n], atol=2e-3, rtol=5e-2), n
+    loss = bl.nn.causal_lm_loss(b, x, use_cache=True)              # a training call the conversion cannot run:
+    with pytest.raises((ValueError, RuntimeError), match="cache"):   # refused when its graph is built (recompute)
+        loss.backward()
+
+
+def test_runner_with_host_embedding_and_a_plain_torch_optimizer():
+    m = _qwen3()
+    bl.surgery.freeze_(m, "*embed_tokens")
+    bl.surgery.convert_(m, "*embed_tokens", "host_embedding")
+    opt = torch.optim.SGD([p for p in m.parameters() if p.requires_grad], lr=1e-1)
+    r = bl.Runner(m, opt, micro=2)
+    x = torch.randint(0, 128, (4, 33))                              # batch on the host
+    first = r.loss(x).item()
+    for _ in range(5):
+        r.step(x)
+    assert r.loss(x).item() < first
+    assert all(p.grad is None for p in m.parameters())             # zero_grad after each step

@@ -66,7 +66,7 @@ def _is_param(t: torch.Tensor) -> bool:
 
 
 class _Packed:
-    __slots__ = ("kind", "data", "scale", "glob", "shape", "dtype", "rows", "cols")
+    __slots__ = ("kind", "data", "scale", "glob", "shape", "dtype", "rows", "cols", "__weakref__")
 
 
 _PIECE = 1 << 22            # values per piece when packing / unpacking: float32 temporaries of 16 MiB
@@ -111,11 +111,17 @@ def _unpack(p) -> torch.Tensor:
             out[sl] = (p.data[sl].float() * scale[:, None]).to(p.dtype)
         return out.view(p.shape)
     from .fp4ref import E2M1
-    codes = p.data.to(torch.int32)
-    codes = torch.stack([codes & 15, codes >> 4], -1).reshape(p.rows, p.cols)
-    lv = E2M1.to(codes.device)[codes & 7] * torch.where(codes & 8 > 0, -1.0, 1.0)
-    s = p.scale.float() * p.glob.float()
-    return (lv.view(p.rows, -1, 16) * s.view(p.rows, -1, 1)).to(p.dtype).view(p.shape)
+    out = torch.empty(p.rows, p.cols, dtype=p.dtype, device=p.data.device)
+    table, g = E2M1.to(p.data.device), p.glob.float()
+    step = max(1, _PIECE // p.cols)                     # row pieces: bounded int32 / float32 temporaries
+    for r in range(0, p.rows, step):
+        codes = p.data[r:r + step].to(torch.int32)
+        n = codes.shape[0]
+        codes = torch.stack([codes & 15, codes >> 4], -1).reshape(n, p.cols)
+        lv = table[codes & 7] * torch.where(codes & 8 > 0, -1.0, 1.0)
+        s = p.scale[r:r + step].float() * g
+        out[r:r + step] = (lv.view(n, -1, 16) * s.view(n, -1, 1)).reshape(n, p.cols).to(p.dtype)
+    return out.view(p.shape)
 
 
 def _packer(spec: SavedSpec):
@@ -133,13 +139,17 @@ def _packer(spec: SavedSpec):
             return t
         key = (id(t), t._version)
         hit = seen.get(key)
-        if hit is not None and hit[0]() is t:          # the same tensor saved by several functions: pack once
-            return hit[1]
+        if hit is not None and hit[0]() is t and hit[1]() is not None:
+            return hit[1]()                            # the same tensor saved by several functions: pack once
         p = _pack_fp8(t.contiguous()) if spec.fmt == "fp8" else _pack_nvfp4(t)
         _STATS["packed"] += 1
         _STATS["bytes_in"] += t.numel() * t.element_size()
         _STATS["bytes_out"] += sum(x.numel() * x.element_size() for x in (p.data, p.scale) if x is not None)
-        seen[key] = (weakref.ref(t), p)
+        # weak references only: a packed tensor lives as long as the graph that saved it, not as long as this context
+        if len(seen) >= 1024:
+            for k in [k for k, (tr, pr) in seen.items() if tr() is None or pr() is None]:
+                del seen[k]
+        seen[key] = (weakref.ref(t), weakref.ref(p))
         return p
 
     return pack

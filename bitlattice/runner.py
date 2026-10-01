@@ -11,9 +11,12 @@ interleaved pipeline of :mod:`bitlattice.pipeline` instead: every process calls 
 from __future__ import annotations
 
 import contextlib
+import logging
 from dataclasses import dataclass
 
 import torch
+
+log = logging.getLogger("bitlattice")
 
 __all__ = ["Memory", "Runner"]
 
@@ -63,8 +66,21 @@ class Runner:
         return getattr(self.optimizer, "fused_backward", False)
 
     def _on_input_device(self, input_ids, labels):
-        dev = self.model.get_input_embeddings().weight.device
+        emb = self.model.get_input_embeddings()
+        dev = getattr(emb, "output_device", None) or emb.weight.device     # host_embedding: where its rows go
         return input_ids.to(dev), None if labels is None else labels.to(dev)
+
+    def _update(self):
+        if self.optimizer is not None:
+            self.optimizer.step()
+            if not self._fused:
+                self.optimizer.zero_grad(set_to_none=True)
+        if self.defer_wgrad:
+            from .backend import fold_rounded
+            n = fold_rounded(reset=True)
+            if n:
+                log.warning("deferred weight gradients: %d NVFP4 block scales were rounded when micro-batches of "
+                            "very different gradient magnitude were folded into one GEMM", n)
 
     def step(self, input_ids: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
         """Forward and backward of the batch over ``micro`` micro-batches, then the optimizer update. Returns the
@@ -72,9 +88,13 @@ class Runner:
         any device; it is moved to the device of the input embeddings."""
         if self.distributed:
             from .pipeline import train_step
-            return train_step(self.model, input_ids, labels, micro=self.micro, optimizer=self.optimizer,
-                              chunk=self.loss_chunk, extra_loss=self.extra_loss,
-                              offload_activations=self.memory.activations == "ram", defer_wgrad=self.defer_wgrad)
+            # the pipeline applies fused updates unit by unit; any other optimizer steps on the summed gradients
+            loss = train_step(self.model, input_ids, labels, micro=self.micro,
+                              optimizer=self.optimizer if self._fused else None, chunk=self.loss_chunk,
+                              extra_loss=self.extra_loss, offload_activations=self.memory.activations == "ram",
+                              defer_wgrad=self.defer_wgrad)
+            self._update()
+            return loss
         from . import backend
         from .nn.loss import causal_lm_loss
         from .storage import activations_in_ram
@@ -94,10 +114,7 @@ class Runner:
             loss_sum = loss.detach() if loss_sum is None else loss_sum + loss.detach()
         if self.defer_wgrad:
             backend.flush_wgrad(optimizer=self.optimizer if self._fused else None)
-        if self.optimizer is not None:
-            self.optimizer.step()
-            if not self._fused:
-                self.optimizer.zero_grad(set_to_none=True)
+        self._update()
         return loss_sum
 
     @torch.no_grad()

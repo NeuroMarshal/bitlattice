@@ -46,3 +46,37 @@ def test_runner_learns_and_evaluates():
     assert r.loss(x).item() < 0.8 * first
     with pytest.raises(ValueError):
         bl.Memory(activations="disk")
+
+
+def test_offloaded_slices_are_stored_compactly():
+    base = torch.randn(2, 4096, 64, device=DEV, dtype=torch.bfloat16, requires_grad=True)
+    sizes = []
+    orig = torch.empty_strided
+
+    def spy(size, stride, **kw):
+        t = orig(size, stride, **kw)
+        if kw.get("device") == "cpu":
+            sizes.append(t.untyped_storage().nbytes())
+        return t
+    torch.empty_strided = spy
+    try:
+        with bl.storage.activations_in_ram():
+            y = (base[:, :256] * 2).sin()                           # saves a 256-token slice of the input
+    finally:
+        torch.empty_strided = orig
+    y.sum().backward()
+    assert sizes and max(sizes) <= 2 * 256 * 64 * 2 * 2              # not the 4096-token extent of the parent
+
+
+def test_state_estimate_counts_momentum_formats():
+    from bitlattice.storage import _state_estimate
+    p = torch.empty(256, 512)
+    base = dict(phase_bits=2, momentum="none", direction="muon_block", vector_direction="factored")
+    sizes = {m: _state_estimate(p, {**base, "momentum": m}) for m in ("none", "nvfp4", "int8", "bf16", "fp32")}
+    assert sizes["none"] < sizes["nvfp4"] < sizes["int8"] < sizes["bf16"] < sizes["fp32"]
+    assert _state_estimate(p, {**base, "normalize": "row"}) == sizes["none"] + 4 * 256
+
+
+def test_nvfp4_momentum_needs_cuda_parameters():
+    with pytest.raises(ValueError, match="nvfp4"):
+        bl.optim.Lattice(torch.nn.Linear(32, 32), "muon", momentum="nvfp4")

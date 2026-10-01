@@ -261,9 +261,11 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
     width, dtype = model.config.hidden_size, emb.weight.dtype
     labels = input_ids if labels is None else labels
     ids_mb = [t.to(dev) for t in input_ids.chunk(micro, 0)]
+    # micro-batch losses are means over their own labelled tokens; weighted by those counts (taken where the labels
+    # are, no device synchronization for host labels) they add up to the mean over the batch
+    n_tok = [int((t[:, 1:] != -100).sum()) for t in labels.chunk(micro, 0)]
     lab_mb = [t.to(dev) for t in labels.chunk(micro, 0)]
     M = len(ids_mb)
-    n_tok = [lb[:, 1:].numel() for lb in lab_mb]
     embed_here = segs[0].owner == me
 
     grad = torch.enable_grad() if backward else torch.no_grad()
@@ -328,7 +330,7 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                         ckpt = (checkpoint_head if checkpoint_head != "auto" else
                                 getattr(getattr(head, "weight", None), "requires_grad", True))
                         loss = (checkpoint(fn, y, e, use_reentrant=False) if backward and ckpt else fn(y, e))
-                        losses[m] = loss * (n_tok[m] / sum(n_tok))
+                        losses[m] = loss * (n_tok[m] / max(1, sum(n_tok)))
                         y = None
                     if offload is not None and (s, j, m) in ins and item[0] == "block":
                         offload.put((s, j, m), ins[(s, j, m)])

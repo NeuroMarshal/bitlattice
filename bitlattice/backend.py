@@ -31,7 +31,7 @@ log = logging.getLogger("bitlattice")
 
 __all__ = ["Fp4Recipe", "FP4_RECIPES", "Fp4Operand", "Mx8Operand", "is_nvfp4", "fp4_supported", "mxfp8_supported",
            "fp4_unfit", "mx_unfit", "to_blocked", "quantize_fp4", "fp4_mm", "mx_mm", "rht_last", "nvfp4_linear",
-           "defer_wgrad", "flush_wgrad", "pending_wgrad", "clear_shared", "drop_cached"]
+           "defer_wgrad", "flush_wgrad", "pending_wgrad", "fold_rounded", "clear_shared", "drop_cached"]
 
 
 @dataclass(frozen=True)
@@ -602,8 +602,15 @@ def _weight_grad(w, gt: Fp4Operand, xt: Fp4Operand):
     return None
 
 
+_FOLD_ROUNDED: dict = {}     # device -> blocks whose folded scale left E4M3's normal range (GPU counter, no sync)
+_E4M3_MIN_NORMAL = 2.0 ** -6
+
+
 def _concat(ops: list) -> Fp4Operand:
-    """Operands [rows, K_j] with power-of-two global scales and blocked scales -> one operand [rows, sum K_j]."""
+    """Operands [rows, K_j] with power-of-two global scales and blocked scales -> one operand [rows, sum K_j] with the
+    largest global scale; the others' block scales are multiplied by g_j / g_max = 2^-k. That is exact while the
+    products stay in E4M3's normal range; smaller products are rounded (micro-batch gradients differing by more than
+    ~2^4 in magnitude) and counted -- :func:`fold_rounded` -- instead of passing silently."""
     if len(ops) == 1:
         return ops[0]
     g = torch.stack([o.global_scale.reshape(()) for o in ops]).amax()
@@ -611,11 +618,24 @@ def _concat(ops: list) -> Fp4Operand:
     rows = ops[0].packed.shape[0]
     nr = -(-rows // 128)
     tiles = []
+    dev = packed.device
+    count = _FOLD_ROUNDED.setdefault(dev, torch.zeros((), dtype=torch.int64, device=dev))
     for o in ops:
-        f = (o.global_scale.reshape(()) / g)                       # a power of two <= 1: exact in E4M3 (normal range)
-        s = (o.scales.view(torch.float8_e4m3fn).float() * f).to(torch.float8_e4m3fn)
-        tiles.append(s.view(nr, -1, 512))
+        f = (o.global_scale.reshape(()) / g)                       # a power of two <= 1
+        sf = o.scales.view(torch.float8_e4m3fn).float() * f
+        count += ((sf > 0) & (sf < _E4M3_MIN_NORMAL)).sum()
+        tiles.append(sf.to(torch.float8_e4m3fn).view(nr, -1, 512))
     return Fp4Operand(packed, torch.cat(tiles, 1).reshape(-1), g.reshape(1), True)
+
+
+def fold_rounded(reset: bool = False) -> int:
+    """Number of NVFP4 blocks whose scale was rounded when deferred weight-gradient operands of micro-batches with
+    different magnitudes were folded into one GEMM (0: the deferred gradients were exact). Synchronizes."""
+    n = int(sum(int(c) for c in _FOLD_ROUNDED.values()))
+    if reset:
+        for c in _FOLD_ROUNDED.values():
+            c.zero_()
+    return n
 
 
 def pending_wgrad() -> list:

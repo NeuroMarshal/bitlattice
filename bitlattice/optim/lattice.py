@@ -2,7 +2,8 @@
 
 One step of a parameter W with gradient G:
     m = momentum(G)                        none | fp32 | ternary | bf16 | int8 | fp8 | nvfp4 (stored formats of
-                                           m; bf16 / int8 / nvfp4 with stochastic rounding, fp8 to nearest)
+                                           m; bf16 / int8 / nvfp4 with stochastic rounding, fp8 to nearest; nvfp4
+                                           for rows of 16-element blocks, int8 for other tensors)
     D = direction(m), RMS-clipped          muon | muon_block | factored | sinkhorn | colnorm | sign | raw
         optional neuron-wise normalization of matrix directions (normalize='row', NorMuon): every row divided by
         the root of an exponential average of its mean square (one fp32 value per row of state)
@@ -58,6 +59,23 @@ def _validate(g: dict) -> None:
     if g["normalize"] not in ("none", "row"):
         raise ValueError("normalize must be 'none' or 'row'")
 
+
+
+def _row_length(p: torch.Tensor) -> int:
+    return p.numel() // p.shape[0] if p.dim() >= 2 else p.numel()
+
+
+def _check_momentum(g: dict) -> None:
+    """nvfp4 momentum needs the extension and CUDA parameters; tensors whose rows are not made of 16-element blocks
+    (e.g. short convolution kernels) store int8 momentum instead -- listed in the log."""
+    if g["momentum"] != "nvfp4":
+        return
+    if not _ops.HAVE_EXT or any(not p.is_cuda for p in g["params"]):
+        raise ValueError("momentum='nvfp4' needs the bitlattice CUDA extension and parameters on the GPU")
+    odd = sorted({tuple(p.shape) for p in g["params"] if _row_length(p) % 16})
+    if odd:
+        log.info("momentum nvfp4: %d parameter shape(s) with rows not made of 16-element blocks keep int8 "
+                 "momentum: %s", len(odd), odd[:8])
 
 
 def _restrict_rows(G: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
@@ -123,6 +141,7 @@ class Lattice(torch.optim.Optimizer):
         super().__init__(params, defaults)
         for g in self.param_groups:
             _validate(g)
+            _check_momentum(g)
         if state not in ("gpu", "ram", "auto"):
             raise ValueError("state must be 'gpu', 'ram' or 'auto'")
         if state == "auto":
@@ -294,8 +313,8 @@ class Lattice(torch.optim.Optimizer):
             st["m"].mul_(g["beta1"]).add_(X, alpha=1 - g["beta1"])
             return st["m"]
         if mode in ("bf16", "int8", "fp8", "nvfp4"):
-            if mode == "nvfp4" and (X.shape[1] % 16 or not (X.is_cuda and _ops.HAVE_EXT)):
-                mode = "int8"                              # rows not made of 16-blocks (e.g. odd-sized biases)
+            if mode == "nvfp4" and X.shape[1] % 16:
+                mode = "int8"                              # rows not made of 16-blocks (see _check_momentum)
             m = self._load_momentum(st, mode, X)
             m.mul_(g["beta1"]).add_(X, alpha=1 - g["beta1"])
             self._store_momentum(st, mode, m, (self.seed + 7919 * pid + 104729 * st["step"]) & 0x7FFFFFFF)

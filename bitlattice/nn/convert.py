@@ -67,19 +67,31 @@ __all__ = ["convert_", "revert_", "conversions", "register_conversion", "Convers
 
 
 class Converted(torch.nn.Module):
-    """Base of converted modules: adopts the original's parameters, buffers and children (same objects, same
-    names) and remembers the original module for :func:`revert_`."""
+    """Base of converted modules: shares the original's parameters, buffers and children (the same dictionaries, so
+    an edit through either -- a nested conversion, a replaced child, a quantized parameter -- is seen by both) and
+    remembers the original module for :func:`revert_`."""
 
     def __init__(self, original: torch.nn.Module):
         super().__init__()
         self.__dict__["_bl_original"] = original                 # not a child: its parameters appear once
-        for name, p in original.named_parameters(recurse=False):
-            self.register_parameter(name, p)
-        for name, b in original.named_buffers(recurse=False):
-            self.register_buffer(name, b, persistent=name not in original._non_persistent_buffers_set)
-        for name, child in original.named_children():
-            self.add_module(name, child)
+        self._parameters = original._parameters
+        self._buffers = original._buffers
+        self._non_persistent_buffers_set = original._non_persistent_buffers_set
+        self._modules = original._modules
         self.training = original.training
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.original.training = mode                           # the original runs the computation it delegates
+        return self
+
+    def _delegate(self, why: str, *args, **kwargs):
+        """Run the original module for a call this conversion does not handle: fine without gradients (evaluation,
+        generation), an error in training, where the conversion was asked for."""
+        if torch.is_grad_enabled() and self.training:
+            raise ValueError(f"{type(self).__name__} conversion of {type(self.original).__name__}: {why} in a "
+                             "training call; the conversion does not run it (revert it or change the call)")
+        return self.original(*args, **kwargs)
 
     @property
     def original(self) -> torch.nn.Module:
@@ -100,14 +112,8 @@ class Converted(torch.nn.Module):
             return attrs[name]
 
     def restored(self) -> torch.nn.Module:
-        """The original module with this module's current parameters, buffers and children."""
+        """The original module (it shares this module's parameters, buffers and children)."""
         orig = self.original
-        for name, p in self.named_parameters(recurse=False):
-            orig._parameters[name] = p
-        for name, b in self.named_buffers(recurse=False):
-            orig._buffers[name] = b
-        for name, child in self.named_children():
-            orig._modules[name] = child
         orig.train(self.training)
         return orig
 
@@ -117,6 +123,18 @@ class Converted(torch.nn.Module):
 
     def extra_repr(self) -> str:
         return ", ".join(x for x in (self.settings(), f"from={type(self.original).__name__}") if x)
+
+
+def _tensors(obj):
+    """Tensors nested in tuples, lists and dicts."""
+    if isinstance(obj, torch.Tensor):
+        yield obj
+    elif isinstance(obj, (tuple, list)):
+        for x in obj:
+            yield from _tensors(x)
+    elif isinstance(obj, dict):
+        for x in obj.values():
+            yield from _tensors(x)
 
 
 # ---- module implementations ---------------------------------------------------------------------------------------
@@ -165,7 +183,9 @@ class GatedDeltaNet(Converted):
 
     def forward(self, hidden_states, cache_params=None, attention_mask=None, **kwargs):
         if cache_params is not None or kwargs.get("cu_seq_lens_q") is not None:
-            return self.original(hidden_states, cache_params=cache_params, attention_mask=attention_mask, **kwargs)
+            why = "a cache" if cache_params is not None else "packed variable-length sequences"
+            return self._delegate(f"called with {why}", hidden_states, cache_params=cache_params,
+                                  attention_mask=attention_mask, **kwargs)
         if attention_mask is not None and attention_mask.dim() == 2 and hidden_states.shape[1] > 1:
             hidden_states = (hidden_states * attention_mask[:, :, None]).to(hidden_states.dtype)
         T = hidden_states.shape[1]
@@ -226,11 +246,14 @@ class AttentionChunks(Converted):
 
     def forward(self, hidden_states, position_embeddings, attention_mask=None, **kwargs):
         m = self.original
-        unknown = set(kwargs) - _PLAIN_KWARGS
+        unknown = sorted(set(kwargs) - _PLAIN_KWARGS)
         cache = kwargs.get("past_key_values", kwargs.get("past_key_value"))
         mask_ok = attention_mask is None or (attention_mask.dim() == 4 and attention_mask.dtype == torch.bool)
-        if unknown or cache is not None or kwargs.get("output_attentions") or not mask_ok:
-            return m(hidden_states, position_embeddings, attention_mask, **kwargs)
+        why = (f"arguments {unknown}" if unknown else "a cache" if cache is not None else
+               "output_attentions" if kwargs.get("output_attentions") else
+               "an attention mask that is not a boolean [B, 1|H, T, T] mask" if not mask_ok else None)
+        if why is not None:
+            return self._delegate(f"called with {why}", hidden_states, position_embeddings, attention_mask, **kwargs)
         B, T, _ = hidden_states.shape
         hd = m.head_dim
         cos, sin = position_embeddings
@@ -265,9 +288,15 @@ class AttentionChunks(Converted):
         q = self._norm("q_norm", q).transpose(1, 2)
         q, _ = self._rotary(q, q[:, :1], cos, sin)
         bias = causal_lower_right(L, k.shape[2]) if mask is None else mask
-        with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.CUDNN_ATTENTION]):
-            o = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=bias, scale=m.scaling,
-                                                                 enable_gqa=q.shape[1] != k.shape[1])
+        try:
+            with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION,
+                              SDPBackend.CUDNN_ATTENTION]):
+                o = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=bias, scale=m.scaling,
+                                                                     enable_gqa=q.shape[1] != k.shape[1])
+        except RuntimeError as e:
+            raise RuntimeError(f"attention_chunks: no fused attention kernel for queries {tuple(q.shape)}, keys "
+                               f"{tuple(k.shape)}, {'a padding mask' if mask is not None else 'causal'} on this "
+                               f"device ({str(e).splitlines()[0][:120]})") from None
         o = o.transpose(1, 2).reshape(B, L, -1)
         if gate is not None:
             o = o * torch.sigmoid(gate)
@@ -313,13 +342,17 @@ class HostEmbedding(Converted):
     def installed(self):
         self.weight.data = self.__dict__.pop("_host")
 
+    @property
+    def output_device(self) -> torch.device:
+        """Where the looked-up rows go (the table's device before the conversion), whatever the indices' device."""
+        return self._device
+
     def forward(self, ids):
         w = self.__dict__.get("_host", self.weight)
         idx = ids.reshape(-1).to("cpu")
         out = torch.empty(idx.numel(), w.shape[1], dtype=w.dtype, pin_memory=w.is_pinned())
         torch.index_select(w, 0, idx, out=out)
-        out = out.view(*ids.shape, w.shape[1])
-        return out.to(ids.device, non_blocking=True) if ids.device.type != "cpu" else out
+        return out.view(*ids.shape, w.shape[1]).to(self._device, non_blocking=True)
 
     def restored(self):
         self.weight.data = self.weight.data.to(self._device)
@@ -391,7 +424,7 @@ class TokenChunks(Converted):
 
     def forward(self, x, *args, **kwargs):
         if args or kwargs:
-            return self.original(x, *args, **kwargs)
+            return self._delegate("called with more than one input", x, *args, **kwargs)
         from .chunk import run_chunked
         ckpt = self.use_checkpoint and torch.is_grad_enabled() and self.training
         return run_chunked(self.original, x, self.chunk, self.dim, ckpt)
@@ -402,8 +435,9 @@ class TokenChunks(Converted):
 
 class Checkpointed(Converted):
     """Recomputes the module in backward. The first pass runs without a graph (nothing is saved), the recomputation
-    with one; with ``saved`` its saved tensors are packed (the per-layer peak of long sequences). Positional
-    arguments that require gradients receive them; keyword arguments are passed through as constants."""
+    with one; with ``saved`` its saved tensors are packed (the per-layer peak of long sequences). Tensor arguments,
+    positional or keyword, receive gradients; tensors nested in other arguments (tuples of rotary tables, caches)
+    are constants and must not require gradients."""
 
     def __init__(self, original, saved: str | None = None, min_numel: int = 1 << 16):
         super().__init__(original)
@@ -413,15 +447,23 @@ class Checkpointed(Converted):
     def forward(self, *args, **kwargs):
         if not (torch.is_grad_enabled() and self.training):
             return self.original(*args, **kwargs)
-        if not any(isinstance(a, torch.Tensor) and a.requires_grad for a in args):
+        names = [k for k, v in kwargs.items() if isinstance(v, torch.Tensor)]
+        rest = {k: v for k, v in kwargs.items() if k not in names}
+        nested = [k for k, v in rest.items() if any(t.requires_grad for t in _tensors(v))]
+        if nested:
+            raise ValueError(f"checkpoint: tensors inside argument(s) {nested} require gradients; the recomputation "
+                             "can only pass gradients to tensor arguments")
+        flat = (*args, *(kwargs[k] for k in names))
+        if not any(isinstance(a, torch.Tensor) and a.requires_grad for a in flat):
             # nothing upstream needs a gradient (e.g. frozen embeddings), but the module's own parameters do: the
             # recomputation needs an input that is part of the graph
-            i = next((k for k, a in enumerate(args) if isinstance(a, torch.Tensor) and a.is_floating_point()), None)
+            i = next((k for k, a in enumerate(flat) if isinstance(a, torch.Tensor) and a.is_floating_point()), None)
             if i is not None:
-                args = (*args[:i], args[i].detach().requires_grad_(True), *args[i + 1:])
-        return _checkpoint(functools.partial(self._run, kwargs), *args, use_reentrant=True)
+                flat = (*flat[:i], flat[i].detach().requires_grad_(True), *flat[i + 1:])
+        return _checkpoint(functools.partial(self._run, len(args), names, rest), *flat, use_reentrant=True)
 
-    def _run(self, kwargs, *args):
+    def _run(self, n_args, names, rest, *flat):
+        args, kwargs = flat[:n_args], {**rest, **dict(zip(names, flat[n_args:]))}
         if self.spec is not None and torch.is_grad_enabled():            # the recomputation in backward
             from ..memory import compress_saved
             with compress_saved(self.spec):
