@@ -14,7 +14,7 @@ lists, per layer, the format, how it computes, conversions, whether it trains an
   predict: the model is not converted, computation is lossless, nothing is compressed, state stays on the GPU.
   Within that, the runtime uses the fastest kernels that compute the same results (bit for bit or with more
   accurate rounding — fused GEMM epilogues, hardware conversions, the output layer's gradient formed in forward,
-  ...): they only make training faster. `Compute(kernels="reference")` selects the plain reference kernels instead.
+  ...): they only make training faster. Each of them is a field of `bl.Kernels` and can be switched off (below).
   Whatever changes the model or loses accuracy is switched on by you. The runtime logs its choices (logger
   `bitlattice`) and `bl.explain` shows them. Settings without a sensible default are required arguments.
 - **Specified → required.** A setting you give explicitly is a requirement: if it cannot be met (no FP4 tensor
@@ -29,6 +29,45 @@ temporary override is an explicit context in your code. Settings are immutable d
 Each resource has one owner: the optimizer places its state (`Lattice(..., state="gpu" | "ram" | "auto")`), the
 runner places activations (`Memory`), a `checkpoint` conversion decides what a module recomputes and how its saves
 are stored.
+
+## Automatic choices, each of which can be switched off
+
+`bl.Kernels` lists what the runtime picks on its own. Every choice computes the same result as the plain path (bit
+for bit, or with sums in another order) and is on by default:
+
+| field | what it does |
+|---|---|
+| `two_level_gemm` | NVFP4 GEMMs apply the per-tensor scales in the GEMM epilogue |
+| `shared_operands` | an input read by several FP4 layers (q / k / v, gate / up) is quantized once |
+| `operand_cache` | quantized weight operands are kept per weight version |
+| `fused_norm` | CUDA kernels for the lean RMSNorm / gated RMSNorm conversions |
+| `fused_conv` | CUDA causal convolution in the `gated_delta_net` conversion |
+| `fused_pack` | CUDA FP8 packing of compressed saved tensors |
+| `grad_in_forward` | a frozen output layer forms its input gradient in the forward pass of the loss |
+
+```python
+with bl.kernels(fused_norm=False):                        # a region; other fields keep their current value
+    ...
+runner = bl.Runner(model, opt, kernels=bl.Kernels.reference())     # every step on the plain paths
+bl.surgery.set_compute_(model, "*.mlp", bl.Compute("nvfp4", kernels="reference"))   # one layer's GEMMs
+```
+
+The innermost setting applies (a layer's own, then a region's, then a runner's). `bl.kernels_available()` and the
+first line of `bl.explain(model)` tell which fast paths exist on the machine.
+
+## Where memory lives
+
+Every placement is chosen explicitly; nothing moves on its own.
+
+| what | where it is chosen | options |
+|---|---|---|
+| optimizer state | `Lattice(..., state=)` | `gpu`, `ram` (pinned, prefetched per layer), `auto` |
+| activations kept for backward | `Runner(..., memory=Memory(activations=))` | `gpu`, `ram` |
+| what a module recomputes, how its saves are kept | `convert_(..., "checkpoint", saved=)` | `None`, `fp8`, `nvfp4` |
+| a module's weights | `convert_(..., "checkpoint", weights=)` | `gpu`, `ram` (streamed in around its uses) |
+| a frozen embedding table / output layer | `convert_(..., "host_embedding")`, `convert_(..., "host_linear")` | pinned host memory |
+
+Host memory is page-locked at exactly the requested size (`bl.hostmem`).
 
 ## The operating table
 
@@ -72,10 +111,13 @@ S = bl.surgery
 S.convert_(model, "*.linear_attn", "gated_delta_net", seq_chunk=4096)
 S.convert_(model, "*norm", "rms_norm", skip_unfit=True)        # the norms this conversion fits; others are logged
 S.convert_(model, "*.mlp", "token_chunks", chunk=2048)
-S.convert_(model, "re:layers\.\d+$", "checkpoint", saved="fp8")  # recomputed in backward, saves packed to FP8
+S.convert_(model, "*.self_attn", "attention_chunks", chunk=4096)  # attention over query pieces
+S.convert_(model, "re:layers\.\d+$", "checkpoint", weights="ram")  # recomputed in backward, weights streamed
 S.set_compute_(model, "*.layers.*", "quartet2")              # NVFP4 forward and backward, Quartet II rounding
 S.set_compute_(model, "*.layers.0.*", "mxfp8_all")            # a sensitive layer on FP8
 S.freeze_(model, ["*embed_tokens", "lm_head"])
+S.convert_(model, "*embed_tokens", "host_embedding")           # frozen tables in host memory
+S.convert_(model, "lm_head", "host_linear")
 
 opt = bl.optim.Lattice(model, "normuon_fast", lr=1e-5, state="ram", fused_backward=True)
 runner = bl.Runner(model, opt, micro=8, memory=bl.Memory(activations="ram"))
