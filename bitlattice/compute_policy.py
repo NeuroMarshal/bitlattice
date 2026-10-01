@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 import torch
 
 from .backend import FP4_RECIPES, Fp4Recipe, as_recipe, fp4_unfit, mx_unfit
+from .kernel_choice import Kernels, as_kernels
 
 __all__ = ["Compute", "PRESETS", "as_compute", "compute", "route", "assign_compute_"]
 
@@ -40,20 +41,19 @@ class Compute:
     backward  with 'nvfp4' / 'mxfp8': the input- and weight-gradient GEMMs on the same tensor cores (gradients
               quantized as well); False keeps the backward exact
     nvfp4     operand quantization of the NVFP4 GEMMs (an :class:`Fp4Recipe` or its name)
-    kernels   'auto': the fastest kernels that compute the same results (global scales in the GEMM epilogue, one
-              quantization of an input shared by the layers reading it, ...); 'reference': the plain kernels
+    kernels   the layer's automatic kernel choices (a :class:`bitlattice.Kernels`, or 'reference': all off); 'auto'
+              (None): the setting in effect (``bitlattice.kernels``, a runner's ``kernels``), by default all on
     """
 
     gemm: str = "exact"
     backward: bool = True
     nvfp4: Fp4Recipe = field(default_factory=Fp4Recipe)
-    kernels: str = "auto"
+    kernels: Kernels | None = None
 
     def __post_init__(self):
         if self.gemm not in GEMMS:
             raise ValueError(f"gemm must be one of {GEMMS}")
-        if self.kernels not in ("auto", "reference"):
-            raise ValueError("kernels must be 'auto' or 'reference'")
+        object.__setattr__(self, "kernels", as_kernels(self.kernels))
         if not isinstance(self.nvfp4, Fp4Recipe):
             object.__setattr__(self, "nvfp4", as_recipe(self.nvfp4))
 
@@ -72,7 +72,7 @@ class Compute:
         if self.gemm == "nvfp4":
             name = next((k for k, r in FP4_RECIPES.items() if r == self.nvfp4), None)
             extra = f", recipe {name}" if name else f", {self.nvfp4}"
-        ref = ", reference kernels" if self.kernels == "reference" else ""
+        ref = f", kernels {self.kernels.describe()}" if self.kernels is not None else ""
         return f"{self.gemm}{'' if self.backward else ' forward only'}{extra}{ref}"
 
 

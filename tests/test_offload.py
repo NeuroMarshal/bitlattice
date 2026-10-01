@@ -63,8 +63,18 @@ def test_streamed_weights_refuse_deferred_weight_gradients():
     if not bl.backend.fp4_supported(0):
         pytest.skip("needs FP4 tensor cores")
     m = _model("nvfp4")
-    bl.surgery.set_compute_(m, "*", "fp4_all")
+    bl.surgery.set_compute_(m, "*", "quartet2_fast")
     bl.surgery.convert_(m, "re:layers\\.\\d+$", "checkpoint", weights="ram")
     r = bl.Runner(m, bl.optim.Lattice(m, "muon", lr=1e-2, fused_backward=True), micro=2, defer_wgrad=True)
     with pytest.raises(RuntimeError, match="deferred"):
+        r.step(torch.randint(0, 256, (4, 65)))
+
+
+def test_deferred_weight_gradients_need_a_foldable_recipe():
+    if not bl.backend.fp4_supported(0):
+        pytest.skip("needs FP4 tensor cores")
+    m = _model("nvfp4")
+    bl.surgery.set_compute_(m, "*", "fp4_all")                     # NVIDIA recipe: 16-element rotation
+    r = bl.Runner(m, bl.optim.Lattice(m, "muon", lr=1e-2, fused_backward=True), micro=2, defer_wgrad=True)
+    with pytest.raises(RuntimeError, match="128-element rotation"):
         r.step(torch.randint(0, 256, (4, 65)))

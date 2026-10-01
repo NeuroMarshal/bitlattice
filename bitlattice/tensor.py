@@ -199,8 +199,11 @@ class LatticeTensor(torch.Tensor):
 # autograd paths
 
 def _kernels(ctx):
-    from .backend import reference_kernels
-    return reference_kernels(ctx.reference)
+    """The layer's own kernel choices (Compute.kernels) for its forward and backward, else those in effect."""
+    import contextlib
+
+    from .kernel_choice import kernels
+    return kernels(ctx.kernels) if ctx.kernels is not None else contextlib.nullcontext()
 
 
 class _LatticeLinear(torch.autograd.Function):
@@ -213,7 +216,7 @@ class _LatticeLinear(torch.autograd.Function):
         ctx.has_bias = bias is not None
         ctx.policy, comp = route(x, w)
         ctx.recipe = comp.nvfp4                         # the backward runs on other threads: keep the forward's
-        ctx.reference = comp.kernels == "reference"
+        ctx.kernels = comp.kernels                      # a Kernels, or None: the setting in effect
         with _kernels(ctx):
             return _LatticeLinear._forward(ctx, x, w, bias)
 

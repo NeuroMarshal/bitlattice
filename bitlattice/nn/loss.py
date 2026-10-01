@@ -100,8 +100,9 @@ def _vocab_pass(h, W, bias, y, valid, chunk, dtype, want_grad: bool):
 class _LinearCE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, weight, bias, labels, chunk: int, ignore_index: int, dtype):
+        from ..kernel_choice import active
         ctx.in_forward = (ctx.needs_input_grad[0] and not ctx.needs_input_grad[1]
-                          and not (bias is not None and ctx.needs_input_grad[2]))
+                          and not (bias is not None and ctx.needs_input_grad[2]) and active().grad_in_forward)
         if ctx.in_forward:
             h = hidden.reshape(-1, hidden.shape[-1])
             y = labels.reshape(-1)

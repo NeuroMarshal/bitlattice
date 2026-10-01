@@ -48,14 +48,18 @@ class Runner:
                    the gradient once (``bitlattice.backend.defer_wgrad``)
     ``loss_chunk`` tokens per chunk of the vocabulary-wide loss
     ``extra_loss`` pipeline only: fn(model, hidden, input_ids, labels, next_embeds) added on the head's process
+    ``kernels``    automatic kernel choices for the steps (a :class:`bitlattice.Kernels`, 'reference'; None: the
+                   setting in effect, by default all on)
     """
 
     def __init__(self, model: torch.nn.Module, optimizer=None, *, micro: int = 1, memory: Memory = Memory(),
-                 defer_wgrad: bool = False, loss_chunk: int = 1024, extra_loss=None):
+                 defer_wgrad: bool = False, loss_chunk: int = 1024, extra_loss=None, kernels=None):
         if micro < 1:
             raise ValueError("micro must be >= 1")
         self.model, self.optimizer, self.micro, self.memory = model, optimizer, micro, memory
         self.defer_wgrad, self.loss_chunk, self.extra_loss = defer_wgrad, loss_chunk, extra_loss
+        from .kernel_choice import as_kernels
+        self.kernels = as_kernels(kernels)
         import torch.distributed as dist
         self.distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
         if extra_loss is not None and not self.distributed:
@@ -82,7 +86,15 @@ class Runner:
                 log.warning("deferred weight gradients: %d NVFP4 block scales were rounded when micro-batches of "
                             "very different gradient magnitude were folded into one GEMM", n)
 
+    def _choices(self):
+        from .kernel_choice import kernels
+        return kernels(self.kernels) if self.kernels is not None else contextlib.nullcontext()
+
     def step(self, input_ids: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
+        with self._choices():
+            return self._step(input_ids, labels)
+
+    def _step(self, input_ids: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
         """Forward and backward of the batch over ``micro`` micro-batches, then the optimizer update. Returns the
         mean next-token loss over the batch's tokens (positions with label -100 are ignored). The batch may be on
         any device; it is moved to the device of the input embeddings."""
@@ -123,11 +135,12 @@ class Runner:
         was = self.model.training
         self.model.eval()
         try:
-            if self.distributed:
-                from .pipeline import train_step
-                return train_step(self.model, input_ids, labels, micro=min(self.micro, input_ids.shape[0]),
-                                  backward=False, chunk=self.loss_chunk)
-            from .nn.loss import causal_lm_loss
-            return causal_lm_loss(self.model, *self._on_input_device(input_ids, labels), chunk=self.loss_chunk)
+            with self._choices():
+                if self.distributed:
+                    from .pipeline import train_step
+                    return train_step(self.model, input_ids, labels, micro=min(self.micro, input_ids.shape[0]),
+                                      backward=False, chunk=self.loss_chunk)
+                from .nn.loss import causal_lm_loss
+                return causal_lm_loss(self.model, *self._on_input_device(input_ids, labels), chunk=self.loss_chunk)
         finally:
             self.model.train(was)

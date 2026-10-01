@@ -47,7 +47,9 @@ def causal_conv1d(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | No
     """x [B, C, T] -> [B, C, T]; ``weight`` [C, W] (or [C, 1, W]); ``activation`` None, 'silu' or 'swish'."""
     if weight.dim() == 3:
         weight = weight.squeeze(1)
-    fast = (_ops.HAVE_EXT and x.is_cuda and x.dim() == 3 and activation in (None, "silu", "swish")
+    from ..kernel_choice import active
+    fast = (_ops.HAVE_EXT and active().fused_conv and x.is_cuda and x.dim() == 3
+            and activation in (None, "silu", "swish")
             and 2 <= weight.shape[-1] <= 8 and x.shape[1] % 2 == 0 and not kwargs.get("seq_idx")
             and x.dtype in (torch.bfloat16, torch.float16, torch.float32))
     if not fast:

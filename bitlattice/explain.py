@@ -21,13 +21,17 @@ class Row:
 
 
 class Explanation(list):
-    """Rows (name, kind, detail, trainable, bytes); printing gives a table."""
+    """Rows (name, kind, detail, trainable, bytes); printing gives a table. ``kernels``: the automatic kernel choices
+    in effect and which fast paths this machine has."""
+
+    kernels: str = ""
 
     def __str__(self) -> str:
+        head = [self.kernels] if self.kernels else []
         if not self:
-            return "no converted modules and no lattice weights"
+            return "\n".join(head + ["no converted modules and no lattice weights"])
         w = max(len(r.name) for r in self)
-        lines = [f"{'module / weight':{w}s}  {'what':10s} {'trains':6s} {'MiB':>9s}  details"]
+        lines = head + [f"{'module / weight':{w}s}  {'what':10s} {'trains':6s} {'MiB':>9s}  details"]
         for r in self:
             lines.append(f"{r.name:{w}s}  {r.kind:10s} {'yes' if r.trainable else 'no':6s} "
                          f"{r.bytes / 2 ** 20:9.2f}  {r.detail}")
@@ -37,7 +41,14 @@ class Explanation(list):
 def explain(model: torch.nn.Module) -> Explanation:
     """Converted modules (what they replaced) and lattice weights (format, how they compute) of ``model``."""
     from .compute_policy import _scope
+    from .kernel_choice import active, kernels_available
     out = Explanation()
+    dev = next((p.device.index for p in model.parameters() if p.is_cuda), None)
+    if dev is not None:
+        have = kernels_available(dev)
+        missing = [k for k, v in have.items() if not v]
+        out.kernels = (f"kernels: {active().describe()}"
+                       + (f"; not available here: {', '.join(missing)}" if missing else "; all fast paths available"))
     for name, mod in model.named_modules():
         if isinstance(mod, Converted):
             nbytes = sum(p.numel() * p.element_size() for p in mod.parameters(recurse=False))
@@ -49,7 +60,8 @@ def explain(model: torch.nn.Module) -> Explanation:
                 c = _scope[-1] if _scope else p.compute
                 how = "exact (default)" if c is None else c.describe() + (" (temporary)" if _scope else "")
                 keep = "" if p.hi_idx is None else f", {p.hi_idx.numel()} columns kept"
+                where = "; in host memory, streamed" if not p.packed.is_cuda and p.is_cuda else ""
                 out.append(Row(".".join(x for x in (name, pname) if x), "lattice",
-                               f"{p.fmt.name} {tuple(p.shape)}{keep}; computes {how}", p.requires_grad,
+                               f"{p.fmt.name} {tuple(p.shape)}{keep}; computes {how}{where}", p.requires_grad,
                                p.storage_bytes()))
     return out

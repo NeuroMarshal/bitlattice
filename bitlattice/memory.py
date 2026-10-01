@@ -72,10 +72,15 @@ class _Packed:
 _PIECE = 1 << 22            # values per piece when packing / unpacking: float32 temporaries of 16 MiB
 
 
+def _fused() -> bool:
+    from .kernel_choice import active
+    return _ops.HAVE_EXT and active().fused_pack
+
+
 def _pack_fp8(t: torch.Tensor) -> _Packed:
     p = _Packed()
     p.kind, p.shape, p.dtype = "fp8", t.shape, t.dtype
-    if _ops.HAVE_EXT:                                    # one read, one write, no float32 temporaries
+    if _fused():                                         # one read, one write, no float32 temporaries
         p.data, p.scale = torch.ops.bitlattice.mx_pack(t.contiguous())
         return p
     g = t.reshape(-1, _GROUP)
@@ -102,7 +107,7 @@ def _unpack(p) -> torch.Tensor:
     if not isinstance(p, _Packed):
         return p
     if p.kind == "fp8":
-        if _ops.HAVE_EXT:
+        if _fused():
             return torch.ops.bitlattice.mx_unpack(p.data, p.scale, p.dtype).view(p.shape)
         out = torch.empty(p.data.shape, dtype=p.dtype, device=p.data.device)
         for s in range(0, out.shape[0], _PIECE // _GROUP):

@@ -23,10 +23,10 @@ _ROWS = 4096
 
 
 def _kernel(x: torch.Tensor, w: torch.Tensor) -> bool:
-    """The CUDA kernels (one pass, the same per-element arithmetic; only the order of row sums differs) unless the
-    reference kernels are asked for (``bitlattice.backend.reference_kernels``)."""
-    from ..backend import reference_kernels_active
-    return (_ops.HAVE_EXT and x.is_cuda and w.dtype == x.dtype and not reference_kernels_active()
+    """The CUDA kernels (one pass, the same per-element arithmetic; only the order of row sums differs) unless
+    switched off (``bitlattice.kernels(fused_norm=False)``)."""
+    from ..kernel_choice import active
+    return (_ops.HAVE_EXT and x.is_cuda and w.dtype == x.dtype and active().fused_norm
             and x.dtype in (torch.bfloat16, torch.float16, torch.float32))
 
 

@@ -31,6 +31,7 @@ import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
 from . import backend
+from .kernel_choice import active as active_kernels
 
 from . import parallel as P
 
@@ -333,7 +334,8 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                         # with a frozen output layer the loss forms its input gradient in forward and keeps only
                         # that: recomputing it would repeat the vocabulary-wide work for nothing
                         ckpt = (checkpoint_head if checkpoint_head != "auto" else
-                                getattr(getattr(head, "weight", None), "requires_grad", True))
+                                getattr(getattr(head, "weight", None), "requires_grad", True)
+                                or not active_kernels().grad_in_forward)
                         loss = (checkpoint(fn, y, e, use_reentrant=False) if backward and ckpt else fn(y, e))
                         losses[m] = loss * (n_tok[m] / max(1, sum(n_tok)))
                         y = None

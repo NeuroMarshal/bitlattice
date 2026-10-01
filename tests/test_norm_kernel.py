@@ -42,9 +42,13 @@ def test_gated_rms_norm_kernel_matches_reference(dtype, rows, d):
         assert ((a - b).norm() / b.norm().clamp_min(1e-12)).item() < 2e-3
 
 
-def test_reference_kernels_context_selects_the_reference():
+def test_kernel_choice_switches_the_norm_kernels_off():
     x = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16)
     w = torch.ones(64, device="cuda", dtype=torch.bfloat16)
-    with bl.backend.reference_kernels():
+    with bl.kernels(fused_norm=False):
         assert not N._kernel(x, w)
+    with bl.kernels("reference"):
+        assert not N._kernel(x, w)
+        with bl.kernels(fused_norm=True):                          # inner settings win
+            assert N._kernel(x, w)
     assert N._kernel(x, w)

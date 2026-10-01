@@ -31,8 +31,7 @@ log = logging.getLogger("bitlattice")
 
 __all__ = ["Fp4Recipe", "FP4_RECIPES", "Fp4Operand", "Mx8Operand", "is_nvfp4", "fp4_supported", "mxfp8_supported",
            "fp4_unfit", "mx_unfit", "to_blocked", "quantize_fp4", "fp4_mm", "mx_mm", "rht_last", "nvfp4_linear",
-           "defer_wgrad", "flush_wgrad", "pending_wgrad", "fold_rounded", "clear_shared", "drop_cached",
-           "reference_kernels", "reference_kernels_active"]
+           "defer_wgrad", "flush_wgrad", "pending_wgrad", "fold_rounded", "clear_shared", "drop_cached"]
 
 
 @dataclass(frozen=True)
@@ -242,22 +241,9 @@ def _scaled_mm_2l(a, b, sa, sb, ga, gb, out_dtype):
     return Fn.scaled_mm(a, b.t(), [sa, ga], rec, [sb, gb], rec, swizzle_a=sw, swizzle_b=sw, output_dtype=out_dtype)
 
 
-_REFERENCE = [0]          # > 0 inside a layer computing with reference kernels (see reference_kernels)
-
-
-@contextlib.contextmanager
-def reference_kernels(on: bool = True):
-    """The plain kernels for the GEMM operands and epilogues inside the block (Compute(kernels='reference'))."""
-    _REFERENCE[0] += int(on)
-    try:
-        yield
-    finally:
-        _REFERENCE[0] -= int(on)
-
-
-def reference_kernels_active() -> bool:
-    """Whether the current code runs inside :func:`reference_kernels`."""
-    return _REFERENCE[0] > 0
+def _choice():
+    from .kernel_choice import active
+    return active()
 
 
 def fp4_mm(a: Fp4Operand, b: Fp4Operand, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
@@ -266,7 +252,7 @@ def fp4_mm(a: Fp4Operand, b: Fp4Operand, out_dtype: torch.dtype = torch.bfloat16
     fp4 = torch.float4_e2m1fn_x2
     sa = a.scales if a.blocked else to_blocked(a.scales)
     sb = b.scales if b.blocked else to_blocked(b.scales)
-    if not _REFERENCE[0] and _two_level(a.packed.device.index or 0):
+    if _choice().two_level_gemm and _two_level(a.packed.device.index or 0):
         return _scaled_mm_2l(a.packed.view(fp4), b.packed.view(fp4), sa, sb, a.global_scale.float().reshape(()),
                              b.global_scale.float().reshape(()), out_dtype)
     y = torch._scaled_mm(a.packed.view(fp4), b.packed.view(fp4).t(), scale_a=sa, scale_b=sb, out_dtype=out_dtype)
@@ -284,6 +270,8 @@ OPERAND_CACHE_BYTES = 768 << 20
 
 
 def _cached(w, kind: str, make):
+    if not _choice().operand_cache:
+        return make()
     key = (id(w), kind)
     ver = getattr(w, "_bl_version", 0)
     hit = _OPERANDS.get(key)
@@ -452,7 +440,7 @@ _SHARED_MAX = 4
 
 
 def _shared(x: torch.Tensor, recipe: Fp4Recipe, kind: str, make):
-    if _REFERENCE[0]:
+    if not _choice().shared_operands:
         return make()
     key = (id(x), x._version, recipe, kind, tuple(x.shape))
     hit = _SHARED.get(key)
@@ -567,6 +555,11 @@ def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool
             gt = _q(g2p, transpose=True, mode=mode, four_over_six=b46, recipe=recipe, rotate_seed=xt.rotate_seed,
                     seed=_seed(), pow2=True)
         else:
+            if _defer_wgrad[0]:
+                name = getattr(w, "_bl_name", None) or f"weight {tuple(w.shape)}"
+                raise RuntimeError(f"{name}: deferred weight gradients need a recipe with the 128-element rotation "
+                                   "(e.g. 'quartet2_fast'); this layer's recipe rotates by 16 and its weight-gradient "
+                                   "operands cannot be folded")
             seed = _seed()                                                             # g^T rotated (16), [N, Mp]
             bound = gq.global_scale * (4.0 * (256.0 / 448.0 if b46 else 1.0)) if gq is not None else None
             gt = Fp4Operand(*torch.ops.bitlattice.quantize_nvfp4_t(g2p, _hadamard16(g2p.device, torch.float32), seed,

@@ -80,3 +80,17 @@ def test_state_estimate_counts_momentum_formats():
 def test_nvfp4_momentum_needs_cuda_parameters():
     with pytest.raises(ValueError, match="nvfp4"):
         bl.optim.Lattice(torch.nn.Linear(32, 32), "muon", momentum="nvfp4")
+
+
+def test_reference_kernels_compute_the_same_training():
+    x = torch.randint(0, 128, (4, 33), device=DEV, generator=torch.Generator(DEV).manual_seed(5))
+    out = []
+    for k in (None, "reference"):
+        m = _model()
+        bl.surgery.convert_(m, "*norm", "rms_norm", skip_unfit=True)
+        r = bl.Runner(m, bl.optim.Lattice(m, "muon", lr=1e-2, fused_backward=True), micro=2, kernels=k)
+        out.append([r.step(x).item() for _ in range(3)])
+    assert all(abs(a - b) <= 2e-3 * abs(a) for a, b in zip(*out)), out
+    with pytest.raises(TypeError, match="unknown kernel choices"):
+        with bl.kernels(fast=True):
+            pass
