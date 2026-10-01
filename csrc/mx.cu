@@ -152,3 +152,100 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> bl_mx_quantize2(at::T
   const auto f8 = e5m2 ? at::kFloat8_e5m2 : at::kFloat8_e4m3fn;
   return {rc.view(f8), rs.view(at::kFloat8_e8m0fnu), cc.view(f8), cs.view(at::kFloat8_e8m0fnu)};
 }
+
+// ---------------------------------------------------------------- flat packing (saved activations)
+// Contiguous values in groups of 32 -> E4M3 codes and E8M0 scales (rounded up), and back; no layout requirements
+// beyond the length being a multiple of 32. Eight lanes hold one group (4 values each).
+namespace {
+
+template <typename T>
+__global__ void mx_pack_flat(const T* __restrict__ x, int64_t groups, uint8_t* __restrict__ codes,
+                             uint8_t* __restrict__ scales) {
+  const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t g = t >> 3;
+  const int lane8 = threadIdx.x & 7;
+  const bool live = g < groups;
+  float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  if (live) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = tof<T>(x[g * 32 + lane8 * 4 + i]);
+  }
+  uint8_t e8;
+  const uint32_t packed = quantize32<false>(v, &e8);
+  if (live) {
+    *reinterpret_cast<uint32_t*>(codes + g * 32 + lane8 * 4) = packed;
+    if (lane8 == 0) scales[g] = e8;
+  }
+}
+
+template <typename T> __device__ __forceinline__ T from_f(float v);
+template <> __device__ __forceinline__ __nv_bfloat16 from_f<__nv_bfloat16>(float v) { return __float2bfloat16_rn(v); }
+template <> __device__ __forceinline__ __half from_f<__half>(float v) { return __float2half_rn(v); }
+template <> __device__ __forceinline__ float from_f<float>(float v) { return v; }
+
+template <typename T>
+__global__ void mx_unpack_flat(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales, int64_t n,
+                               T* __restrict__ out) {
+  const int64_t i = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+  if (i >= n) return;
+  const float s = exp2f(static_cast<float>(scales[i / 32]) - 127.0f);
+  const uint32_t raw = *reinterpret_cast<const uint32_t*>(codes + i);
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    __nv_fp8_e4m3 c;
+    c.__x = static_cast<uint8_t>(raw >> (8 * k));
+    out[i + k] = from_f<T>(static_cast<float>(c) * s);
+  }
+}
+
+}  // namespace
+
+// x contiguous, numel % 32 == 0 -> (E4M3 codes [numel], E8M0 scales [numel / 32])
+std::tuple<at::Tensor, at::Tensor> bl_mx_pack(at::Tensor x) {
+  TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.numel() % 32 == 0, "x: contiguous CUDA, numel % 32 == 0");
+  const c10::cuda::CUDAGuard guard(x.device());
+  const int64_t groups = x.numel() / 32;
+  auto opt = x.options().dtype(at::kByte);
+  at::Tensor codes = at::empty({x.numel()}, opt), scales = at::empty({groups}, opt);
+  if (groups == 0) return {codes, scales};
+  const int64_t threads = groups * 8;
+  const unsigned blocks = static_cast<unsigned>((threads + 255) / 256);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  if (x.scalar_type() == at::kBFloat16)
+    mx_pack_flat<__nv_bfloat16><<<blocks, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()), groups, codes.data_ptr<uint8_t>(),
+        scales.data_ptr<uint8_t>());
+  else if (x.scalar_type() == at::kHalf)
+    mx_pack_flat<__half><<<blocks, 256, 0, stream>>>(reinterpret_cast<const __half*>(x.data_ptr<at::Half>()), groups,
+                                                     codes.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>());
+  else {
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "x must be bf16, fp16 or fp32");
+    mx_pack_flat<float><<<blocks, 256, 0, stream>>>(x.data_ptr<float>(), groups, codes.data_ptr<uint8_t>(),
+                                                    scales.data_ptr<uint8_t>());
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {codes.view(at::kFloat8_e4m3fn), scales.view(at::kFloat8_e8m0fnu)};
+}
+
+at::Tensor bl_mx_unpack(at::Tensor codes, at::Tensor scales, at::ScalarType dtype) {
+  TORCH_CHECK(codes.is_cuda() && codes.is_contiguous() && codes.numel() % 32 == 0, "codes: contiguous CUDA");
+  const c10::cuda::CUDAGuard guard(codes.device());
+  at::Tensor out = at::empty({codes.numel()}, codes.options().dtype(dtype));
+  const int64_t n = codes.numel();
+  if (n == 0) return out;
+  const unsigned blocks = static_cast<unsigned>((n / 4 + 255) / 256);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const uint8_t* c = reinterpret_cast<const uint8_t*>(codes.data_ptr());
+  const uint8_t* s = reinterpret_cast<const uint8_t*>(scales.data_ptr());
+  if (dtype == at::kBFloat16)
+    mx_unpack_flat<__nv_bfloat16><<<blocks, 256, 0, stream>>>(c, s, n,
+                                                              reinterpret_cast<__nv_bfloat16*>(out.data_ptr()));
+  else if (dtype == at::kHalf)
+    mx_unpack_flat<__half><<<blocks, 256, 0, stream>>>(c, s, n, reinterpret_cast<__half*>(out.data_ptr()));
+  else {
+    TORCH_CHECK(dtype == at::kFloat, "dtype must be bf16, fp16 or fp32");
+    mx_unpack_flat<float><<<blocks, 256, 0, stream>>>(c, s, n, out.data_ptr<float>());
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}

@@ -27,6 +27,8 @@ std::tuple<Tensor, Tensor, Tensor> bl_quantize_nvfp4_t(Tensor x, std::optional<T
 std::tuple<Tensor, Tensor, Tensor> bl_requantize_nvfp4_t(Tensor packed, Tensor scales, Tensor global_scale);
 Tensor bl_scale_(Tensor y, Tensor alpha);
 std::tuple<Tensor, Tensor, Tensor, Tensor> bl_mx_quantize2(Tensor x, bool row, bool col, bool e5m2, bool blocked);
+std::tuple<Tensor, Tensor> bl_mx_pack(Tensor x);
+Tensor bl_mx_unpack(Tensor codes, Tensor scales, at::ScalarType dtype);
 Tensor bl_causal_conv1d_fwd(Tensor x, Tensor weight, std::optional<Tensor> bias, bool silu_act);
 std::tuple<Tensor, Tensor, Tensor> bl_causal_conv1d_bwd(Tensor x, Tensor weight, std::optional<Tensor> bias, Tensor dy,
                                                         bool silu_act);
@@ -78,6 +80,8 @@ TORCH_LIBRARY(bitlattice, m) {
   m.def("nvfp4_quantize2(Tensor x, int[] row, int[] col, bool mae=False, Tensor? global_scales=None, "
         "bool blocked=False, Tensor(a!)? amax_out=None) "
         "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+  m.def("mx_pack(Tensor x) -> (Tensor, Tensor)");
+  m.def("mx_unpack(Tensor codes, Tensor scales, ScalarType dtype) -> Tensor");
   m.def("mx_quantize2(Tensor x, bool row=True, bool col=False, bool e5m2=False, bool blocked=False) "
         "-> (Tensor, Tensor, Tensor, Tensor)");
   m.def("causal_conv1d_fwd(Tensor x, Tensor weight, Tensor? bias, bool silu_act) -> Tensor");
@@ -99,6 +103,8 @@ TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
   m.impl("nvfp4_quantize2", &bl_nvfp4_quantize2);
   m.impl("causal_conv1d_fwd", &bl_causal_conv1d_fwd);
   m.impl("mx_quantize2", &bl_mx_quantize2);
+  m.impl("mx_pack", &bl_mx_pack);
+  m.impl("mx_unpack", &bl_mx_unpack);
   m.impl("causal_conv1d_bwd", &bl_causal_conv1d_bwd);
 }
 

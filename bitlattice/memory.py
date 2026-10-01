@@ -19,12 +19,11 @@ per-layer peak that limits the context length; without it, they shrink all saved
         loss = model(x).loss
     loss.backward()
 
-    bl.memory.compress_saved_(model, "*layers.*")      # every decoder layer's forward runs inside the hooks
+    bl.surgery.convert_(model, "*.mlp", "compressed_saves", fmt="fp8")   # inside chosen layers (also in
+                                                                          # checkpoint recomputation)
 """
 from __future__ import annotations
 
-import fnmatch
-import re
 import weakref
 from dataclasses import dataclass
 
@@ -32,7 +31,7 @@ import torch
 
 from . import _ops
 
-__all__ = ["SavedSpec", "compress_saved", "compress_saved_", "stats"]
+__all__ = ["SavedSpec", "compress_saved", "stats"]
 
 _GROUP = 32
 
@@ -70,13 +69,23 @@ class _Packed:
     __slots__ = ("kind", "data", "scale", "glob", "shape", "dtype", "rows", "cols")
 
 
+_PIECE = 1 << 22            # values per piece when packing / unpacking: float32 temporaries of 16 MiB
+
+
 def _pack_fp8(t: torch.Tensor) -> _Packed:
     p = _Packed()
     p.kind, p.shape, p.dtype = "fp8", t.shape, t.dtype
-    g = t.reshape(-1, _GROUP).float()
-    e = torch.ceil(torch.log2(g.abs().amax(1).clamp_min(2.0 ** -126) / 448.0)).clamp_(-127, 127)
-    p.data = (g * torch.exp2(-e)[:, None]).to(torch.float8_e4m3fn)
-    p.scale = e.to(torch.int8)
+    if _ops.HAVE_EXT:                                    # one read, one write, no float32 temporaries
+        p.data, p.scale = torch.ops.bitlattice.mx_pack(t.contiguous())
+        return p
+    g = t.reshape(-1, _GROUP)
+    p.data = torch.empty(g.shape, dtype=torch.float8_e4m3fn, device=t.device)
+    p.scale = torch.empty(g.shape[0], dtype=torch.uint8, device=t.device)
+    for s in range(0, g.shape[0], _PIECE // _GROUP):             # pieces: bounded float32 temporaries
+        gf = g[s:s + _PIECE // _GROUP].float()
+        e = torch.ceil(torch.log2(gf.abs().amax(1).clamp_min(2.0 ** -126) / 448.0)).clamp_(-127, 127)
+        p.data[s:s + _PIECE // _GROUP] = (gf * torch.exp2(-e)[:, None]).to(torch.float8_e4m3fn)
+        p.scale[s:s + _PIECE // _GROUP] = (e + 127).to(torch.uint8)
     return p
 
 
@@ -93,8 +102,14 @@ def _unpack(p) -> torch.Tensor:
     if not isinstance(p, _Packed):
         return p
     if p.kind == "fp8":
-        g = p.data.float() * torch.exp2(p.scale.float())[:, None]
-        return g.to(p.dtype).view(p.shape)
+        if _ops.HAVE_EXT:
+            return torch.ops.bitlattice.mx_unpack(p.data, p.scale, p.dtype).view(p.shape)
+        out = torch.empty(p.data.shape, dtype=p.dtype, device=p.data.device)
+        for s in range(0, out.shape[0], _PIECE // _GROUP):
+            sl = slice(s, s + _PIECE // _GROUP)
+            scale = torch.exp2(p.scale[sl].view(torch.uint8).float() - 127)
+            out[sl] = (p.data[sl].float() * scale[:, None]).to(p.dtype)
+        return out.view(p.shape)
     from .fp4ref import E2M1
     codes = p.data.to(torch.int32)
     codes = torch.stack([codes & 15, codes >> 4], -1).reshape(p.rows, p.cols)
@@ -135,29 +150,3 @@ def compress_saved(spec="fp8"):
     :class:`SavedSpec` or a format name."""
     spec = spec if isinstance(spec, SavedSpec) else SavedSpec(spec)
     return torch.autograd.graph.saved_tensors_hooks(_packer(spec), _unpack)
-
-
-def compress_saved_(model: torch.nn.Module, pattern: str = "*layers.*", spec="fp8") -> list[str]:
-    """Run the forward of every module whose name matches ``pattern`` (glob on the full name with no further dots
-    after the match, or ``re:`` regex) inside :func:`compress_saved`; the forward of a checkpointed layer is also
-    its recomputation, so the hooks act there too. Returns the wrapped module names."""
-    spec = spec if isinstance(spec, SavedSpec) else SavedSpec(spec)
-    if pattern.startswith("re:"):
-        rx = re.compile(pattern[3:])
-        match = lambda n: rx.fullmatch(n) is not None  # noqa: E731
-    else:
-        match = lambda n: fnmatch.fnmatchcase(n, pattern) and "." not in n[len(pattern.rstrip("*")):]  # noqa: E731
-    done = []
-    for name, mod in model.named_modules():
-        if not name or not match(name) or getattr(mod, "_bl_compressed", None) is not None:
-            continue
-        inner = mod.forward
-
-        def forward(*args, _inner=inner, _mod=mod, **kwargs):
-            with compress_saved(_mod._bl_compressed):
-                return _inner(*args, **kwargs)
-
-        mod.forward = forward
-        mod._bl_compressed = spec
-        done.append(name)
-    return done

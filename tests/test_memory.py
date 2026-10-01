@@ -74,8 +74,56 @@ def test_fp32_and_parameters_kept():
     assert torch.isfinite(w.grad).all() and torch.isfinite(a.grad).all()
 
 
-def test_compress_saved_patches_layers():
-    model = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.Sequential(torch.nn.Linear(8, 8)))
-    names = bl.memory.compress_saved_(model, "1")
-    assert names == ["1"]
-    assert bl.memory.compress_saved_(model, "1") == []          # already wrapped
+def test_compressed_saves_conversion():
+    model = torch.nn.Sequential(Block(), Block()).to(DEV).to(torch.bfloat16)
+    x = torch.randn(2, 256, 256, device=DEV, dtype=torch.bfloat16)
+    ref = _grads(model, x)
+    rep = bl.surgery.convert_(model, "1", "compressed_saves", fmt="fp8", min_numel=1024)
+    assert rep == [("1", "Block", "CompressedSaves")]
+    bl.memory.stats(reset=True)
+    got = _grads(model, x)
+    assert bl.memory.stats()["packed"] > 0
+    for r, g in zip(ref, got):
+        assert ((g - r).norm() / r.norm()).item() < 0.03
+    assert bl.surgery.revert_(model, "1") == [("1", "CompressedSaves", "Block")]
+
+
+def test_checkpoint_conversion_with_compressed_recomputation():
+    torch.manual_seed(2)
+    model = torch.nn.Sequential(*[Block(512) for _ in range(4)]).to(DEV).to(torch.bfloat16)
+    x = torch.randn(4, 1024, 512, device=DEV, dtype=torch.bfloat16)
+
+    def run(grad_input=True):
+        model.zero_grad()
+        xi = x.clone().requires_grad_(grad_input)
+        torch.cuda.synchronize()
+        base = torch.cuda.memory_allocated()
+        y = model(xi)
+        kept = torch.cuda.memory_allocated() - base
+        y.float().square().mean().backward()
+        return kept, ([xi.grad.float()] if grad_input else []) + [p.grad.float() for p in model.parameters()]
+
+    k0, ref = run()
+    bl.surgery.convert_(model, "re:^[0-9]+$", "checkpoint")
+    k1, g1 = run()
+    assert k1 < 0.2 * k0                                       # the forward keeps only the layer inputs
+    for r, a in zip(ref, g1):
+        assert ((a - r).norm() / r.norm()).item() < 1e-2
+    _, g_frozen_input = run(grad_input=False)                  # parameters still get gradients
+    for r, a in zip(ref[1:], g_frozen_input):
+        assert ((a - r).norm() / r.norm()).item() < 1e-2
+    bl.surgery.revert_(model, "*")
+    bl.memory.stats(reset=True)
+    bl.surgery.convert_(model, "re:^[0-9]+$", "checkpoint", saved="fp8", min_numel=1024)
+    _, g2 = run()
+    st = bl.memory.stats()
+    assert st["packed"] > 0 and st["bytes_out"] < 0.55 * st["bytes_in"]   # recomputed saves packed
+    for r, b in zip(ref, g2):
+        assert ((b - r).norm() / r.norm()).item() < 0.05
+
+
+def test_skip_unfit_conversions():
+    model = torch.nn.Sequential(torch.nn.LayerNorm(64), torch.nn.Linear(64, 64)).to(DEV)
+    with pytest.raises(ValueError, match="cannot be converted"):
+        bl.surgery.convert_(model, "*", "rms_norm")
+    assert bl.surgery.convert_(model, "re:^[0-9]$", "rms_norm", skip_unfit=True) == []
