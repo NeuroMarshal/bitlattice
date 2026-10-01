@@ -19,7 +19,7 @@ from .runner import Memory, Runner
 from .storage import plan
 from .tensor import LatticeTensor, is_lattice
 
-__version__ = "0.2.0.dev0"
+__version__ = "0.2.0rc1"
 
 __all__ = ["backend", "data", "formats", "io", "kvcache", "memory", "nn", "optim", "parallel", "pipeline", "quant",
            "select", "storage", "surgery", "HAVE_EXT", "Compute", "COMPUTE_PRESETS", "compute", "explain", "Format",
