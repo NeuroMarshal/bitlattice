@@ -111,12 +111,19 @@ class _Segment:
         return sum(t[:self.rows].numel() * t.element_size() for t in parts if t is not None)
 
 
+def _four_over_six(fmt: F.Format) -> bool:
+    return getattr(fmt, "init", "") == "4over6"
+
+
 def _quantize(x2: torch.Tensor, fmt: F.Format, g: torch.Tensor | None):
-    """Rows of x2 quantized along the last dimension (fast CUDA path for nvfp4)."""
-    if fmt.name == "nvfp4" and x2.is_cuda and x2.shape[-1] % 16 == 0 and _ops.HAVE_EXT:
-        packed, scales = torch.ops.bitlattice.quantize_nvfp4(x2.contiguous(), g.float().reshape(1), -1, 0)
+    """Rows of x2 quantized along the last dimension (CUDA kernel for NVFP4-layout formats, with four-over-six block
+    scales for e.g. 'nvfp4_4o6')."""
+    from .backend import is_nvfp4
+    if is_nvfp4(fmt) and x2.is_cuda and x2.shape[-1] % 16 == 0 and _ops.HAVE_EXT:
+        packed, scales, _ = torch.ops.bitlattice.nvfp4_quantize(x2.contiguous(), False, 0, _four_over_six(fmt), False,
+                                                                False, 0, g.float().reshape(1))
         return R.Quantized(packed, scales, g, None, x2.shape[0], x2.shape[1])
-    return R.quantize(x2, fmt, method="rtn", global_scale=g)
+    return R.quantize(x2, fmt, method="4over6" if _four_over_six(fmt) else "rtn", global_scale=g)
 
 
 class _Store:
@@ -149,7 +156,9 @@ class _Store:
         if not self.segments or not self.segments[-1][0].fits(x2):
             g = None
             if cols_fmt.scale is not None and cols_fmt.scale.global_scale:
-                g = (x2.abs().amax() * HEADROOM / (cols_fmt.max_abs * F.E4M3_MAX)).clamp_min(1e-12).reshape(1)
+                # four over six: E4M3 scales up to 448 must still fit 6/4 times the block scale of the top level
+                top = 256.0 if _four_over_six(cols_fmt) else F.E4M3_MAX
+                g = (x2.abs().amax() * HEADROOM / (cols_fmt.max_abs * top)).clamp_min(1e-12).reshape(1)
             self.segments.append((_Segment(cols_fmt, cols, x.device, g), 0))
         seg, n = self.segments[-1]
         seg.append(x2)

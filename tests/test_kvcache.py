@@ -32,7 +32,7 @@ def test_dense_format_equals_plain_cache(model):
     assert torch.allclose(got, ref, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("fmt,tol", [("fp8", 0.03), ("mxfp8", 0.03), ("int8", 0.03), ("nvfp4", 0.15),
+@pytest.mark.parametrize("fmt,tol", [("fp8", 0.03), ("mxfp8", 0.03), ("int8", 0.03), ("nvfp4", 0.15), ("nvfp4_4o6", 0.15),
                                      ("mxfp4", 0.2), ("int4", 0.2), ("mxfp6", 0.06)])
 @pytest.mark.parametrize("rotate", [False, True])
 def test_quantized_formats_stay_close(model, fmt, tol, rotate):
