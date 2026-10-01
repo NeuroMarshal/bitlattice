@@ -31,7 +31,8 @@ log = logging.getLogger("bitlattice")
 
 __all__ = ["Fp4Recipe", "FP4_RECIPES", "Fp4Operand", "Mx8Operand", "is_nvfp4", "fp4_supported", "mxfp8_supported",
            "fp4_unfit", "mx_unfit", "to_blocked", "quantize_fp4", "fp4_mm", "mx_mm", "rht_last", "nvfp4_linear",
-           "defer_wgrad", "flush_wgrad", "pending_wgrad", "fold_rounded", "clear_shared", "drop_cached"]
+           "defer_wgrad", "flush_wgrad", "pending_wgrad", "fold_rounded", "clear_shared", "drop_cached",
+           "reference_kernels", "reference_kernels_active"]
 
 
 @dataclass(frozen=True)
@@ -252,6 +253,11 @@ def reference_kernels(on: bool = True):
         yield
     finally:
         _REFERENCE[0] -= int(on)
+
+
+def reference_kernels_active() -> bool:
+    """Whether the current code runs inside :func:`reference_kernels`."""
+    return _REFERENCE[0] > 0
 
 
 def fp4_mm(a: Fp4Operand, b: Fp4Operand, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:

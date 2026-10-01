@@ -15,9 +15,41 @@ from __future__ import annotations
 
 import torch
 
+from .. import _ops
+
 __all__ = ["rms_norm", "rms_norm_gated"]
 
 _ROWS = 4096
+
+
+def _kernel(x: torch.Tensor, w: torch.Tensor) -> bool:
+    """The CUDA kernels (one pass, the same per-element arithmetic; only the order of row sums differs) unless the
+    reference kernels are asked for (``bitlattice.backend.reference_kernels``)."""
+    from ..backend import reference_kernels_active
+    return (_ops.HAVE_EXT and x.is_cuda and w.dtype == x.dtype and not reference_kernels_active()
+            and x.dtype in (torch.bfloat16, torch.float16, torch.float32))
+
+
+class _NormKernel(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, gate, w, eps: float, offset: float, cast_first: bool):
+        shape = x.shape
+        x2 = x.reshape(-1, shape[-1]).contiguous()
+        g2 = None if gate is None else gate.reshape(-1, shape[-1]).contiguous()
+        y, rstd = torch.ops.bitlattice.rms_norm_fwd(x2, g2, w.contiguous(), eps, offset, cast_first)
+        ctx.save_for_backward(x2, g2, w, rstd)
+        ctx.offset, ctx.shape = offset, shape
+        return y.view(shape)
+
+    @staticmethod
+    def backward(ctx, gy):
+        x2, g2, w, rstd = ctx.saved_tensors
+        need_x, need_g, need_w = ctx.needs_input_grad[0], ctx.needs_input_grad[1], ctx.needs_input_grad[2]
+        dx, dg, dw = torch.ops.bitlattice.rms_norm_bwd(x2, g2, w.contiguous(), rstd,
+                                                        gy.reshape(x2.shape).contiguous(), ctx.offset, need_x,
+                                                        need_g, need_w)
+        return (dx.view(ctx.shape) if need_x else None, dg.view(ctx.shape) if need_g and g2 is not None else None,
+                dw.to(w.dtype) if need_w else None, None, None, None)
 
 
 class _RMSNorm(torch.autograd.Function):
@@ -111,11 +143,15 @@ class _RMSNormGated(torch.autograd.Function):
 
 
 def rms_norm_gated(x: torch.Tensor, gate: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    if _kernel(x, w) and gate.dtype == x.dtype:
+        return _NormKernel.apply(x, gate, w, eps, 0.0, True)
     return _RMSNormGated.apply(x, gate, w, eps)
 
 
 def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float, offset: float = 0.0,
              cast_first: bool = True) -> torch.Tensor:
+    if _kernel(x, w):
+        return _NormKernel.apply(x, None, w, eps, offset, cast_first)
     return _RMSNorm.apply(x, w, eps, offset, cast_first)
 
 

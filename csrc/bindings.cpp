@@ -30,6 +30,10 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> bl_mx_quantize2(Tensor x, bool row, b
 std::tuple<Tensor, Tensor> bl_mx_pack(Tensor x);
 Tensor bl_mx_unpack(Tensor codes, Tensor scales, at::ScalarType dtype);
 Tensor bl_causal_conv1d_fwd(Tensor x, Tensor weight, std::optional<Tensor> bias, bool silu_act);
+std::tuple<Tensor, Tensor> bl_rms_norm_fwd(Tensor x, std::optional<Tensor> gate, Tensor w, double eps, double offset,
+                                           bool cast_first);
+std::tuple<Tensor, Tensor, Tensor> bl_rms_norm_bwd(Tensor x, std::optional<Tensor> gate, Tensor w, Tensor rstd,
+                                                   Tensor dy, double offset, bool need_x, bool need_gate, bool need_w);
 std::tuple<Tensor, Tensor, Tensor> bl_causal_conv1d_bwd(Tensor x, Tensor weight, std::optional<Tensor> bias, Tensor dy,
                                                         bool silu_act);
 std::tuple<Tensor, Tensor, Tensor> bl_nvfp4_quantize(Tensor x, bool transpose, int64_t mode, bool four_over_six,
@@ -86,6 +90,9 @@ TORCH_LIBRARY(bitlattice, m) {
         "-> (Tensor, Tensor, Tensor, Tensor)");
   m.def("causal_conv1d_fwd(Tensor x, Tensor weight, Tensor? bias, bool silu_act) -> Tensor");
   m.def("causal_conv1d_bwd(Tensor x, Tensor weight, Tensor? bias, Tensor dy, bool silu_act) -> (Tensor, Tensor, Tensor)");
+  m.def("rms_norm_fwd(Tensor x, Tensor? gate, Tensor w, float eps, float offset, bool cast_first) -> (Tensor, Tensor)");
+  m.def("rms_norm_bwd(Tensor x, Tensor? gate, Tensor w, Tensor rstd, Tensor dy, float offset, bool need_x, "
+        "bool need_gate, bool need_w) -> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
@@ -106,6 +113,8 @@ TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
   m.impl("mx_pack", &bl_mx_pack);
   m.impl("mx_unpack", &bl_mx_unpack);
   m.impl("causal_conv1d_bwd", &bl_causal_conv1d_bwd);
+  m.impl("rms_norm_fwd", &bl_rms_norm_fwd);
+  m.impl("rms_norm_bwd", &bl_rms_norm_bwd);
 }
 
 TORCH_LIBRARY_IMPL(bitlattice, CompositeExplicitAutograd, m) { m.impl("direction", &bl_direction); }
