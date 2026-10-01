@@ -38,6 +38,9 @@ def stream_rows(W: torch.Tensor, rows: int, device: torch.device):
         return ready
 
     cur = torch.cuda.current_stream(device)
+    # the buffers were allocated on the current stream, whose queued work may still read that memory (freed by
+    # earlier tensors): the side stream writes only after it
+    side.wait_stream(cur)
     try:
         nxt = load(0)
         for k, v0 in enumerate(starts):

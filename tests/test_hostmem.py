@@ -32,3 +32,21 @@ def test_pool_reuses_completed_buffers_only():
     pool.give(a, ev)
     assert pool.take((4, 4), torch.float32) is a
     assert pool.take((4, 4), torch.float32) is not a
+
+
+def test_streamed_rows_are_exact_while_the_compute_stream_is_busy():
+    from bitlattice.nn.stream import stream_rows
+    torch.manual_seed(0)
+    W = torch.randn(4096, 512, dtype=torch.bfloat16)
+    Wh, Wg = to_pinned(W), W.cuda()
+    x = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
+    ref = torch.cat([x @ Wg[v:v + 512].t() for v in range(0, 4096, 512)], 1)
+    for _ in range(10):
+        junk = torch.randn(2048, 2048, device="cuda")
+        for _ in range(3):
+            junk = junk @ junk / 32                    # queued work reading memory freed just below
+        del junk
+        out = torch.empty_like(ref)
+        for v0, v1, t in stream_rows(Wh, 512, x.device):
+            out[:, v0:v1] = x @ t.t()
+        assert torch.equal(out, ref)
