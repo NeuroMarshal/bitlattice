@@ -48,7 +48,7 @@ def _log(*a):
 def init(backend: str = "nccl") -> tuple[int, int]:
     """Start the process group for a one-process-per-GPU run (environment from torchrun). Returns (rank, world)."""
     os.environ.setdefault("TORCH_NCCL_SHOW_EAGER_INIT_P2P_SERIALIZATION_WARNING", "false")   # one group per direction
-    local = int(os.environ.get("LOCAL_RANK", 0))
+    local = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local)
     if not dist.is_initialized():
         dist.init_process_group(backend, device_id=torch.device("cuda", local))
@@ -280,6 +280,13 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                     next_emb[m] = e
                 else:
                     keep.append((dist.isend(e, head_owner, group=_group(me, head_owner, "aux")), None))
+    elif extra_loss is not None and head_owner == me:
+        # the receives are posted now, not when the head is reached: a send left pending for the whole forward
+        # would block any device-wide synchronization on the sender (the caching allocator releasing memory under
+        # pressure calls cudaFree), and the sender would then never produce the activations this process waits for
+        for m in range(M):
+            e = torch.empty(ids_mb[m].shape[0], ids_mb[m].shape[1] - 1, width, dtype=dtype, device=dev)
+            next_emb[m] = (e, dist.irecv(e, segs[0].owner, group=_group(segs[0].owner, me, "aux")))
     with grad:
         prep = [_block_kwargs(backbone, blocks, ids, embed_here, width, dtype, dev) for ids in ids_mb]
         # forward: each segment (run of units on this GPU) micro-batch by micro-batch, so its output for micro-batch
@@ -313,11 +320,10 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                     else:
                         e = None
                         if extra_loss is not None:
-                            e = next_emb.get(m)
-                            if e is None:
-                                e = torch.empty(ids_mb[m].shape[0], ids_mb[m].shape[1] - 1, width, dtype=dtype,
-                                                device=dev)
-                                dist.irecv(e, segs[0].owner, group=_group(segs[0].owner, me, "aux")).wait()
+                            e = next_emb.pop(m)
+                            if isinstance(e, tuple):
+                                e, work = e
+                                work.wait()
                         fn = functools.partial(_head_loss, model, norm, head, lab_mb[m], ids_mb[m], chunk,
                                                extra_loss)
                         # the head (final norm, vocabulary-wide loss, extra heads) is recomputed in backward, so only
