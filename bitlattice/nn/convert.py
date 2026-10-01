@@ -193,14 +193,15 @@ class GatedDeltaNet(Converted):
             return self._piece(hidden_states, None, None, last=True)[0]
         # the layer over pieces of `chunk` tokens: the convolution continues from the previous piece's last inputs,
         # the recurrence from its final state; with gradients each piece is recomputed in backward
+        from .chunk import place
         ckpt = torch.is_grad_enabled() and self.training
-        outs, tail, state = [], None, None
+        out, tail, state = None, None, None
         for s in range(0, T, self.chunk):
             x, last = hidden_states[:, s:s + self.chunk], s + self.chunk >= T
             args = (x, tail, state, last)
             o, tail, state = _checkpoint(self._piece, *args, use_reentrant=False) if ckpt else self._piece(*args)
-            outs.append(o)
-        return torch.cat(outs, 1)
+            out = place(out, o, 1, s, T)
+        return out
 
     def _piece(self, x, tail, state, last: bool):
         """(output, convolution inputs of the last tokens, final recurrent state) of tokens x [B, L, D] that follow
@@ -260,14 +261,16 @@ class AttentionChunks(Converted):
         k = self._norm("k_norm", m.k_proj(hidden_states).view(B, T, -1, hd)).transpose(1, 2)
         v = m.v_proj(hidden_states).view(B, T, -1, hd).transpose(1, 2)
         _, k = self._rotary(k[:, :1], k, cos, sin)
+        from .chunk import place
         ckpt = torch.is_grad_enabled() and self.training
-        outs = []
+        out = None
         for s in range(0, T, self.chunk):
             e = min(T, s + self.chunk)
             mask = None if attention_mask is None else attention_mask[:, :, s:e, :e]
             args = (hidden_states[:, s:e], k[:, :, :e], v[:, :, :e], cos[:, s:e], sin[:, s:e], mask)
-            outs.append(_checkpoint(self._piece, *args, use_reentrant=False) if ckpt else self._piece(*args))
-        return torch.cat(outs, 1), None
+            out = place(out, _checkpoint(self._piece, *args, use_reentrant=False) if ckpt else self._piece(*args),
+                        1, s, T)
+        return out, None
 
     def _norm(self, name: str, x):
         norm = getattr(self.original, name, None)

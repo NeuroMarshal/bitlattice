@@ -35,13 +35,14 @@ def sequence_chunked(fn, chunk: int = 4096):
             return fn(q, k, v, *args, initial_state=initial_state, output_final_state=output_final_state, **kw)
         per_token = {n: t for n, t in kw.items() if n in _SPLIT and isinstance(t, torch.Tensor) and t.dim() >= 2
                      and t.shape[1] == T}
-        outs, state = [], initial_state
+        from .chunk import place
+        out, state = None, initial_state
         for s in range(0, T, chunk):
             sl = slice(s, min(T, s + chunk))
             piece = {**kw, **{n: t[:, sl] for n, t in per_token.items()}}
             o, state = fn(q[:, sl], k[:, sl], v[:, sl], initial_state=state, output_final_state=True, **piece)
-            outs.append(o)
-        return torch.cat(outs, 1), (state if output_final_state else None)
+            out = place(out, o, 1, s, T)
+        return out, (state if output_final_state else None)
 
     wrapped._bl_sequence_chunk = chunk
     return wrapped

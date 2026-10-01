@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 from torch.utils.checkpoint import checkpoint
 
-__all__ = ["run_chunked"]
+__all__ = ["run_chunked", "place"]
 
 
 def run_chunked(fn, x: torch.Tensor, chunk: int, dim: int = -2, checkpoint_pieces: bool = True) -> torch.Tensor:
@@ -20,8 +20,20 @@ def run_chunked(fn, x: torch.Tensor, chunk: int, dim: int = -2, checkpoint_piece
     n = x.shape[dim]
     if n <= chunk and not checkpoint_pieces:
         return fn(x)
-    outs = []
+    out = None
     for s in range(0, n, chunk):
         xs = x.narrow(dim, s, min(chunk, n - s))
-        outs.append(checkpoint(fn, xs, use_reentrant=False) if checkpoint_pieces else fn(xs))
-    return torch.cat(outs, dim)
+        y = checkpoint(fn, xs, use_reentrant=False) if checkpoint_pieces else fn(xs)
+        out = place(out, y, dim, s, n)
+    return out
+
+
+def place(out, y: torch.Tensor, dim: int, start: int, total: int) -> torch.Tensor:
+    """Write piece ``y`` at ``start`` along ``dim`` of the output (allocated on the first piece): each piece is freed
+    once copied, instead of all pieces and their concatenation existing at once."""
+    if out is None:
+        shape = list(y.shape)
+        shape[dim] = total
+        out = torch.empty(shape, dtype=y.dtype, device=y.device)
+    out.narrow(dim, start, y.shape[dim]).copy_(y)
+    return out
