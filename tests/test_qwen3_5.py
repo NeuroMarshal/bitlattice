@@ -36,3 +36,27 @@ def test_gated_delta_net_conversion_matches_and_trains():
         outs.append((y.float(), xi.grad.float(), m.in_proj_qkv.weight.grad.float()))
     for a, b in zip(outs[1], outs[0]):
         assert ((a - b).norm() / b.norm()).item() < 3e-2
+
+
+def test_gated_attention_chunks_match_the_model():
+    cfg = transformers.Qwen3_5TextConfig(hidden_size=256, intermediate_size=512, num_hidden_layers=2,
+                                         num_attention_heads=4, num_key_value_heads=2, head_dim=64,
+                                         linear_num_key_heads=2, linear_num_value_heads=6, linear_key_head_dim=64,
+                                         linear_value_head_dim=64, layer_types=["linear_attention", "full_attention"],
+                                         vocab_size=256)
+    torch.manual_seed(0)
+    a = transformers.Qwen3_5ForCausalLM(cfg).cuda().to(torch.bfloat16)
+    b = transformers.Qwen3_5ForCausalLM(cfg).cuda().to(torch.bfloat16)
+    b.load_state_dict(a.state_dict())
+    for m in (a, b):
+        m.config.use_cache = False
+        m.train()
+    assert len(bl.surgery.convert_(b, "*.self_attn", "attention_chunks", chunk=48)) == 1      # the gated one
+    x = torch.randint(0, 256, (2, 130), device="cuda")
+    la, lb = bl.nn.causal_lm_loss(a, x), bl.nn.causal_lm_loss(b, x)
+    la.backward()
+    lb.backward()
+    assert abs(la.item() - lb.item()) < 1e-2
+    for (n, pa), (_, pb) in zip(a.named_parameters(), b.named_parameters()):
+        if pa.grad is not None:
+            assert ((pa.grad.float() - pb.grad.float()).norm() / pa.grad.float().norm().clamp_min(1e-6)) < 5e-2, n

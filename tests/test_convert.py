@@ -128,3 +128,32 @@ def test_unfit_modules_are_skipped_with_a_reason_when_asked(caplog):
     assert "not an RMSNorm convention" in caplog.text and "meta" in caplog.text
     with pytest.raises(TypeError):                # invalid options are never skipped
         bl.surgery.convert_(m, "1", "token_chunks", chunk=4, colour="red", skip_unfit=True)
+
+
+@pytest.mark.parametrize("chunk", [16, 40])
+def test_attention_chunks_reproduce_the_layer_and_its_gradients(chunk):
+    transformers = pytest.importorskip("transformers")
+    cfg = transformers.Qwen3Config(vocab_size=128, hidden_size=128, intermediate_size=256, num_hidden_layers=2,
+                                   num_attention_heads=4, num_key_value_heads=2, head_dim=32)
+    torch.manual_seed(0)
+    a = transformers.Qwen3ForCausalLM(cfg).to(DEV, torch.bfloat16)
+    b = transformers.Qwen3ForCausalLM(cfg).to(DEV, torch.bfloat16)
+    b.load_state_dict(a.state_dict())
+    for m in (a, b):
+        m.config.use_cache = False
+        m.train()
+    done = bl.surgery.convert_(b, "*.self_attn", "attention_chunks", chunk=chunk)
+    assert len(done) == 2 and done[0][2] == "AttentionChunks"
+    x = torch.randint(0, 128, (2, 97), device=DEV)
+    la, lb = bl.nn.causal_lm_loss(a, x), bl.nn.causal_lm_loss(b, x)
+    la.backward()
+    lb.backward()
+    assert abs(la.item() - lb.item()) < 1e-2
+    for (n, pa), (_, pb) in zip(a.named_parameters(), b.named_parameters()):
+        assert torch.allclose(pa.grad.float(), pb.grad.float(), atol=2e-3, rtol=5e-2), n
+    with torch.no_grad():                                # generation with a cache goes to the original layer
+        out = b.generate(x[:1, :8], max_new_tokens=4, do_sample=False, use_cache=True)
+        ref = a.generate(x[:1, :8], max_new_tokens=4, do_sample=False, use_cache=True)
+    assert torch.equal(out, ref)
+    with pytest.raises(TypeError, match="chunk"):
+        bl.surgery.convert_(b, "*.self_attn", "attention_chunks")

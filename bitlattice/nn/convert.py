@@ -23,6 +23,12 @@ Conversions:
                       heads (no repeated copies), optional pieces of ``seq_chunk`` tokens for the delta rule; calls
                       with a cache (generation) go to the original module
     token_chunks      a position-wise module (MLP) over pieces of ``chunk`` tokens, each recomputed in backward
+    attention_chunks  a causal self-attention layer (q/k/v/o projections, optional q/k norms and output gate, e.g.
+                      Qwen3 / Qwen3.5) over pieces of ``chunk`` queries: keys and values are projected once for
+                      all tokens, every query piece (projection, rotary, attention, gate, output projection) is
+                      recomputed in backward -- the layer keeps its input, K and V instead of all its internals;
+                      runs on fused attention kernels only (never a materialized score matrix); calls with a
+                      cache or unknown attention arguments go to the original module
     checkpoint        activation checkpointing of the module: the forward keeps only its inputs, backward
                       recomputes it; ``saved`` ('fp8' / 'nvfp4', lossy) stores the recomputed module's saved
                       tensors compressed, which lowers the per-layer peak (use it instead of the model's own
@@ -46,7 +52,8 @@ from ..select import Selector, select
 
 log = logging.getLogger("bitlattice")
 
-__all__ = ["convert_", "revert_", "conversions", "register_conversion", "Conversion", "Converted", "RMSNorm",
+__all__ = ["convert_", "revert_", "conversions", "register_conversion", "Conversion", "Converted", "Unfit",
+           "AttentionChunks", "RMSNorm",
            "GatedRMSNorm", "GatedDeltaNet", "TokenChunks", "Checkpointed", "CompressedSaves"]
 
 
@@ -169,6 +176,97 @@ class GatedDeltaNet(Converted):
         return f"seq_chunk={self.seq_chunk}"
 
 
+_PLAIN_KWARGS = {"position_ids", "cache_position", "use_cache", "output_attentions", "past_key_values",
+                 "past_key_value"}
+
+
+class AttentionChunks(Converted):
+    def __init__(self, original, chunk: int):
+        super().__init__(original)
+        import sys
+        self.chunk = int(chunk)
+        if self.chunk < 1:
+            raise ValueError("chunk must be >= 1")
+        self._rotary = getattr(sys.modules[type(original).__module__], "apply_rotary_pos_emb")
+        self.n_heads = original.o_proj.in_features // original.head_dim
+        self.gated = original.q_proj.out_features == 2 * original.o_proj.in_features
+
+    def forward(self, hidden_states, position_embeddings, attention_mask=None, **kwargs):
+        m = self.original
+        unknown = set(kwargs) - _PLAIN_KWARGS
+        cache = kwargs.get("past_key_values", kwargs.get("past_key_value"))
+        mask_ok = attention_mask is None or (attention_mask.dim() == 4 and attention_mask.dtype == torch.bool)
+        if unknown or cache is not None or kwargs.get("output_attentions") or not mask_ok:
+            return m(hidden_states, position_embeddings, attention_mask, **kwargs)
+        B, T, _ = hidden_states.shape
+        hd = m.head_dim
+        cos, sin = position_embeddings
+        k = self._norm("k_norm", m.k_proj(hidden_states).view(B, T, -1, hd)).transpose(1, 2)
+        v = m.v_proj(hidden_states).view(B, T, -1, hd).transpose(1, 2)
+        _, k = self._rotary(k[:, :1], k, cos, sin)
+        ckpt = torch.is_grad_enabled() and self.training
+        outs = []
+        for s in range(0, T, self.chunk):
+            e = min(T, s + self.chunk)
+            mask = None if attention_mask is None else attention_mask[:, :, s:e, :e]
+            args = (hidden_states[:, s:e], k[:, :, :e], v[:, :, :e], cos[:, s:e], sin[:, s:e], mask)
+            outs.append(_checkpoint(self._piece, *args, use_reentrant=False) if ckpt else self._piece(*args))
+        return torch.cat(outs, 1), None
+
+    def _norm(self, name: str, x):
+        norm = getattr(self.original, name, None)
+        return x if norm is None else norm(x)
+
+    def _piece(self, x, k, v, cos, sin, mask):
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        from torch.nn.attention.bias import causal_lower_right
+        m = self.original
+        B, L, _ = x.shape
+        hd = m.head_dim
+        qp = m.q_proj(x)
+        if self.gated:
+            q, gate = torch.chunk(qp.view(B, L, -1, 2 * hd), 2, dim=-1)
+            gate = gate.reshape(B, L, -1)
+        else:
+            q, gate = qp.view(B, L, -1, hd), None
+        q = self._norm("q_norm", q).transpose(1, 2)
+        q, _ = self._rotary(q, q[:, :1], cos, sin)
+        bias = causal_lower_right(L, k.shape[2]) if mask is None else mask
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.CUDNN_ATTENTION]):
+            o = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=bias, scale=m.scaling,
+                                                                 enable_gqa=q.shape[1] != k.shape[1])
+        o = o.transpose(1, 2).reshape(B, L, -1)
+        if gate is not None:
+            o = o * torch.sigmoid(gate)
+        return m.o_proj(o)
+
+    def settings(self):
+        return f"chunk={self.chunk}"
+
+
+def _make_attention(m, *, chunk):
+    import sys
+    if not hasattr(sys.modules[type(m).__module__], "apply_rotary_pos_emb"):
+        raise Unfit("its module defines no apply_rotary_pos_emb")
+    if getattr(m, "sliding_window", None):
+        raise Unfit("sliding-window attention")
+    if getattr(m, "attention_dropout", 0.0):
+        raise Unfit("attention dropout")
+    if not getattr(m, "is_causal", True):
+        raise Unfit("not causal")
+    heads = m.o_proj.in_features // m.head_dim
+    if m.q_proj.out_features not in (heads * m.head_dim, 2 * heads * m.head_dim):
+        raise Unfit("q_proj is neither the query nor query + gate projection")
+    return AttentionChunks(m, chunk)
+
+
+def _attention_probe(m, new):
+    T = 2 * new.chunk + 7                                            # several pieces and a ragged last one
+    x = torch.randn(1, T, m.q_proj.in_features, device=_device(m), dtype=_wdtype(m))
+    angle = torch.rand(1, T, m.head_dim, device=_device(m)) * 6.3
+    return x, (angle.cos().to(x.dtype), angle.sin().to(x.dtype)), None
+
+
 class TokenChunks(Converted):
     def __init__(self, original, chunk: int = 2048, dim: int = -2, checkpoint: bool = True):
         super().__init__(original)
@@ -237,13 +335,14 @@ class CompressedSaves(Converted):
 @dataclass(frozen=True)
 class Conversion:
     """``applies(module)``: whether the module can be converted; ``make(module, **options)``: the new module (raises
-    :class:`Unfit` with the reason when it finds that the module does not fit); ``probe(module)``: inputs for the
-    agreement check (None for lossy conversions, which are not checked)."""
+    :class:`Unfit` with the reason when it finds that the module does not fit); ``probe(module, converted)``: inputs
+    for the agreement check, sized to exercise the converted module's options (None for lossy conversions, which
+    are not checked)."""
 
     describe: str
     applies: Callable[[torch.nn.Module], bool]
     make: Callable[..., torch.nn.Module]
-    probe: Callable[[torch.nn.Module], tuple] | None
+    probe: Callable[[torch.nn.Module, torch.nn.Module], tuple] | None
     tol: float = 2e-2
 
 
@@ -297,24 +396,31 @@ _CONVERSIONS: dict[str, Conversion] = {
         "lean RMSNorm (input + one fp32 value per row kept for backward)",
         lambda m: type(m).__name__.endswith("RMSNorm") and getattr(getattr(m, "weight", None), "dim", lambda: 0)() == 1,
         _make_rms,
-        lambda m: (torch.randn(4, m.weight.shape[0], device=_device(m), dtype=_wdtype(m)),)),
+        lambda m, new: (torch.randn(4, m.weight.shape[0], device=_device(m), dtype=_wdtype(m)),)),
     "gated_rms_norm": Conversion(
         "lean normalize-then-gate (SiLU) RMSNorm",
         lambda m: type(m).__name__.endswith("RMSNormGated") and _eps(m) is not None,
         lambda m: GatedRMSNorm(m, _eps(m)),
-        lambda m: (torch.randn(4, m.weight.shape[0], device=_device(m), dtype=_wdtype(m)),
-                   torch.randn(4, m.weight.shape[0], device=_device(m), dtype=_wdtype(m)))),
+        lambda m, new: (torch.randn(4, m.weight.shape[0], device=_device(m), dtype=_wdtype(m)),
+                        torch.randn(4, m.weight.shape[0], device=_device(m), dtype=_wdtype(m)))),
     "gated_delta_net": Conversion(
         "GatedDeltaNet: fused convolution, q / k in their own heads, optional seq_chunk pieces",
         lambda m: all(hasattr(m, k) for k in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "conv1d",
                                               "A_log", "dt_bias", "norm", "out_proj")),
         lambda m, seq_chunk=0: GatedDeltaNet(m, seq_chunk),
-        lambda m: (torch.randn(1, 128, m.hidden_size, device=_device(m), dtype=_wdtype(m)) * 0.5,)),
+        lambda m, new: (torch.randn(1, max(128, 2 * new.seq_chunk + 64), m.hidden_size, device=_device(m),
+                                    dtype=_wdtype(m)) * 0.5,)),
     "token_chunks": Conversion(
         "position-wise module over pieces of `chunk` tokens, each recomputed in backward",
         lambda m: _width(m) is not None,
         lambda m, *, chunk, dim=-2, checkpoint=True: TokenChunks(m, chunk, dim, checkpoint),
-        lambda m: (torch.randn(2, 96, _width(m), device=_device(m), dtype=_wdtype(m)),)),
+        lambda m, new: (torch.randn(2, 2 * new.chunk + 7, _width(m), device=_device(m), dtype=_wdtype(m)),)),
+    "attention_chunks": Conversion(
+        "causal self-attention over pieces of `chunk` queries (K / V projected once), each piece recomputed in "
+        "backward; fused attention kernels only",
+        lambda m: all(hasattr(m, k) for k in ("q_proj", "k_proj", "v_proj", "o_proj", "head_dim", "scaling")),
+        _make_attention,
+        _attention_probe),
     "checkpoint": Conversion(
         "recompute in backward (inputs kept); `saved` packs the recomputed saved tensors ('fp8' / 'nvfp4')",
         lambda m: True,
@@ -398,9 +504,13 @@ def _refusal(conv: Conversion, to: str, m: torch.nn.Module, options: dict, check
     except Unfit as e:
         return str(e)
     if check and conv.probe is not None and next(m.parameters(), torch.empty(0)).device.type != "meta":
-        inputs = conv.probe(m)
+        inputs = conv.probe(m, new)
         with torch.no_grad():
-            ref, out = m(*inputs), new(*inputs)
+            ref = m(*inputs)
+            try:
+                out = new(*inputs)
+            except RuntimeError as e:                    # e.g. no fused kernel for these shapes on this device
+                return f"the {to!r} conversion fails on this module: {str(e).splitlines()[0][:200]}"
         ref = ref[0] if isinstance(ref, tuple) else ref
         out = out[0] if isinstance(out, tuple) else out
         if not _agree(out, ref, conv.tol):
