@@ -5,6 +5,9 @@ processed in chunks, the forward keeps only per-token log-sum-exp values, and th
 logits to form d(hidden) and d(weight). The weight gradient is accumulated in one dense buffer (or returned per
 chunk to a callback for fused updates).
 
+A frozen weight may live in pinned host memory (the ``host_linear`` conversion): it is then streamed to the GPU in row
+tiles, once per group of tokens, overlapped with the computation.
+
 With a frozen output layer (no gradient for the weight and bias) the gradient for ``hidden`` is formed in the forward
 pass instead: one pass over vocabulary tiles with an online softmax (running maximum and sum, as in flash
 attention) accumulates both the log-sum-exp and softmax-weighted rows of the weight, so each tile costs two GEMMs,
@@ -21,47 +24,76 @@ __all__ = ["linear_cross_entropy", "causal_lm_loss"]
 
 
 def _dense(w: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if w.device.type == "cpu" and not isinstance(w, LatticeTensor):
+        return w                                   # host-memory weight: streamed, tiles are cast on the device
     return w.dequantize(dtype) if isinstance(w, LatticeTensor) else w.to(dtype)
 
 
-_VOCAB_TILE_BYTES = 128 << 20          # fp32 logits per vocabulary tile in the gradient-in-forward pass
+_VOCAB_TILE_BYTES = 128 << 20          # fp32 logits per vocabulary tile
+_HOST_TILE_BYTES = 64 << 20            # weight rows per tile streamed from host memory
+_HOST_GROUP_BYTES = 512 << 20          # fp32 [tokens, hidden] accumulator per pass over a host-memory weight
 
 
-def _grad_in_forward(h, W, bias, y, valid, chunk, dtype):
-    """(lse, target logit, d loss_sum / d h) per token with one pass over vocabulary tiles."""
+def _vocab_pass(h, W, bias, y, valid, chunk, dtype, want_grad: bool):
+    """(lse, target logit, d loss_sum / d h or None) per token with passes over vocabulary tiles and an online
+    softmax. A weight on the GPU is read per chunk of tokens; a weight in host memory (a frozen layer converted with
+    ``host_linear``) is streamed to the GPU once per group of tokens (as many as an accumulator of
+    ``_HOST_GROUP_BYTES`` holds; all tokens without a gradient)."""
+    from .stream import stream_rows
     n, d = h.shape
     V = W.shape[0]
+    host = W.device != h.device
     lse = torch.empty(n, dtype=torch.float32, device=h.device)
     tgt = torch.empty(n, dtype=torch.float32, device=h.device)
     gh = torch.empty(n, d, dtype=h.dtype if h.dtype in (torch.bfloat16, torch.float16) else torch.float32,
-                     device=h.device)
-    for s in range(0, n, chunk):
-        hc = h[s:s + chunk].to(dtype)
-        c = hc.shape[0]
+                     device=h.device) if want_grad else None
+    if not host:
+        group = chunk
+    elif want_grad:
+        group = max(chunk, _HOST_GROUP_BYTES // (4 * d) // chunk * chunk)
+    else:
+        group = max(n, 1)
+    for g0 in range(0, n, group):
+        subs = [(s, min(n, g0 + group, s + chunk)) for s in range(g0, min(n, g0 + group), chunk)]
+        c = max(e - s for s, e in subs)
         vt = max(128, min(V, _VOCAB_TILE_BYTES // (4 * c)))
         vt -= vt % 128 if vt < V else 0
-        m = torch.full((c,), float("-inf"), device=h.device)
-        z = torch.zeros(c, device=h.device)
-        acc = torch.zeros(c, d, device=h.device)
-        yc = y[s:s + chunk]
-        tg = torch.zeros(c, device=h.device)
-        for v0 in range(0, V, vt):
-            v1 = min(V, v0 + vt)
-            L = (hc @ W[v0:v1].t()).float()
-            if bias is not None:
-                L += bias[v0:v1].float()
-            inside = (yc >= v0) & (yc < v1)
-            tg += torch.where(inside, L.gather(1, (yc - v0).clamp(0, v1 - v0 - 1)[:, None]).squeeze(1), 0.0)
-            m_new = torch.maximum(m, L.amax(1))
-            r = torch.exp(m - m_new)                                    # rescale of the previous tiles
-            P = L.sub_(m_new[:, None]).exp_()
-            z = z * r + P.sum(1)
-            acc.mul_(r[:, None]).add_((P.to(dtype) @ W[v0:v1].to(dtype)).float())
-            m = m_new
-        lse[s:s + chunk] = m + z.log()
-        tgt[s:s + chunk] = tg
-        g = acc / z[:, None] - W[yc].float()                           # softmax rows minus the target row
-        gh[s:s + chunk] = (g * valid[s:s + chunk, None]).to(gh.dtype)
+        if host:
+            vt = max(128, min(vt, _HOST_TILE_BYTES // (d * W.element_size()) // 128 * 128))
+        st = []
+        for s, e in subs:
+            k = e - s
+            st.append(dict(hc=h[s:e].to(dtype), yc=y[s:e], m=torch.full((k,), float("-inf"), device=h.device),
+                           z=torch.zeros(k, device=h.device), tg=torch.zeros(k, device=h.device),
+                           acc=torch.zeros(k, d, device=h.device) if want_grad else None,
+                           trow=torch.zeros(k, d, dtype=W.dtype, device=h.device) if want_grad and host else None))
+        tiles = (stream_rows(W, vt, h.device) if host else
+                 ((v0, min(V, v0 + vt), W[v0:min(V, v0 + vt)]) for v0 in range(0, V, vt)))
+        for v0, v1, Wt in tiles:
+            for t in st:
+                yc = t["yc"]
+                L = (t["hc"] @ Wt.t()).float()
+                if bias is not None:
+                    L += bias[v0:v1].float()
+                inside = (yc >= v0) & (yc < v1)
+                col = (yc - v0).clamp(0, v1 - v0 - 1)
+                t["tg"] += torch.where(inside, L.gather(1, col[:, None]).squeeze(1), 0.0)
+                if t["trow"] is not None:                       # target rows: exactly one tile holds each
+                    t["trow"] = torch.where(inside[:, None], Wt[col], t["trow"])
+                m_new = torch.maximum(t["m"], L.amax(1))
+                r = torch.exp(t["m"] - m_new)                   # rescale of the previous tiles
+                P = L.sub_(m_new[:, None]).exp_()
+                t["z"] = t["z"] * r + P.sum(1)
+                if want_grad:
+                    t["acc"].mul_(r[:, None]).add_((P.to(dtype) @ Wt.to(dtype)).float())
+                t["m"] = m_new
+        for (s, e), t in zip(subs, st):
+            lse[s:e] = t["m"] + t["z"].log()
+            tgt[s:e] = t["tg"]
+            if want_grad:
+                rows = t["trow"] if host else W[t["yc"]]
+                g = t["acc"] / t["z"][:, None] - rows.float()       # softmax rows minus the target row
+                gh[s:e] = (g * valid[s:e, None]).to(gh.dtype)
     return lse, tgt, gh
 
 
@@ -75,7 +107,7 @@ class _LinearCE(torch.autograd.Function):
             y = labels.reshape(-1)
             valid = y != ignore_index
             ysafe = torch.where(valid, y, torch.zeros_like(y))
-            lse, tgt, gh = _grad_in_forward(h, _dense(weight, dtype), bias, ysafe, valid.float(), chunk, dtype)
+            lse, tgt, gh = _vocab_pass(h, _dense(weight, dtype), bias, ysafe, valid.float(), chunk, dtype, True)
             count = valid.sum().clamp_min(1)
             loss = ((lse - tgt) * valid).sum() / count
             ctx.save_for_backward(gh, count)
@@ -83,34 +115,9 @@ class _LinearCE(torch.autograd.Function):
             return loss
         h = hidden.reshape(-1, hidden.shape[-1])
         y = labels.reshape(-1)
-        W = _dense(weight, dtype)
-        n = h.shape[0]
-        lse = torch.empty(n, dtype=torch.float32, device=h.device)
-        tgt = torch.zeros(n, dtype=torch.float32, device=h.device)
         valid = y != ignore_index
         ysafe = torch.where(valid, y, torch.zeros_like(y))
-        V = W.shape[0]
-        for s in range(0, n, chunk):
-            hc = h[s:s + chunk].to(dtype)
-            c = hc.shape[0]
-            vt = max(128, min(V, _VOCAB_TILE_BYTES // (4 * c)))
-            vt -= vt % 128 if vt < V else 0
-            m = torch.full((c,), float("-inf"), device=h.device)
-            z = torch.zeros(c, device=h.device)
-            yc = ysafe[s:s + chunk]
-            tg = torch.zeros(c, device=h.device)
-            for v0 in range(0, V, vt):                          # online log-sum-exp over vocabulary tiles
-                v1 = min(V, v0 + vt)
-                L = (hc @ W[v0:v1].t()).float()
-                if bias is not None:
-                    L += bias[v0:v1].float()
-                inside = (yc >= v0) & (yc < v1)
-                tg += torch.where(inside, L.gather(1, (yc - v0).clamp(0, v1 - v0 - 1)[:, None]).squeeze(1), 0.0)
-                m_new = torch.maximum(m, L.amax(1))
-                z = z * torch.exp(m - m_new) + L.sub_(m_new[:, None]).exp_().sum(1)
-                m = m_new
-            lse[s:s + chunk] = m + z.log()
-            tgt[s:s + chunk] = tg
+        lse, tgt, _ = _vocab_pass(h, _dense(weight, dtype), bias, ysafe, valid.float(), chunk, dtype, False)
         count = valid.sum().clamp_min(1)
         loss = ((lse - tgt) * valid).sum() / count
         ctx.save_for_backward(hidden, lse, ysafe, valid, count)
@@ -194,7 +201,14 @@ def linear_cross_entropy(hidden: torch.Tensor, weight: torch.Tensor, labels: tor
     """Mean cross-entropy of ``hidden @ weight.T (+ bias)`` against ``labels`` without full logits. Inputs on
     another device than ``weight`` are moved to it (layer-split models)."""
     from ..parallel import to_device
-    hidden, labels = to_device(hidden, weight.device), to_device(labels, weight.device)
+    if weight.device.type == "cpu" and hidden.is_cuda:            # a weight kept in host memory (host_linear)
+        if weight.requires_grad or (bias is not None and bias.requires_grad):
+            raise ValueError("a weight kept in host memory must be frozen: it is streamed to the GPU in tiles and "
+                             "gets no gradient")
+        labels = to_device(labels, hidden.device)
+        bias = None if bias is None else bias.to(hidden.device)
+    else:
+        hidden, labels = to_device(hidden, weight.device), to_device(labels, weight.device)
     dtype = dtype or (hidden.dtype if hidden.dtype in (torch.bfloat16, torch.float16) else torch.float32)
     return _LinearCE.apply(hidden, weight, bias, labels, chunk, ignore_index, dtype)
 

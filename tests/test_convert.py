@@ -193,3 +193,44 @@ def test_host_embedding_refuses_tied_tables():
     bl.surgery.freeze_(m, "*embed_tokens")
     with pytest.raises(ValueError, match="tied"):
         bl.surgery.convert_(m, "*embed_tokens", "host_embedding")
+
+
+def test_host_linear_head_streams_and_matches():
+    transformers = pytest.importorskip("transformers")
+    cfg = transformers.Qwen2Config(vocab_size=1000, hidden_size=64, intermediate_size=128, num_hidden_layers=1,
+                                   num_attention_heads=4, num_key_value_heads=2, tie_word_embeddings=False)
+    torch.manual_seed(0)
+    m = transformers.Qwen2ForCausalLM(cfg).to(DEV, torch.bfloat16)
+    m.config.use_cache = False
+    bl.surgery.freeze_(m, "lm_head")
+    x = torch.randint(0, 1000, (2, 50), device=DEV)
+    labels = x.clone()
+    labels[:, :10] = -100
+    ref = bl.nn.causal_lm_loss(m, x, labels, chunk=16)
+    ref.backward()
+    ref_g = {n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None}
+    m.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        ref_eval = bl.nn.causal_lm_loss(m, x, labels, chunk=16)
+        logits = m(x).logits
+    w = m.lm_head.weight
+    bl.surgery.convert_(m, "lm_head", "host_linear")
+    assert not w.is_cuda and w.is_pinned()
+    import bitlattice.nn.loss as L
+    old = (L._HOST_TILE_BYTES, L._HOST_GROUP_BYTES)
+    L._HOST_TILE_BYTES, L._HOST_GROUP_BYTES = 128 * 64 * 2 * 3, 64 * 4 * 32       # several tiles and token groups
+    try:
+        out = bl.nn.causal_lm_loss(m, x, labels, chunk=16)
+        out.backward()
+        with torch.no_grad():
+            out_eval = bl.nn.causal_lm_loss(m, x, labels, chunk=16)
+    finally:
+        L._HOST_TILE_BYTES, L._HOST_GROUP_BYTES = old
+    assert abs(out.item() - ref.item()) < 1e-3 and abs(out_eval.item() - ref_eval.item()) < 1e-3
+    for n, g in ref_g.items():
+        p = dict(m.named_parameters())[n]
+        assert torch.allclose(p.grad.float(), g.float(), atol=1e-3, rtol=2e-2), n
+    with torch.no_grad():
+        assert torch.allclose(m(x).logits.float(), logits.float(), atol=2e-2, rtol=2e-2)
+    bl.surgery.revert_(m, "lm_head")
+    assert w.is_cuda

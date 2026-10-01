@@ -38,6 +38,9 @@ Conversions:
     host_embedding    a frozen embedding table kept in pinned host memory: lookups gather the rows on the CPU and copy
                       only them to the device of the indices (frees the table's GPU memory, e.g. 2.5 GB for a
                       250k x 5120 vocabulary); refused for trainable or tied tables
+    host_linear       a frozen linear layer (e.g. the output head) whose weight stays in pinned host memory and is
+                      streamed to the GPU in row tiles when used; :func:`linear_cross_entropy` streams it once per
+                      group of tokens (2.5 GB freed for a 250k x 5120 head); refused for trainable or tied weights
     compressed_saves  tensors saved for backward inside the module stored as ``fmt`` ('fp8' or 'nvfp4'; lossy) --
                       for modules that are not recomputed: inside a checkpointed region the hooks would also act in
                       its first pass and keep what checkpointing discards; there use ``checkpoint`` with ``saved``
@@ -54,11 +57,12 @@ import torch
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
 from ..select import Selector, select
+from ..tensor import LatticeTensor
 
 log = logging.getLogger("bitlattice")
 
 __all__ = ["convert_", "revert_", "conversions", "register_conversion", "Conversion", "Converted", "Unfit",
-           "AttentionChunks", "HostEmbedding", "RMSNorm",
+           "AttentionChunks", "HostEmbedding", "HostLinear", "RMSNorm",
            "GatedRMSNorm", "GatedDeltaNet", "TokenChunks", "Checkpointed", "CompressedSaves"]
 
 
@@ -325,6 +329,50 @@ class HostEmbedding(Converted):
         return f"{tuple(self.weight.shape)}, pinned={self.weight.is_pinned()}"
 
 
+class HostLinear(Converted):
+    _TILE_BYTES = 64 << 20
+
+    def __init__(self, original):
+        super().__init__(original)
+        w = self.weight
+        self._device = w.device
+        self.__dict__["_host"] = w.detach().to("cpu").pin_memory() if torch.cuda.is_available() else \
+            w.detach().to("cpu")
+
+    def installed(self):
+        self.weight.data = self.__dict__.pop("_host")
+
+    def forward(self, x):
+        from .stream import stream_rows
+        w = self.__dict__.get("_host", self.weight)
+        rows = max(128, self._TILE_BYTES // (w.shape[1] * w.element_size()) // 128 * 128)
+        b = None if self.original.bias is None else self.original.bias.to(x.device)
+        out = torch.empty(*x.shape[:-1], w.shape[0], dtype=x.dtype, device=x.device)
+        for v0, v1, tile in stream_rows(w, rows, x.device):
+            out[..., v0:v1] = torch.nn.functional.linear(x, tile.to(x.dtype), None if b is None else b[v0:v1])
+        return out
+
+    def restored(self):
+        self.weight.data = self.weight.data.to(self._device)
+        return super().restored()
+
+    def settings(self):
+        return f"{tuple(self.weight.shape)}, pinned={self.weight.is_pinned()}"
+
+
+def _make_host_linear(m):
+    w = m.weight
+    if w.device.type == "meta":
+        raise Unfit("parameters not materialized (meta)")
+    if w.device.type != "cuda":
+        raise Unfit("the weight is not on a GPU")
+    if isinstance(w, LatticeTensor):
+        raise Unfit("quantized weights are not streamed (dequantize it or keep it on the GPU)")
+    if w.requires_grad or (m.bias is not None and m.bias.requires_grad):
+        raise Unfit("the layer is trainable (freeze it first: a streamed weight gets no gradient)")
+    return HostLinear(m)
+
+
 def _make_host_embedding(m):
     w = m.weight
     if w.device.type == "meta":
@@ -498,6 +546,12 @@ _CONVERSIONS: dict[str, Conversion] = {
         _make_host_embedding,
         lambda m, new: (torch.randint(0, m.num_embeddings, (2, 33), device=new._device),),
         tol=0.0, exclusive=True),
+    "host_linear": Conversion(
+        "frozen linear layer with its weight in pinned host memory, streamed to the GPU in row tiles",
+        lambda m: isinstance(m, torch.nn.Linear),
+        _make_host_linear,
+        lambda m, new: (torch.randn(2, 33, m.in_features, device=new._device, dtype=_wdtype(m)),),
+        exclusive=True),
     "checkpoint": Conversion(
         "recompute in backward (inputs kept); `saved` packs the recomputed saved tensors ('fp8' / 'nvfp4')",
         lambda m: True,
