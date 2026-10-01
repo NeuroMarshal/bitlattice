@@ -34,7 +34,9 @@ Conversions:
     checkpoint        activation checkpointing of the module: the forward keeps only its inputs, backward
                       recomputes it; ``saved`` ('fp8' / 'nvfp4', lossy) stores the recomputed module's saved
                       tensors compressed, which lowers the per-layer peak (use it instead of the model's own
-                      gradient checkpointing for these modules)
+                      gradient checkpointing for these modules); ``weights='ram'`` keeps the module's weights in
+                      pinned host memory between its uses and streams them in (bitlattice.nn.offload): about two
+                      modules' weights on the GPU at a time
     host_embedding    a frozen embedding table kept in pinned host memory: lookups gather the rows on the CPU and copy
                       only them to the device of the indices (frees the table's GPU memory, e.g. 2.5 GB for a
                       250k x 5120 vocabulary); refused for trainable or tied tables
@@ -396,6 +398,18 @@ class HostLinear(Converted):
         return f"{tuple(self.weight.shape)}, pinned={self.weight.is_pinned()}"
 
 
+def _make_checkpoint(m, saved=None, min_numel=1 << 16, weights="gpu"):
+    if weights == "ram":
+        from .offload import STREAM_MIN_NUMEL
+        from ..tensor import LatticeTensor
+        on_gpu = [p for p in m.parameters() if p.is_cuda]
+        big = [p for p in on_gpu if (max(v.numel() for v in p.parts().values() if v is not None)
+                                     if isinstance(p, LatticeTensor) else p.numel()) >= STREAM_MIN_NUMEL]
+        if on_gpu and not big:
+            raise Unfit("no parameter large enough to stream")
+    return Checkpointed(m, saved, min_numel, weights)
+
+
 def _make_host_linear(m):
     w = m.weight
     if w.device.type == "meta":
@@ -442,13 +456,41 @@ class Checkpointed(Converted):
     positional or keyword, receive gradients; tensors nested in other arguments (tuples of rotary tables, caches)
     are constants and must not require gradients."""
 
-    def __init__(self, original, saved: str | None = None, min_numel: int = 1 << 16):
+    def __init__(self, original, saved: str | None = None, min_numel: int = 1 << 16, weights: str = "gpu"):
         super().__init__(original)
         from ..memory import SavedSpec
+        if weights not in ("gpu", "ram"):
+            raise ValueError("weights must be 'gpu' or 'ram'")
         self.spec = SavedSpec(saved, min_numel) if saved else None
+        self.weights = weights
+        self.__dict__["residency"] = None
+
+    def installed(self):
+        if self.weights == "ram" and any(p.is_cuda for p in self.parameters()):   # modules of other processes: meta
+            from .offload import Residency
+            self.__dict__["residency"] = Residency(self)
+
+    def restored(self):
+        if self.residency is not None:
+            self.residency.make_resident()
+            self.__dict__["residency"] = None
+        return super().restored()
+
+    def _recompute(self, args, kwargs):
+        if self.spec is not None:
+            from ..memory import compress_saved
+            with compress_saved(self.spec):
+                return self.original(*args, **kwargs)
+        return self.original(*args, **kwargs)
 
     def forward(self, *args, **kwargs):
+        res = self.residency
         if not (torch.is_grad_enabled() and self.training):
+            if res is not None:
+                res.acquire()
+                nxt = res.neighbour(+1)
+                if nxt is not None:
+                    nxt.prefetch()
             return self.original(*args, **kwargs)
         names = [k for k, v in kwargs.items() if isinstance(v, torch.Tensor)]
         rest = {k: v for k, v in kwargs.items() if k not in names}
@@ -463,18 +505,22 @@ class Checkpointed(Converted):
             i = next((k for k, a in enumerate(flat) if isinstance(a, torch.Tensor) and a.is_floating_point()), None)
             if i is not None:
                 flat = (*flat[:i], flat[i].detach().requires_grad_(True), *flat[i + 1:])
+        if res is not None:
+            from .offload import StreamedCheckpoint
+            return StreamedCheckpoint.apply(self, len(args), names, rest, *flat)
         return _checkpoint(functools.partial(self._run, len(args), names, rest), *flat, use_reentrant=True)
 
     def _run(self, n_args, names, rest, *flat):
         args, kwargs = flat[:n_args], {**rest, **dict(zip(names, flat[n_args:]))}
-        if self.spec is not None and torch.is_grad_enabled():            # the recomputation in backward
-            from ..memory import compress_saved
-            with compress_saved(self.spec):
-                return self.original(*args, **kwargs)
+        if torch.is_grad_enabled():                                      # the recomputation in backward
+            return self._recompute(args, kwargs)
         return self.original(*args, **kwargs)
 
     def settings(self):
-        return f"saved={self.spec.fmt if self.spec else 'as is'}"
+        out = f"saved={self.spec.fmt if self.spec else 'as is'}"
+        if self.residency is not None:
+            out += f", weights in RAM ({self.residency.nbytes() / 2 ** 30:.2f} GiB streamed)"
+        return out
 
 
 class CompressedSaves(Converted):
@@ -506,7 +552,9 @@ class Conversion:
     make: Callable[..., torch.nn.Module]
     probe: Callable[[torch.nn.Module, torch.nn.Module], tuple] | None
     tol: float = 2e-2
-    exclusive: bool = False         # the module's parameters must not be shared with other modules (e.g. tied heads)
+    # the module's parameters must not be shared with other modules (e.g. tied heads): a bool, or a function of the
+    # conversion's options
+    exclusive: bool | Callable[[dict], bool] = False
 
 
 class Unfit(ValueError):
@@ -598,10 +646,11 @@ _CONVERSIONS: dict[str, Conversion] = {
         lambda m, new: (torch.randn(2, 33, m.in_features, device=new._device, dtype=_wdtype(m)),),
         exclusive=True),
     "checkpoint": Conversion(
-        "recompute in backward (inputs kept); `saved` packs the recomputed saved tensors ('fp8' / 'nvfp4')",
+        "recompute in backward (inputs kept); `saved` packs the recomputed saved tensors ('fp8' / 'nvfp4'); "
+        "`weights='ram'` keeps the module's weights in host memory, streamed to the GPU around its uses",
         lambda m: True,
-        lambda m, saved=None, min_numel=1 << 16: Checkpointed(m, saved, min_numel),
-        None),
+        _make_checkpoint,
+        None, exclusive=lambda options: options.get("weights") == "ram"),
     "compressed_saves": Conversion(
         "tensors saved for backward inside the module stored as `fmt` ('fp8' / 'nvfp4'; lossy, not checked)",
         lambda m: True,
@@ -659,7 +708,8 @@ def convert_(model: torch.nn.Module, target: Selector, to: str, *, check: bool =
         raise ValueError(f"no module matches {target!r}")
     plan = []
     for name, m in chosen:
-        shared = _shared_with(model, name, m) if conv.exclusive else None
+        exclusive = conv.exclusive(options) if callable(conv.exclusive) else conv.exclusive
+        shared = _shared_with(model, name, m) if exclusive else None
         why = f"its parameters are shared with {shared} (tied)" if shared else _refusal(conv, to, m, options, check)
         if isinstance(why, str):
             if not skip_unfit:
