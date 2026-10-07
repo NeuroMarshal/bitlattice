@@ -23,7 +23,9 @@ Conversions:
                       heads (no repeated copies); ``seq_chunk``: the delta rule over pieces of that many tokens;
                       ``chunk``: the whole layer over pieces of that many tokens (convolution inputs and recurrent
                       state carried between pieces), each piece recomputed in backward -- the layer keeps its input
-                      only; calls with a cache (generation) go to the original module
+                      only; ``precision``: 'bf16' runs fla's kernel on the activations' dtype (as fla / vLLM do),
+                      'fp32' on float32 inputs (as transformers' own implementation without the hub kernel; ~1-2 %
+                      lower perplexity on a 27B model, slower); calls with a cache (generation) go to the original
     token_chunks      a position-wise module (MLP) over pieces of ``chunk`` tokens, each recomputed in backward
     attention_chunks  a causal self-attention layer (q/k/v/o projections, optional q/k norms and output gate, e.g.
                       Qwen3 / Qwen3.5) over pieces of ``chunk`` queries: keys and values are projected once for
@@ -170,8 +172,11 @@ class GatedDeltaNet(Converted):
     _COPY = ("hidden_size", "num_v_heads", "num_k_heads", "head_k_dim", "head_v_dim", "key_dim", "value_dim",
              "conv_kernel_size", "layer_idx", "activation", "layer_norm_epsilon", "conv_dim", "layer_type")
 
-    def __init__(self, original, seq_chunk: int = 0, chunk: int = 0):
+    def __init__(self, original, seq_chunk: int = 0, chunk: int = 0, precision: str = "bf16"):
         super().__init__(original)
+        if precision not in ("bf16", "fp32"):
+            raise ValueError("precision must be 'bf16' or 'fp32'")
+        self.precision = precision
         for k in self._COPY:
             if hasattr(original, k):
                 setattr(self, k, getattr(original, k))
@@ -222,14 +227,18 @@ class GatedDeltaNet(Converted):
         k = k.reshape(B, L, -1, self.head_k_dim)
         v = v.reshape(B, L, -1, self.head_v_dim)
         g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
-        o, state = self._rule(q, k, v, g=g, beta=b.sigmoid(), initial_state=state, output_final_state=not last,
+        beta = b.sigmoid()
+        if self.precision == "fp32":           # the delta rule on float32 inputs, as transformers' own path
+            q, k, v, beta = q.float(), k.float(), v.float(), beta.float()
+        o, state = self._rule(q, k, v, g=g, beta=beta, initial_state=state, output_final_state=not last,
                               use_qk_l2norm_in_kernel=True)
+        o = o.to(x.dtype)
         o = self.norm(o.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)).reshape(B, L, -1)
         keep = self.conv1d.weight.shape[-1] - 1
         return self.out_proj(o), (None if last else ext[:, ext.shape[1] - keep:]), state
 
     def settings(self):
-        return f"seq_chunk={self.seq_chunk}, chunk={self.chunk}"
+        return f"seq_chunk={self.seq_chunk}, chunk={self.chunk}, precision={self.precision}"
 
 
 _PLAIN_KWARGS = {"position_ids", "cache_position", "use_cache", "output_attentions", "past_key_values",
@@ -619,7 +628,7 @@ _CONVERSIONS: dict[str, Conversion] = {
         "over pieces recomputed in backward",
         lambda m: all(hasattr(m, k) for k in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "conv1d",
                                               "A_log", "dt_bias", "norm", "out_proj")),
-        lambda m, seq_chunk=0, chunk=0: GatedDeltaNet(m, seq_chunk, chunk),
+        lambda m, seq_chunk=0, chunk=0, precision="bf16": GatedDeltaNet(m, seq_chunk, chunk, precision),
         lambda m, new: (torch.randn(1, max(128, 2 * max(new.seq_chunk, new.chunk) + 64), m.hidden_size,
                                     device=_device(m), dtype=_wdtype(m)) * 0.5,)),
     "token_chunks": Conversion(

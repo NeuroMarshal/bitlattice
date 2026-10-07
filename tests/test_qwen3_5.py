@@ -81,3 +81,19 @@ def test_gated_delta_net_layer_pieces_match(chunk):
                      m.A_log.grad.float()))
     for a, b in zip(outs[1], outs[0]):
         assert ((a - b).norm() / b.norm()).item() < 3e-2
+
+
+def test_gated_delta_net_fp32_precision_follows_the_reference_path():
+    import copy
+    errs = {}
+    x = torch.randn(1, 512, 256, device="cuda", dtype=torch.bfloat16)
+    for precision in ("bf16", "fp32"):
+        layer = _layer()
+        orig = copy.deepcopy(layer)
+        holder = torch.nn.ModuleList([layer])
+        bl.surgery.convert_(holder, "0", "gated_delta_net", precision=precision)
+        with torch.no_grad():
+            ref, out = orig(x).float(), holder[0](x).float()
+        errs[precision] = ((out - ref).norm() / ref.norm()).item()
+    assert errs["fp32"] <= errs["bf16"], errs
+    assert errs["fp32"] < 1e-2, errs

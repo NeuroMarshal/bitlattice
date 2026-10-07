@@ -198,18 +198,20 @@ forward, derivative of the expectation), `expect_det`, `ste`, `true`.
 
 ## Status
 
-Version 0.1.0. Implemented:
-- formats; CUDA kernels for the step, dequantization, fused factored direction and NVFP4 activation quantization;
-- tensor subclass and quantization API;
-- optimizer with presets: fused backward, row tiles, sparse embeddings, gradient accumulation, Newton–Schulz
-  variants;
-- optimizer state and activation placement; chunked output layer; module conversions (operating table);
-- layer split and one-process-per-GPU pipeline;
-- FP4 training path (`fp4`, `fp4_all`);
-- checkpoint IO for dense and pre-quantized layouts.
+Version 0.2.0. Implemented:
+- formats; CUDA kernels for the optimizer step, dequantization, NVFP4 / MXFP8 quantization (RTN, SR, MS-EDEN, four
+  over six, Hadamard rotations), RMSNorm, causal convolution, FP8 packing;
+- tensor subclass and quantization API; the operating table (`bl.surgery`) with reversible module conversions;
+- optimizer with presets (Muon variants, NorMuon, low-bit momentum), fused backward, host-memory state;
+- FP4 training recipes (NVIDIA, four over six, Quartet II) with deferred weight gradients; MXFP8 path;
+- long context: chunked loss, token / attention / linear-attention pieces, recomputation with compressed saves,
+  weights streamed from host memory, frozen embedding and output layer in host memory;
+- `bl.Kernels`: every automatic implementation choice can be switched off; `bl.explain`;
+- layer split, one-process-per-GPU pipeline (`bl.Runner`);
+- checkpoint IO for dense and pre-quantized layouts; quantized KV cache.
 
-Verified by fine-tuning Qwen3-0.6B and Qwen3-8B checkpoints. Planned: fused dequantize-GEMM for formats without a
-hardware path, kernels for linear-attention layers of hybrid models, GGUF. See `docs/DESIGN.md`.
+Qwen3.8-27B (NVFP4) on two RTX 5070 Ti: 8 × 1024 tokens at 1 102 tokens/s, 16k context at 722 tokens/s, 32k
+context trains. See `docs/API.md` and `docs/DESIGN.md`.
 
 ## Tests
 
