@@ -34,7 +34,7 @@ from .runner import Memory, Runner
 from .storage import plan
 from .tensor import LatticeTensor, is_lattice
 
-__version__ = "0.2.0rc1"
+__version__ = "0.2.0"
 
 __all__ = [
            "COMPUTE_PRESETS",
