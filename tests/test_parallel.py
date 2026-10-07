@@ -263,3 +263,12 @@ def test_two_gpu_pipelined_equals_single_device(dense_dir):
     # identical first step; later steps differ by the bf16 accumulation order of the micro-batch gradients
     assert abs(a[0] - b[0]) <= 1e-3 * a[0] and b[-1] < 0.8 * b[0]
     assert all(abs(x - y) <= 0.05 * abs(x) for x, y in zip(a, b)), (a, b)
+
+
+def test_interleaved_map_tail_cost_moves_blocks_off_the_head_device():
+    m = transformers.Qwen2ForCausalLM(_config(layers=16)).to(torch.bfloat16)
+    count = lambda dm: sum(1 for k, v in dm.items() if ".layers." in k and v.index == 1)   # noqa: E731
+    a = bl.parallel.interleaved_device_map(m, [0, 1])
+    b = bl.parallel.interleaved_device_map(m, [0, 1], tail_cost=50.0)       # a tiny head made expensive
+    assert count(b) < count(a)
+    assert all(v.index == 1 for k, v in b.items() if k.startswith("lm_head"))

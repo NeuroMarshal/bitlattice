@@ -315,11 +315,14 @@ def _compute_weight(name: str, p: torch.Tensor, embeddings: set) -> int:
     return 0 if id(p) in embeddings or p.dim() < 2 else p.numel()
 
 
-def interleaved_device_map(model: torch.nn.Module, devices=None, chunk: int = 1) -> dict[str, torch.device]:
+def interleaved_device_map(model: torch.nn.Module, devices=None, chunk: int = 1,
+                           tail_cost: float = 1.0) -> dict[str, torch.device]:
     """Place the repeated blocks round-robin in runs of ``chunk`` over ``devices`` (default: all GPUs), with the
     per-device compute balanced: the output head counts as compute, embeddings do not, and the head goes to the last
     device, which receives correspondingly fewer blocks. Modules before the blocks go to the first device, modules
-    after them to the last. Use with :func:`pipelined_causal_lm_loss`."""
+    after them to the last. Compute is estimated by parameter count; ``tail_cost`` scales the estimate of the modules
+    after the blocks (the head, extra heads) relative to a block parameter -- e.g. ~3 for a BF16 head next to FP4
+    blocks. Use with :func:`pipelined_causal_lm_loss`."""
     devices = [torch.device(f"cuda:{d}" if isinstance(d, int) else d)
                for d in (devices if devices is not None else range(torch.cuda.device_count()))]
     blocks = block_list(model)
@@ -336,7 +339,7 @@ def interleaved_device_map(model: torch.nn.Module, devices=None, chunk: int = 1)
     for u in after:
         for p in model.get_submodule(u).parameters(recurse=False):
             if id(p) not in seen:
-                tail += _compute_weight(u, p, set())          # a tied head still costs compute
+                tail += _compute_weight(u, p, set()) * tail_cost      # a tied head still costs compute
     D, L = len(devices), len(layers)
     total = sum(per_layer) + tail
     quota = [total / D] * D

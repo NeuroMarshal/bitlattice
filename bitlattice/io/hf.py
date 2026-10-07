@@ -218,9 +218,19 @@ def _device_plan(path, model, layout, quant, device, device_map, max_memory):
         return (lambda name: dev), None
     from .. import parallel
     if isinstance(device_map, str) and device_map.startswith("interleaved"):
-        chunk = int(device_map.partition(":")[2] or 1)
+        # "interleaved[:chunk][:tail=<cost>]"
+        parts = device_map.split(":")[1:]
+        chunk, opts = 1, {}
+        for x in parts:
+            if "=" in x:
+                k, v = x.split("=", 1)
+                if k != "tail":
+                    raise ValueError(f"unknown interleaved option {k!r} (known: tail)")
+                opts["tail_cost"] = float(v)
+            elif x:
+                chunk = int(x)
         devs = list(max_memory) if max_memory else None
-        device_map = parallel.interleaved_device_map(model, devs, chunk)
+        device_map = parallel.interleaved_device_map(model, devs, chunk, **opts)
     if isinstance(device_map, str):
         if device_map not in ("auto", "balanced"):
             raise ValueError("device_map must be 'auto', 'balanced', 'interleaved[:chunk]' or a dict")
@@ -242,7 +252,7 @@ def load(path_or_id: str, quant: QuantConfig | None = None, *, device: str | tor
     quant       -- QuantConfig for dense weights (None: keep dense in ``dtype``). Pre-quantized checkpoints keep
                    their stored format unless ``requantize`` (dequantize then apply ``quant``).
     device_map  -- None (everything on ``device``), 'auto' / 'balanced' (contiguous split over the GPUs, sized from
-                   the checkpoint headers and ``max_memory``), 'interleaved[:chunk]' (blocks round-robin over the GPUs
+                   the checkpoint headers and ``max_memory``), 'interleaved[:chunk][:tail=cost]' (blocks round-robin over the GPUs
                    for ``bitlattice.parallel.pipelined_causal_lm_loss``) or {module name: device}
     model_cls   -- transformers class to instantiate (default: from config.architectures).
     config      -- model config to use instead of the checkpoint's (e.g. the text part of a multimodal model).
