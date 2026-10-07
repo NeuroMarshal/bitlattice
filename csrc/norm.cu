@@ -52,7 +52,7 @@ __global__ void norm_fwd(const T* __restrict__ x, const T* __restrict__ gate, co
     const float v = f(xr[c]);
     ss += v * v;
   }
-  const float r = rsqrtf(warp_sum(ss) / static_cast<float>(D) + eps);
+  const float r = rsqrtf(warp_sum(ss) * (1.0f / static_cast<float>(D)) + eps);   // as ATen: sum times 1/D
   if (lane == 0) rstd[row] = r;
   T* yr = y + row * D;
   if (gate != nullptr) {
@@ -93,7 +93,7 @@ __global__ void norm_bwd_rows(const T* __restrict__ x, const T* __restrict__ gat
     }
     s += dn * n;
   }
-  const float mean = warp_sum(s) / static_cast<float>(D);
+  const float mean = warp_sum(s) * (1.0f / static_cast<float>(D));
   for (int64_t c = lane; c < D; c += 32) {
     const float n = f(xr[c]) * r;
     const float d = f(dr[c]);
