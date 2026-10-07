@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import fnmatch
 import re
-from typing import Callable, Iterable, Union
+from collections.abc import Callable, Iterable
+from typing import Union
 
 import torch
 
-__all__ = ["Selector", "select", "matches"]
+__all__ = ["Selector", "matches", "select"]
 
 Selector = Union[str, type, torch.nn.Module, Iterable, Callable[[str, torch.nn.Module], bool]]
 

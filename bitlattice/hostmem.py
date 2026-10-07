@@ -16,7 +16,7 @@ import weakref
 
 import torch
 
-__all__ = ["pinned_empty", "to_pinned", "HostPool"]
+__all__ = ["HostPool", "pinned_empty", "to_pinned"]
 
 
 def _unregister(ptr: int) -> None:

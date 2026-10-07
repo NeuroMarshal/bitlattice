@@ -31,11 +31,10 @@ import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
 from . import backend
+from . import parallel as P
 from .kernel_choice import active as active_kernels
 
-from . import parallel as P
-
-__all__ = ["init", "train_step", "is_main"]
+__all__ = ["init", "is_main", "train_step"]
 
 _GROUPS: dict = {}
 _DEBUG = os.environ.get("BL_PIPELINE_DEBUG", "") == "1"
@@ -106,7 +105,7 @@ def _plan(model) -> list[_Segment]:
     emb, head = model.get_input_embeddings(), model.get_output_embeddings()
     if emb.weight is head.weight:
         raise NotImplementedError("tied input and output embeddings are not supported by the pipeline")
-    owner = lambda name: P.device_of(name, dm).index  # noqa: E731
+    owner = lambda name: P.device_of(name, dm).index
     blocks_name = _module_name(model, backbone.layers)
     units = [(("embed",), owner(_module_name(model, emb)))]
     units += [(("block", i), owner(f"{blocks_name}.{i}")) for i in range(len(backbone.layers))]

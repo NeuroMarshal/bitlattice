@@ -19,7 +19,7 @@ from ..quant.config import QuantConfig
 from ..tensor import LatticeTensor
 from . import convert as C
 
-__all__ = ["load", "save", "detect_layout", "export_compressed_tensors"]
+__all__ = ["detect_layout", "export_compressed_tensors", "load", "save"]
 
 _PART_SUFFIXES = ("weight_packed", "weight_scale", "weight_global_scale", "input_global_scale", "weight_scale_2",
                   "input_scale", "weight_scale_inv", "weight_zero_point", "weight_shape", "qweight", "qzeros",

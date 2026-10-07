@@ -54,7 +54,7 @@ class LatticeTensor(torch.Tensor):
     @classmethod
     def from_float(cls, w: torch.Tensor, fmt, method: str = "mse", keep: float = 0.0,
                    keep_dtype: torch.dtype = torch.bfloat16, saliency: torch.Tensor | None = None,
-                   dtype: torch.dtype | None = None) -> "LatticeTensor":
+                   dtype: torch.dtype | None = None) -> LatticeTensor:
         """Quantize a dense tensor. ``keep``: fraction of input columns (of the 2-D view) stored in ``keep_dtype``,
         chosen by ``saliency`` (per column, larger = more important; default: column L2 norm)."""
         fmt = F.get(fmt)
@@ -130,7 +130,7 @@ class LatticeTensor(torch.Tensor):
         return LatticeTensor(inner["packed"], inner["scales"], inner.get("global_scale"), inner.get("zeros"), fmt,
                              shape, dtype, inner.get("hi_idx"), inner.get("hi_val"))
 
-    def _map(self, fn, **kw) -> "LatticeTensor":
+    def _map(self, fn, **kw) -> LatticeTensor:
         p = {k: (fn(v) if v is not None else None) for k, v in self.parts().items()}
         t = LatticeTensor(p["packed"], p["scales"], p["global_scale"], p["zeros"], self.fmt, kw.get("shape", self.shape),
                           kw.get("dtype", self.dtype), p["hi_idx"], p["hi_val"])

@@ -20,7 +20,7 @@ import logging
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache
 from typing import NamedTuple
 
 import torch
@@ -29,9 +29,29 @@ from . import formats as F
 
 log = logging.getLogger("bitlattice")
 
-__all__ = ["Fp4Recipe", "FP4_RECIPES", "Fp4Operand", "Mx8Operand", "is_nvfp4", "fp4_supported", "mxfp8_supported",
-           "fp4_unfit", "mx_unfit", "to_blocked", "quantize_fp4", "fp4_mm", "mx_mm", "rht_last", "nvfp4_linear",
-           "defer_wgrad", "flush_wgrad", "pending_wgrad", "fold_rounded", "clear_shared", "drop_cached"]
+__all__ = [
+    "FP4_RECIPES",
+    "Fp4Operand",
+    "Fp4Recipe",
+    "Mx8Operand",
+    "clear_shared",
+    "defer_wgrad",
+    "drop_cached",
+    "flush_wgrad",
+    "fold_rounded",
+    "fp4_mm",
+    "fp4_supported",
+    "fp4_unfit",
+    "is_nvfp4",
+    "mx_mm",
+    "mx_unfit",
+    "mxfp8_supported",
+    "nvfp4_linear",
+    "pending_wgrad",
+    "quantize_fp4",
+    "rht_last",
+    "to_blocked",
+]
 
 
 @dataclass(frozen=True)
@@ -122,7 +142,7 @@ def is_nvfp4(fmt) -> bool:
 _NVFP4_LEVELS = F.get("nvfp4").levels
 
 
-@lru_cache(maxsize=None)
+@cache
 def mxfp8_supported(device_index: int) -> bool:
     """MXFP8 block-scaled GEMMs (E8M0 scales per 32) through PyTorch on this device (probed once)."""
     if not hasattr(torch, "float8_e8m0fnu"):
@@ -138,7 +158,7 @@ def mxfp8_supported(device_index: int) -> bool:
         return False
 
 
-@lru_cache(maxsize=None)
+@cache
 def fp4_supported(device_index: int) -> bool:
     if not hasattr(torch, "float4_e2m1fn_x2"):
         return False
@@ -213,7 +233,7 @@ def quantize_fp4(x2: torch.Tensor, stochastic: bool = False) -> Fp4Operand:
     return Fp4Operand(packed, scales, g)
 
 
-@lru_cache(maxsize=None)
+@cache
 def _two_level(device_index: int) -> bool:
     """Whether ``torch.nn.functional.scaled_mm`` takes NVFP4 block scales plus a per-tensor scale (applied inside the
     GEMM epilogue); probed once per device."""
@@ -264,7 +284,7 @@ def fp4_mm(a: Fp4Operand, b: Fp4Operand, out_dtype: torch.dtype = torch.bfloat16
 # changes it (which bumps ``_bl_version``); its GEMM-layout scales and its transposed re-quantization are built once
 # per version. The cache is bounded (LRU by bytes) and holds only weak references to the weights.
 
-_OPERANDS: "OrderedDict" = OrderedDict()
+_OPERANDS: OrderedDict = OrderedDict()
 _OPERAND_BYTES = [0]
 OPERAND_CACHE_BYTES = 768 << 20
 
@@ -324,7 +344,7 @@ def weight_t_rotated_operand(w, four_over_six: bool = False) -> Fp4Operand:
     return _cached(w, "wt128_4o6" if four_over_six else "wt128", make)
 
 
-@lru_cache(maxsize=None)
+@cache
 def _hadamard16(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """Orthogonal 16x16 matrix diag(s) H / 4 with a fixed random sign vector s."""
     h = torch.ones(1, 1)
@@ -435,7 +455,7 @@ def nvfp4_linear(x: torch.Tensor, w, bias: torch.Tensor | None = None, recipe: F
 # the consumers share the operands (and the saved x^T: less activation memory as well). Sharing one random rotation
 # and one stochastic draw between consumers keeps every gradient estimate unbiased.
 
-_SHARED: "OrderedDict" = OrderedDict()
+_SHARED: OrderedDict = OrderedDict()
 _SHARED_MAX = 4
 
 
@@ -578,7 +598,7 @@ def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool
 # (the weight-gradient half of a split backward).
 
 _defer_wgrad = [0]
-_PENDING: "OrderedDict" = OrderedDict()             # id(param) -> (weakref(param), [(gt, xt), ...])
+_PENDING: OrderedDict = OrderedDict()             # id(param) -> (weakref(param), [(gt, xt), ...])
 
 
 @contextlib.contextmanager

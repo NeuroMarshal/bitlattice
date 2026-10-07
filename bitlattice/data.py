@@ -14,11 +14,11 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Iterator
+from collections.abc import Iterator
 
 import torch
 
-__all__ = ["TextWindows", "JsonlStream", "encode_example", "IGNORE"]
+__all__ = ["IGNORE", "JsonlStream", "TextWindows", "encode_example"]
 
 IGNORE = -100
 

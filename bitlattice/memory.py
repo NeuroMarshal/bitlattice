@@ -66,7 +66,7 @@ def _is_param(t: torch.Tensor) -> bool:
 
 
 class _Packed:
-    __slots__ = ("kind", "data", "scale", "glob", "shape", "dtype", "rows", "cols", "__weakref__")
+    __slots__ = ("__weakref__", "cols", "data", "dtype", "glob", "kind", "rows", "scale", "shape")
 
 
 _PIECE = 1 << 22            # values per piece when packing / unpacking: float32 temporaries of 16 MiB

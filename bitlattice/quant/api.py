@@ -1,8 +1,8 @@
 """quantize_ / dequantize_: convert the weights of a model in place."""
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable
 
 import torch
 
@@ -10,7 +10,7 @@ from .. import formats as F
 from ..tensor import LatticeTensor
 from .config import QuantConfig
 
-__all__ = ["calibrate", "QuantReport"]
+__all__ = ["QuantReport", "calibrate"]
 
 
 @dataclass
@@ -37,7 +37,7 @@ class QuantReport:
         lines = [f"{len(self.layers)} quantized, {len(self.skipped)} kept dense, "
                  f"{self.bits_per_weight:.3f} bits/weight over quantized layers"]
         for l in self.layers:
-            lines.append(f"  {l.name:60s} {l.format:10s} {str(l.shape):18s} keep={l.keep:<5d} "
+            lines.append(f"  {l.name:60s} {l.format:10s} {l.shape!s:18s} keep={l.keep:<5d} "
                          f"err={l.rel_error:.4f} bits={l.bits_per_weight:.3f}")
         return "\n".join(lines)
 

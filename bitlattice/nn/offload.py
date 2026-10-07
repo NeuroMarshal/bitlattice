@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["Residency", "STREAM_MIN_NUMEL"]
+__all__ = ["STREAM_MIN_NUMEL", "Residency"]
 
 STREAM_MIN_NUMEL = 1 << 16          # parameters (or parts) with fewer elements stay on the GPU
 

@@ -20,7 +20,7 @@ import torch
 
 from ..tensor import LatticeTensor
 
-__all__ = ["linear_cross_entropy", "causal_lm_loss"]
+__all__ = ["causal_lm_loss", "linear_cross_entropy"]
 
 
 def _dense(w: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:

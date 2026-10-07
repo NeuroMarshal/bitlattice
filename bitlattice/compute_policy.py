@@ -24,7 +24,7 @@ import torch
 from .backend import FP4_RECIPES, Fp4Recipe, as_recipe, fp4_unfit, mx_unfit
 from .kernel_choice import Kernels, as_kernels
 
-__all__ = ["Compute", "PRESETS", "as_compute", "compute", "route", "assign_compute_"]
+__all__ = ["PRESETS", "Compute", "as_compute", "assign_compute_", "compute", "route"]
 
 log = logging.getLogger("bitlattice")
 

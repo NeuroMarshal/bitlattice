@@ -54,8 +54,8 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
 from torch.utils.checkpoint import checkpoint as _checkpoint
@@ -65,9 +65,24 @@ from ..tensor import LatticeTensor
 
 log = logging.getLogger("bitlattice")
 
-__all__ = ["convert_", "revert_", "conversions", "register_conversion", "Conversion", "Converted", "Unfit",
-           "AttentionChunks", "HostEmbedding", "HostLinear", "RMSNorm",
-           "GatedRMSNorm", "GatedDeltaNet", "TokenChunks", "Checkpointed", "CompressedSaves"]
+__all__ = [
+    "AttentionChunks",
+    "Checkpointed",
+    "CompressedSaves",
+    "Conversion",
+    "Converted",
+    "GatedDeltaNet",
+    "GatedRMSNorm",
+    "HostEmbedding",
+    "HostLinear",
+    "RMSNorm",
+    "TokenChunks",
+    "Unfit",
+    "conversions",
+    "convert_",
+    "register_conversion",
+    "revert_",
+]
 
 
 class Converted(torch.nn.Module):
@@ -184,6 +199,7 @@ class GatedDeltaNet(Converted):
         if self.chunk < 0 or self.chunk % 64:
             raise ValueError("chunk must be 0 or a positive multiple of 64")
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
         from .sequence import sequence_chunked
         self._rule = sequence_chunked(chunk_gated_delta_rule, self.seq_chunk) if self.seq_chunk else \
             chunk_gated_delta_rule
@@ -252,7 +268,7 @@ class AttentionChunks(Converted):
         self.chunk = int(chunk)
         if self.chunk < 1:
             raise ValueError("chunk must be >= 1")
-        self._rotary = getattr(sys.modules[type(original).__module__], "apply_rotary_pos_emb")
+        self._rotary = sys.modules[type(original).__module__].apply_rotary_pos_emb
         self.n_heads = original.o_proj.in_features // original.head_dim
         self.gated = original.q_proj.out_features == 2 * original.o_proj.in_features
 
@@ -409,8 +425,8 @@ class HostLinear(Converted):
 
 def _make_checkpoint(m, saved=None, min_numel=1 << 16, weights="gpu"):
     if weights == "ram":
-        from .offload import STREAM_MIN_NUMEL
         from ..tensor import LatticeTensor
+        from .offload import STREAM_MIN_NUMEL
         on_gpu = [p for p in m.parameters() if p.is_cuda]
         big = [p for p in on_gpu if (max(v.numel() for v in p.parts().values() if v is not None)
                                      if isinstance(p, LatticeTensor) else p.numel()) >= STREAM_MIN_NUMEL]

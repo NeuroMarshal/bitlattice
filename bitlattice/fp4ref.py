@@ -19,7 +19,7 @@ import torch
 
 from . import reference as R
 
-__all__ = ["hadamard_signs", "rht128", "quantize", "dequantize", "E2M1", "uniform_u"]
+__all__ = ["E2M1", "dequantize", "hadamard_signs", "quantize", "rht128", "uniform_u"]
 
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 E4M3_MAX = 448.0

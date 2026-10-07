@@ -17,7 +17,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass, fields, replace
 
-__all__ = ["Kernels", "kernels", "active", "kernels_available"]
+__all__ = ["Kernels", "active", "kernels", "kernels_available"]
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,7 @@ class Kernels:
     grad_in_forward: bool = True
 
     @classmethod
-    def reference(cls) -> "Kernels":
+    def reference(cls) -> Kernels:
         """Every automatic choice off: the plain implementations."""
         return cls(**{f.name: False for f in fields(cls)})
 

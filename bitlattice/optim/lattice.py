@@ -27,7 +27,7 @@ from ..tensor import LatticeTensor
 
 log = logging.getLogger("bitlattice")
 
-__all__ = ["Lattice", "DEFAULTS", "DIRECTIONS", "MOMENTA", "ROUNDINGS", "SCALE_RULES"]
+__all__ = ["DEFAULTS", "DIRECTIONS", "MOMENTA", "ROUNDINGS", "SCALE_RULES", "Lattice"]
 
 DIRECTIONS = ("muon_block", "muon", "factored", "sinkhorn", "colnorm", "sign", "raw")
 MOMENTA = ("none", "fp32", "ternary", "bf16", "int8", "fp8", "nvfp4")

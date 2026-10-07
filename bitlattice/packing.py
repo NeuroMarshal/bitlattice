@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["pack", "unpack", "sign_extend", "packed_cols", "container_dtype"]
+__all__ = ["container_dtype", "pack", "packed_cols", "sign_extend", "unpack"]
 
 
 def container_dtype(container_bits: int) -> torch.dtype:

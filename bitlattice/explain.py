@@ -8,7 +8,7 @@ import torch
 from .nn.convert import Converted
 from .tensor import LatticeTensor
 
-__all__ = ["explain", "Explanation"]
+__all__ = ["Explanation", "explain"]
 
 
 @dataclass

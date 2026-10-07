@@ -24,7 +24,7 @@ compositions of these, e.g. :func:`extend_vocab`.
 """
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 
@@ -32,10 +32,32 @@ from .nn.convert import Conversion, conversions, convert_, register_conversion, 
 from .select import Selector, select
 from .tensor import LatticeTensor
 
-__all__ = ["values", "assign_", "update_", "resize_", "select_", "set_parameter", "train_rows_", "sync_shapes_",
-           "quantize_", "dequantize_", "convert_", "revert_", "conversions", "register_conversion", "Conversion",
-           "set_compute_", "freeze_", "unfreeze_", "drop_", "replace_", "insert_", "sparse_embeddings_",
-           "extend_vocab", "mean_of_pieces"]
+__all__ = [
+    "Conversion",
+    "assign_",
+    "conversions",
+    "convert_",
+    "dequantize_",
+    "drop_",
+    "extend_vocab",
+    "freeze_",
+    "insert_",
+    "mean_of_pieces",
+    "quantize_",
+    "register_conversion",
+    "replace_",
+    "resize_",
+    "revert_",
+    "select_",
+    "set_compute_",
+    "set_parameter",
+    "sparse_embeddings_",
+    "sync_shapes_",
+    "train_rows_",
+    "unfreeze_",
+    "update_",
+    "values",
+]
 
 Init = str | torch.Tensor | Callable[[torch.Tensor, int, int], torch.Tensor]
 

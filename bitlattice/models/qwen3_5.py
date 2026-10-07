@@ -13,7 +13,7 @@ import torch
 
 from .. import io as bl_io
 
-__all__ = ["load", "MTPHead", "TEXT_KEY_MAP"]
+__all__ = ["TEXT_KEY_MAP", "MTPHead", "load"]
 
 TEXT_KEY_MAP = {r"^model\.visual\.": None, r"^model\.language_model\.": "model."}
 
@@ -21,7 +21,10 @@ TEXT_KEY_MAP = {r"^model\.visual\.": None, r"^model\.language_model\.": "model."
 class MTPHead(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
+        from transformers.models.qwen3_5.modeling_qwen3_5 import (
+            Qwen3_5DecoderLayer,
+            Qwen3_5RMSNorm,
+        )
         cfg = copy.deepcopy(config)
         cfg.layer_types = ["full_attention"] * cfg.num_hidden_layers
         d = cfg.hidden_size

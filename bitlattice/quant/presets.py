@@ -11,7 +11,7 @@ import torch
 
 from .config import QuantConfig, Rule
 
-__all__ = ["default", "accuracy_critical", "aggressive", "skip_blocks", "layer_indices"]
+__all__ = ["accuracy_critical", "aggressive", "default", "layer_indices", "skip_blocks"]
 
 _HEAD_EMBED = (Rule("*lm_head*"), Rule("*embed_tokens*"), Rule("*embed_positions*"), Rule("*wte*"), Rule("*wpe*"))
 

@@ -10,14 +10,22 @@ activations crossing the split points.
 from __future__ import annotations
 
 import re
-from typing import Callable, Mapping
+from collections.abc import Callable, Mapping
 
 import torch
 
 from .tensor import LatticeTensor
 
-__all__ = ["infer_device_map", "interleaved_device_map", "dispatch", "device_of", "block_list", "parse_bytes",
-           "to_device", "pipelined_causal_lm_loss"]
+__all__ = [
+    "block_list",
+    "device_of",
+    "dispatch",
+    "infer_device_map",
+    "interleaved_device_map",
+    "parse_bytes",
+    "pipelined_causal_lm_loss",
+    "to_device",
+]
 
 _UNITS = {"b": 1, "kb": 10 ** 3, "mb": 10 ** 6, "gb": 10 ** 9, "kib": 2 ** 10, "mib": 2 ** 20, "gib": 2 ** 30}
 
@@ -456,4 +464,8 @@ def pipelined_causal_lm_loss(model: torch.nn.Module, input_ids: torch.Tensor, la
     return loss
 
 
-from .pipeline import init, is_main, train_step  # noqa: E402,F401  (re-exported: one process per GPU; see bitlattice.pipeline)
+from .pipeline import (  # noqa: F401  (re-exported: one process per GPU; see bitlattice.pipeline)
+    init,
+    is_main,
+    train_step,
+)

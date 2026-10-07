@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 from torch.utils.checkpoint import checkpoint
 
-__all__ = ["run_chunked", "place"]
+__all__ = ["place", "run_chunked"]
 
 
 def run_chunked(fn, x: torch.Tensor, chunk: int, dim: int = -2, checkpoint_pieces: bool = True) -> torch.Tensor:

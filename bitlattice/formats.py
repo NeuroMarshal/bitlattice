@@ -17,13 +17,24 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
+from functools import cache
 
 import torch
 
 __all__ = [
-    "Format", "TableFormat", "UniformFormat", "NativeFormat", "ScaleSpec",
-    "get", "register", "available", "exmy_values", "table", "uniform", "native", "fit_group",
+    "Format",
+    "NativeFormat",
+    "ScaleSpec",
+    "TableFormat",
+    "UniformFormat",
+    "available",
+    "exmy_values",
+    "fit_group",
+    "get",
+    "native",
+    "register",
+    "table",
+    "uniform",
 ]
 
 SCALE_DTYPES = ("fp32", "fp16", "bf16", "e4m3", "e8m0")
@@ -133,11 +144,11 @@ class TableFormat(Format):
     def max_abs(self) -> float:
         return max(abs(v) for v in self.levels)
 
-    def with_scale(self, **kw) -> "TableFormat":
+    def with_scale(self, **kw) -> TableFormat:
         spec = ScaleSpec(**{**self.scale_spec.__dict__, **kw})
         return TableFormat(self.name, self.bits, self.values, spec, self.init)
 
-    @lru_cache(maxsize=None)
+    @cache
     def tables(self, device: str = "cpu") -> dict[str, torch.Tensor]:
         """Lookup tables used by kernels: decode, rank_of_code, sorted values, canonical code per rank."""
         levels = self.levels
@@ -193,7 +204,7 @@ class UniformFormat(Format):
     def levels(self) -> tuple[float, ...]:
         return tuple(float(k) for k in range(self.qmin, self.qmax + 1))
 
-    def with_scale(self, **kw) -> "UniformFormat":
+    def with_scale(self, **kw) -> UniformFormat:
         spec = ScaleSpec(**{**self.scale_spec.__dict__, **kw})
         return UniformFormat(self.name, self.bits, self.qmin, self.qmax, spec, self.zero_point, self.init)
 

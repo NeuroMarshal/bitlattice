@@ -6,7 +6,7 @@ are multiples of 8; otherwise the reference implementation is used.
 from __future__ import annotations
 
 import math
-from functools import lru_cache
+from functools import cache
 
 import torch
 
@@ -24,7 +24,7 @@ _RULE = {"fixed": 0, "fit": 1, "fit_latent": 2}
 _DIRECTION = {"raw": 0, "sign": 1, "colnorm": 2, "sinkhorn": 3, "factored": 4, "muon": 5, "muon_block": 5}
 
 
-@lru_cache(maxsize=None)
+@cache
 def _empty(device: str, dtype: torch.dtype) -> torch.Tensor:
     return torch.empty(0, dtype=dtype, device=device)
 

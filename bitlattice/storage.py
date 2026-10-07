@@ -12,7 +12,7 @@ import torch
 
 from .tensor import LatticeTensor
 
-__all__ = ["activations_in_ram", "plan", "MemoryPlan", "choose_placement"]
+__all__ = ["MemoryPlan", "activations_in_ram", "choose_placement", "plan"]
 
 AUTO_STATE_FRACTION = 0.25
 

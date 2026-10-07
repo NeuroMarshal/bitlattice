@@ -8,7 +8,7 @@ import torch
 
 from .. import formats as F
 
-__all__ = ["QuantConfig", "Rule", "SKIP"]
+__all__ = ["SKIP", "QuantConfig", "Rule"]
 
 SKIP = "skip"
 
@@ -73,7 +73,7 @@ class QuantConfig:
             fmt = fmt.with_scale(**kw)
         return fmt
 
-    def for_module(self, name: str) -> "QuantConfig | None":
+    def for_module(self, name: str) -> QuantConfig | None:
         """Effective config for a module name, or None if the layer stays dense."""
         for rule in self.rules:
             if rule.matches(name):
@@ -82,5 +82,5 @@ class QuantConfig:
                 return replace(self, rules=(), **rule.action)
         return self
 
-    def with_rules(self, *rules) -> "QuantConfig":
+    def with_rules(self, *rules) -> QuantConfig:
         return replace(self, rules=tuple(rules) + self.rules)

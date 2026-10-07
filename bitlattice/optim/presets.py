@@ -6,7 +6,6 @@ from typing import Any
 
 import torch
 
-
 __all__ = ["PRESETS", "param_groups"]
 
 PRESETS: dict[str, dict[str, Any]] = {

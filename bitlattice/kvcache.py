@@ -24,7 +24,7 @@ from . import _ops
 from . import formats as F
 from . import reference as R
 
-__all__ = ["KVSpec", "QuantizedKVLayer", "quantized_cache", "cache_bytes"]
+__all__ = ["KVSpec", "QuantizedKVLayer", "cache_bytes", "quantized_cache"]
 
 HEADROOM = 4.0
 
@@ -316,7 +316,7 @@ class QuantizedKVLayer(_Base):
             self.batch_select_indices(torch.arange(b, device=self.device).repeat_interleave(repeats))
 
     def nbytes(self) -> dict[str, int]:
-        dense = lambda t: 0 if t is None else t.numel() * t.element_size()  # noqa: E731
+        dense = lambda t: 0 if t is None else t.numel() * t.element_size()
         q = 0
         for spec, store in ((self.k_spec, self.k_store), (self.v_spec, self.v_store)):
             q += dense(getattr(store, "dense", None)) if self._dense(spec) else store.nbytes()
