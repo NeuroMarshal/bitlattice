@@ -8,7 +8,9 @@ from bitlattice import LatticeTensor
 transformers = pytest.importorskip("transformers")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 DEV = "cuda"
-two_gpus = pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+GPUS = min(2, torch.cuda.device_count())
+# Layer splits over the GPUs there are. With one GPU every block stays on it and the split code still runs.
+SPLIT = dict(device_map="auto", max_memory={0: "1MiB", 1: "1MiB"}) if GPUS == 2 else dict(device_map="interleaved")
 
 
 def _config(layers=4, tie=False):
@@ -91,13 +93,11 @@ def test_bitlattice_checkpoint_loads_with_device_map(dense_dir, tmp_path):
         assert torch.equal(m(ids).logits, back(ids).logits.to(DEV))
 
 
-@two_gpus
-def test_two_gpu_split_matches_single_device(dense_dir):
+def test_split_matches_single_device(dense_dir):
     single = bl.io.load(dense_dir, bl.quant.presets.default("nvfp4"), device=DEV)
-    split = bl.io.load(dense_dir, bl.quant.presets.default("nvfp4"), device_map="auto",
-                       max_memory={0: "1MiB", 1: "1MiB"})
+    split = bl.io.load(dense_dir, bl.quant.presets.default("nvfp4"), **SPLIT)
     devs = {p.device.index for p in split.parameters()}
-    assert devs == {0, 1}
+    assert devs == set(range(GPUS))
     ids = _ids()
     with torch.no_grad():
         assert torch.allclose(single(ids).logits, split(ids).logits.to(DEV), atol=1e-2, rtol=1e-2)
@@ -105,9 +105,8 @@ def test_two_gpu_split_matches_single_device(dense_dir):
     assert out.shape == (1, 9)
 
 
-@two_gpus
 @pytest.mark.parametrize("state", ["gpu", "ram"])
-def test_two_gpu_training_equals_single_device(dense_dir, state):
+def test_split_training_equals_single_device(dense_dir, state):
     def run(model):
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
@@ -124,8 +123,7 @@ def test_two_gpu_training_equals_single_device(dense_dir, state):
         return out
 
     a = run(bl.io.load(dense_dir, bl.quant.presets.default("nvfp4"), device=DEV))
-    b = run(bl.io.load(dense_dir, bl.quant.presets.default("nvfp4"), device_map="auto",
-                       max_memory={0: "1MiB", 1: "1MiB"}))
+    b = run(bl.io.load(dense_dir, bl.quant.presets.default("nvfp4"), **SPLIT))
     assert b[-1] < b[0]
     assert all(abs(x - y) <= 1e-2 * abs(x) for x, y in zip(a, b)), (a, b)
 
@@ -241,8 +239,7 @@ def test_pipelined_training_with_checkpointing_and_host_split(dense_dir):
     assert all(p.grad is None for p in m.parameters())
 
 
-@two_gpus
-def test_two_gpu_pipelined_equals_single_device(dense_dir):
+def test_pipelined_equals_single_device(dense_dir):
     def run(model, pipelined):
         model.gradient_checkpointing_enable()
         model.config.use_cache = False

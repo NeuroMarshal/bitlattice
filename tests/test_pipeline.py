@@ -1,4 +1,5 @@
-"""One process per GPU: the interleaved pipeline reproduces single-GPU training (needs two GPUs)."""
+"""One process per GPU: the interleaved pipeline reproduces single-GPU training. With two GPUs the blocks alternate
+between two processes; with one GPU a single process runs the same distributed path."""
 import json
 import os
 import subprocess
@@ -10,8 +11,8 @@ import torch
 import bitlattice as bl
 
 transformers = pytest.importorskip("transformers")
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2,
-                                reason="needs two GPUs")
+GPUS = min(2, torch.cuda.device_count()) if torch.cuda.is_available() else 0
+pytestmark = pytest.mark.skipif(GPUS == 0, reason="needs CUDA")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -32,8 +33,8 @@ def test_two_process_pipeline_matches_single_gpu(dense_dir, tmp_path, activation
     args = ["--model", dense_dir, "--steps", "8", "--batch", "4", "--micro", "2", "--seq", "12", "--preset", "muon",
             "--lr", "3e-3", "--data", "fixed", "--json", str(out), "--activations", activations]
     env = dict(os.environ, PYTHONPATH=ROOT)
-    subprocess.run([sys.executable, "-m", "torch.distributed.run", "--nproc-per-node", "2",
-                    os.path.join(ROOT, "bench", "pipeline_train.py"), *args], check=True, env=env, cwd=ROOT,
+    subprocess.run([sys.executable, "-m", "torch.distributed.run", "--nproc-per-node", str(GPUS),
+                    os.path.join(ROOT, "tests", "pipeline_worker.py"), *args], check=True, env=env, cwd=ROOT,
                    timeout=600)
     piped = json.loads(out.read_text().splitlines()[-1])["losses"]
 
@@ -59,8 +60,8 @@ def _pipe(dense_dir, tmp_path, tag, extra):
     args = ["--model", dense_dir, "--steps", "8", "--batch", "4", "--micro", "2", "--seq", "127", "--preset", "muon",
             "--lr", "3e-3", "--data", "fixed", "--json", str(out)] + extra
     env = dict(os.environ, PYTHONPATH=ROOT)
-    subprocess.run([sys.executable, "-m", "torch.distributed.run", "--nproc-per-node", "2",
-                    os.path.join(ROOT, "bench", "pipeline_train.py"), *args], check=True, env=env, cwd=ROOT,
+    subprocess.run([sys.executable, "-m", "torch.distributed.run", "--nproc-per-node", str(GPUS),
+                    os.path.join(ROOT, "tests", "pipeline_worker.py"), *args], check=True, env=env, cwd=ROOT,
                    timeout=600)
     return json.loads(out.read_text().splitlines()[-1])["losses"]
 
