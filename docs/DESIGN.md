@@ -23,8 +23,8 @@ the neighbouring lattice values. `ĉ = 0` is the represented value.
 
 For a parameter with gradient `G`:
 
-1. `m = momentum(G)` — none, fp32 EMA, or ternary codes with a per-row scale;
-2. `U = direction(m)` — Newton–Schulz orthogonalization (optionally on `b×b` blocks), factored second moment
+1. `m = momentum(G)`: none, fp32 EMA, or ternary codes with a per-row scale;
+2. `U = direction(m)`: Newton–Schulz orthogonalization (optionally on `b×b` blocks), factored second moment
    (row/column EMAs), Sinkhorn, column normalization, sign or identity; `D = U / max(1, RMS(U)/clip)`;
 3. `t = λ·(1 − lr·wd) − lr·D` (in units of the current group scale);
 4. scale refit (table/uniform formats): with `a` the represented levels and `τ = a·(1 − lr·wd) − lr·D/s`,
@@ -52,7 +52,7 @@ rounding uses `frac((bitrev(step mod K) + h_i)/K)`.
   `baddbmm` iterations; options: coefficient schedule (`muon` fixed quintic, or `polar_express`: per-iteration
   minimax schedule of Amsel et al. 2025 with a 1.05 safety factor), block shape (square or `(rows, cols)`), dtype
   (bf16, fp16, fp32) and algorithm (`standard`, or `gram`: iterate on the Gram matrix `R = XXᵀ` and accumulate the
-  polynomial, restarted after two steps, after Zhang, Amsel, Chen and Dao 2026 — mathematically the same result,
+  polynomial, restarted after two steps, after Zhang, Amsel, Chen and Dao 2026; mathematically the same result,
   fewer FLOPs for wide blocks; `auto` uses it for aspect ≥ 2 outside bf16).
 * `quantize_nvfp4`: activations → E2M1 codes with E4M3 block scales (16 elements) and a per-tensor fp32 global
   scale; ties go to the lower value, as everywhere in the library.
