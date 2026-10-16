@@ -420,6 +420,55 @@ def _block_inputs(backbone: torch.nn.Module, blocks, input_ids: torch.Tensor | N
 _NORM_NAMES = ("norm", "final_layernorm", "ln_f", "final_norm", "norm_f")
 
 
+class _Deferral:
+    """A window of deferred fused updates around the backward of one block for one micro-batch."""
+
+    __slots__ = ("open",)
+
+    def __init__(self):
+        self.open = False
+
+    def close(self):
+        if self.open:
+            from .optim.lattice import defer_fused_updates
+            self.open = False
+            defer_fused_updates(-1)
+
+
+class _OpenDeferral(torch.autograd.Function):
+    """Identity placed after a block; its backward opens the window. The window also closes when the backward pass
+    ends, in case the backward never reaches the block's input (a gradient asked only for some parameters)."""
+
+    @staticmethod
+    def forward(ctx, x, window):
+        ctx.window = window
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        window = ctx.window
+        if not window.open:
+            from .optim.lattice import defer_fused_updates
+            window.open = True
+            defer_fused_updates(+1)
+            torch.autograd.Variable._execution_engine.queue_callback(window.close)
+        return grad, None
+
+
+class _CloseDeferral(torch.autograd.Function):
+    """Identity placed before the same block; its backward closes the window."""
+
+    @staticmethod
+    def forward(ctx, x, window):
+        ctx.window = window
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        ctx.window.close()
+        return grad, None
+
+
 def pipelined_causal_lm_loss(model: torch.nn.Module, input_ids: torch.Tensor, labels: torch.Tensor | None = None,
                              micro: int = 4, chunk: int = 1024, **kwargs) -> torch.Tensor:
     """Next-token loss of a Hugging Face decoder-only LM, computed block-major over ``micro`` micro-batches.
@@ -449,8 +498,15 @@ def pipelined_causal_lm_loss(model: torch.nn.Module, input_ids: torch.Tensor, la
         for m in range(len(states)):
             kw = per_dev[m][i]
             kw = per_dev[m][i] = _move(kw, dev)
-            out = block(states[m], **kw)
+            # A reentrant checkpoint runs a block's backward once per micro-batch, and fused optimizers would update
+            # after each. The backward visits the micro-batches last to first, so every one but the first is wrapped
+            # in a window of deferred updates and the update after micro-batch 0 sees the whole gradient.
+            window = _Deferral() if m > 0 and torch.is_grad_enabled() and states[m].requires_grad else None
+            x = _CloseDeferral.apply(states[m], window) if window else states[m]
+            out = block(x, **kw)
             out = out[0] if isinstance(out, tuple) else out
+            if window and out.requires_grad:
+                out = _OpenDeferral.apply(out, window)
             # send each micro-batch on as soon as it is computed, so the next device starts on it while this one
             # works on the following micro-batch
             states[m] = to_device(out, nxt)

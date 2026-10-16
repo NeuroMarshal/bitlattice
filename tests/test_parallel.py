@@ -272,3 +272,32 @@ def test_interleaved_map_tail_cost_moves_blocks_off_the_head_device():
     b = bl.parallel.interleaved_device_map(m, [0, 1], tail_cost=50.0)       # a tiny head made expensive
     assert count(b) < count(a)
     assert all(v.index == 1 for k, v in b.items() if k.startswith("lm_head"))
+
+
+@pytest.mark.parametrize("checkpointing", ["transformers", "bitlattice"])
+def test_pipelined_fused_updates_wait_for_every_micro_batch_under_reentrant_checkpointing(dense_dir, checkpointing):
+    """A reentrant checkpoint runs each block's backward once per micro-batch; the fused update must still see the
+    gradient of all micro-batches, as without checkpointing."""
+    from bitlattice.optim import lattice
+
+    def run(checkpoint):
+        model = bl.io.load(dense_dir, bl.quant.presets.default("nvfp4"), device_map="interleaved")
+        if checkpoint == "transformers":
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+        elif checkpoint == "bitlattice":
+            bl.surgery.convert_(model, "re:layers\\.\\d+$", "checkpoint")
+        model.config.use_cache = False
+        model.train()
+        opt = bl.optim.Lattice(model, "muon", lr=3e-3, fused_backward=True, seed=0)
+        ids = _ids(b=4)
+        out = []
+        for _ in range(6):
+            loss = bl.parallel.pipelined_causal_lm_loss(model, ids, micro=4)
+            loss.backward()
+            opt.step()
+            out.append(loss.item())
+        return out
+
+    plain, checkpointed = run(None), run(checkpointing)
+    assert lattice._deferred == 0
+    assert all(abs(a - b) <= 1e-3 * a for a, b in zip(plain, checkpointed)), (plain, checkpointed)

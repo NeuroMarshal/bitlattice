@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 from typing import Any
 
 import torch
@@ -27,7 +28,22 @@ from ..tensor import LatticeTensor
 
 log = logging.getLogger("bitlattice")
 
-__all__ = ["DEFAULTS", "DIRECTIONS", "MOMENTA", "ROUNDINGS", "SCALE_RULES", "Lattice"]
+__all__ = ["DEFAULTS", "DIRECTIONS", "MOMENTA", "ROUNDINGS", "SCALE_RULES", "Lattice", "defer_fused_updates"]
+
+# Open windows in which no fused update is applied, across all optimizers and autograd threads.
+_deferred = 0
+_deferred_lock = threading.Lock()
+
+
+def defer_fused_updates(delta: int) -> None:
+    """Opens (+1) or closes (-1) a window in which fused optimizers apply no update: gradients that arrive meanwhile
+    are summed in ``.grad`` and applied by the next arrival outside every window, or by ``step()``. Code that runs
+    the backward of one module several times within one backward pass (reentrant checkpointing over micro-batches)
+    opens a window around all but the last run, so the update sees the whole gradient."""
+    global _deferred
+    with _deferred_lock:
+        _deferred = max(0, _deferred + delta)
+
 
 DIRECTIONS = ("muon_block", "muon", "factored", "sinkhorn", "colnorm", "sign", "raw")
 MOMENTA = ("none", "fp32", "ternary", "bf16", "int8", "fp8", "nvfp4")
@@ -175,7 +191,7 @@ class Lattice(torch.optim.Optimizer):
 
     # ------------------------------------------------------------------------------------------------------------
     def _on_grad(self, p: torch.Tensor) -> None:
-        if p.grad is None or self._defer:
+        if p.grad is None or self._defer or _deferred:
             return
         with torch.no_grad():
             self._update(p, self._group_of[p])
