@@ -1,5 +1,8 @@
 # Design
 
+> This document was written with AI and may contain mistakes. The code and
+> its tests are the reference.
+
 ## Weight representation
 
 A weight is viewed as a 2-D matrix `[rows, cols]` (`cols` = product of trailing dimensions). Its represented

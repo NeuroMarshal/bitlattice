@@ -1,11 +1,17 @@
 # Bitlattice
 
-Training and fine-tuning of PyTorch models directly in low-bit and arbitrary number formats.
+Training and fine-tuning of PyTorch models with the weights kept in a low-bit format the whole time.
 
-Weights stay in their storage format during training (NVFP4, MXFP4, INT2–INT8, FP8, ternary, binary, NF4, any
-ExMy float, custom level tables, BF16/FP16/FP32). There is no full-precision master copy: each weight carries a
-small phase (0–8 bits) that accumulates sub-step updates, and projections back to the format use unbiased
-stochastic rounding. Optimizer state is 0–8 bits per weight instead of 64–96.
+## Why
+
+Low-bit training usually keeps a full-precision master copy of every weight next to the optimizer's moments and
+only casts to the low-bit format for the forward pass. The copy and the moments take 12 to 16 bytes per weight,
+far more than the 4-bit weight itself, and they decide how large a model fits on a GPU.
+
+Bitlattice has no master copy. Weights stay in their storage format during training (NVFP4, MXFP4, INT2–INT8,
+FP8, ternary, binary, NF4, any ExMy float, custom level tables, BF16/FP16/FP32). Each weight carries a small
+phase of 0–8 bits that accumulates updates smaller than one step of the format, and projections back to the
+format use unbiased stochastic rounding. Optimizer state is 0–8 bits per weight instead of 64–96.
 
 Bitlattice extends PyTorch rather than replacing it: a quantized weight is a `torch.Tensor` subclass, models keep
 their `nn.Module` code, and the optimizer is a `torch.optim.Optimizer`.
@@ -149,15 +155,6 @@ before the next one, forward and backward, so one GPU works on block i of micro-
 block i+1 of micro-batch m−1. Each block's gradient is accumulated over the micro-batches and applied at once:
 one block of gradients in memory, the same update as the full batch.
 
-Qwen3-8B NVFP4, 8 × 1024 tokens per step, two RTX 5070 Ti:
-
-| layout | tokens/s |
-|---|---:|
-| one GPU | 1 086 |
-| contiguous split, one process | 818 |
-| pipeline, two processes, 4 micro-batches | 1 729 |
-| same with `fp4_all` compute | 1 953 |
-
 **Single process** (any model, simplest):
 
 ```python
@@ -210,18 +207,26 @@ Version 0.2.0. Implemented:
 - layer split, one-process-per-GPU pipeline (`bl.Runner`);
 - checkpoint IO for dense and pre-quantized layouts; quantized KV cache.
 
-Qwen3.8-27B (NVFP4) on two RTX 5070 Ti: 8 × 1024 tokens at 1 102 tokens/s, 16k context at 722 tokens/s, 32k
-context trains. See `docs/API.md` and `docs/DESIGN.md`.
+See `docs/API.md` and `docs/DESIGN.md`.
 
 ## Tests
 
 ```bash
-pytest            # kernels against the reference implementation, tensor subclass, quantization, optimizer, IO
+pytest            # kernels against the reference implementation, tensor subclass, quantization, optimizer, IO,
+                  # training a small model end to end
 python bench/bench_kernels.py                      # kernel timings
-python bench/profile_context.py --model <id>       # peak memory and step time versus context length
+python bench/bench_fp4_layer.py                    # one NVFP4 linear layer per compute policy and FP4 recipe
 python bench/optimizer_ablation.py --variant ...   # optimizer options on a small byte-level LM
 ```
+
+The tests build small models from random weights and download nothing. Tests of layer splits and the pipeline
+use two GPUs when there are two and run on one otherwise; tests of FP4 and MXFP8 GEMMs need GPUs that have them
+(compute capability 10.0 or 12.0) and are skipped elsewhere.
 
 ## License
 
 MIT
+
+This is a personal project that I build for my own use, with a great deal of help from AI. Much of the code and
+nearly all of the documentation were written with AI, so the documentation may contain mistakes; the code and its
+tests are the reference.

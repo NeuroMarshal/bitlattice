@@ -1,5 +1,8 @@
 # Bitlattice API
 
+> This document was written with AI and may contain mistakes. The code and
+> its tests are the reference.
+
 Principles every part of the library follows.
 
 ## A model stays a model
