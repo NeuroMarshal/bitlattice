@@ -15,10 +15,9 @@ dependencies = ["torch>=2.6", "safetensors>=0.4"]
 [project.optional-dependencies]
 hf = ["transformers>=4.45", "accelerate>=0.30", "huggingface_hub>=0.23"]
 test = ["pytest>=8"]
-bench = ["pyarrow>=14"]
 
-[tool.setuptools]
-packages = ["bitlattice", "bitlattice.quant", "bitlattice.optim", "bitlattice.nn", "bitlattice.io"]
+[tool.setuptools.packages.find]
+include = ["bitlattice*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
