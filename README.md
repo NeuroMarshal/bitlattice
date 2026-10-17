@@ -1,20 +1,77 @@
 # Bitlattice
 
-Training and fine-tuning of PyTorch models with the weights kept in a low-bit format the whole time.
+> **USE AT YOUR OWN RISK.** This is a personal research project, not a product. Much of the code and nearly all
+> of the documentation were written with AI, so the documentation may contain mistakes; the code and its tests are
+> the reference. Nothing here is guaranteed to be stable, correct or fit for any purpose, and the license gives no
+> warranty. Whatever you do with it, including training models you rely on, is at your own risk.
+
+Bitlattice is an extension of PyTorch for training and fine-tuning models whose weights stay in a low-bit format
+the whole time. It works on ordinary `nn.Module` models and loads Hugging Face safetensors checkpoints, including
+ones already quantized with NVIDIA ModelOpt, compressed-tensors, GPTQ or AWQ, and trains all of their weights in
+place.
 
 ## Why
 
-Low-bit training usually keeps a full-precision master copy of every weight next to the optimizer's moments and
-only casts to the low-bit format for the forward pass. The copy and the moments take 12 to 16 bytes per weight,
-far more than the 4-bit weight itself, and they decide how large a model fits on a GPU.
+The goal is a full fine-tune of a large language model on consumer GPUs: every weight trained, not a low-rank
+adapter on top of frozen weights. In short, a model that runs on your GPUs for inference can be trained on them too.
 
-Bitlattice has no master copy. Weights stay in their storage format during training (NVFP4, MXFP4, INT2 to INT8,
-FP8, ternary, binary, NF4, any ExMy float, custom level tables, BF16/FP16/FP32). Each weight carries a small
-phase of 0 to 8 bits that accumulates updates smaller than one step of the format, and projections back to the
-format use unbiased stochastic rounding. Optimizer state is 0 to 8 bits per weight instead of 64 to 96.
+Low-bit training usually keeps a full-precision master copy of every weight next to the optimizer's moments and only
+casts to the low-bit format for the forward pass. The copy and the moments take 12 to 16 bytes per weight, far more
+than a 4-bit weight, and they, not the weights, decide how large a model fits.
 
-Bitlattice extends PyTorch rather than replacing it: a quantized weight is a `torch.Tensor` subclass, models keep
-their `nn.Module` code, and the optimizer is a `torch.optim.Optimizer`.
+Bitlattice has no master copy. Weights stay in their storage format during training, and the optimizer keeps 0 to 8
+bits of state per weight instead of 64 to 96. With that state in host memory, or with the `stateless` preset that
+keeps none (for formats of 8 bits and more), and with each gradient freed as soon as its update is applied, the GPU
+holds little more than for inference: the weights in their format and the activations of the step, which can be
+recomputed or moved to host memory as well. That was enough for a full fine-tune of Qwen3-8B with NVFP4 weights on
+one 16 GB RTX 5070 Ti: the optimizer state took 1.9 GiB, where AdamW would need about 98 GiB for fp32 master weights
+and moments.
+
+Bitlattice also trains Qwen3.8-27B, a hybrid model of the Qwen3.5 family (48 Gated DeltaNet and 16 attention
+blocks), stably in mixed precision with 8192-token sequences on two RTX 5070 Ti with 16 GB each. The weights stay in
+NVFP4 (a ModelOpt checkpoint, 18.3 GiB over the two GPUs), the matrix multiplications run on FP4 tensor cores with
+the `quartet2_fast` recipe, the embeddings and the output head stay in BF16 and frozen, and the optimizer state
+lives in host memory. In that setup steps of 2 × 8192 tokens ran at about 950 tokens/s with 13.5 and 12.9 GiB in use
+on the two GPUs, steps of 8 × 1024 tokens at about 1 100 tokens/s, and contexts of 16k and 32k tokens trained as
+well. In a short run the held-out perplexity fell from 3.70 to 3.49.
+
+These figures come from development runs on that server; the tests do not reproduce them.
+
+## Status
+
+Bitlattice is a research prototype at version 0.2.0.
+
+- Stability is not guaranteed. APIs, file formats and numerical results may change between versions, and there are
+  bugs nobody has found yet.
+- It was developed and tested on a server with two RTX 5070 Ti (compute capability 12.0) and on an RTX 4060
+  Laptop GPU (8.9). Other GPUs, including data-center Blackwell, Hopper and older generations, have not been
+  tested, and neither has more than one machine.
+- Most of the work went into NVFP4: its kernels, the FP4 training recipes and FP4 tensor cores of consumer
+  Blackwell cards. The other formats work, but with fewer measurements behind them.
+- Training across GPUs was tested with decoder-only Hugging Face models (Qwen3 and the Qwen3.5 family).
+
+## How it works
+
+- A quantized weight is `LatticeTensor`, a `torch.Tensor` subclass holding packed codes, group scales
+  and an optional per-tensor scale. Linear and embedding layers have their own autograd functions, so no dense copy
+  of the weight is kept between forward and backward; any other operation dequantizes and runs the dense operator.
+- Each weight carries a phase of 0 to 8 bits: its position between the two neighbouring values the
+  format can represent. Updates smaller than one step of the format accumulate in the phase, and the projection
+  back to the format rounds stochastically, so on average a weight lands where the update put it. Group scales are
+  refit to the updated values within a trust region.
+- The update direction comes from orthogonalization (Newton-Schulz, as in Muon), a factored second
+  moment (as in Adafactor), Sinkhorn normalization, column normalization or the sign, with optional low-bit
+  momentum.
+- By default a layer dequantizes to BF16 and computes exactly. On request it runs its GEMMs on FP4
+  tensor cores, with one of several FP4 training recipes, or on FP8 tensor cores through MXFP8 for any weight
+  format.
+- Optimizer state and activations can live in host memory, layers can be recomputed in backward with
+  their saved tensors compressed, and the loss, MLPs, attention and linear attention can run over pieces of the
+  sequence.
+- A model can be split over GPUs layer by layer, or trained in a pipeline with one process per
+  GPU.
+
+`docs/DESIGN.md` gives the formulas and the kernels, and `docs/API.md` the principles of the interface.
 
 ## Install
 
@@ -195,40 +252,54 @@ compressed-tensors layout (experimental).
 `bl.nn.DiscreteAct(kind, mode)` with kinds `sign`, `step`, `ternary`, `int<k>` and modes `expect` (stochastic
 forward, derivative of the expectation), `expect_det`, `ste`, `true`.
 
-## Status
-
-Version 0.2.0. Implemented:
-- formats; CUDA kernels for the optimizer step, dequantization, NVFP4 / MXFP8 quantization (RTN, SR, MS-EDEN, four
-  over six, Hadamard rotations), RMSNorm, causal convolution, FP8 packing;
-- tensor subclass and quantization API; the operating table (`bl.surgery`) with reversible module conversions;
-- optimizer with presets (Muon variants, NorMuon, low-bit momentum), fused backward, host-memory state;
-- FP4 training recipes (NVIDIA, four over six, Quartet II) with deferred weight gradients; MXFP8 path;
-- long context: chunked loss, token / attention / linear-attention pieces, recomputation with compressed saves,
-  weights streamed from host memory, frozen embedding and output layer in host memory;
-- `bl.Kernels`: every automatic implementation choice can be switched off; `bl.explain`;
-- layer split, one-process-per-GPU pipeline (`bl.Runner`);
-- checkpoint IO for dense and pre-quantized layouts; quantized KV cache.
-
-See `docs/API.md` and `docs/DESIGN.md`.
-
 ## Tests
 
 ```bash
-pytest            # kernels against the reference implementation, tensor subclass, quantization, optimizer, IO,
-                  # training a small model end to end
+pytest
+```
+
+The suite has 696 cases in 26 files. They check the CUDA kernels against reference implementations in Python
+(lattice steps across formats and phase widths, NVFP4 and MX quantization, RMSNorm, causal convolution), the
+tensor subclass inside ordinary PyTorch code, quantization rules and presets, the optimizer training in quantized
+and native formats, checkpoint loading for dense and pre-quantized layouts, layer conversions, the chunked loss,
+compressed and offloaded activations, the quantized KV cache, layer splits, the pipeline, and a small language
+model trained from scratch in a low-bit format.
+
+The tests build small models from random weights and download nothing. Layer splits and the pipeline use two GPUs
+when there are two and run on one otherwise. Tests of FP4 and MXFP8 GEMMs need GPUs that have them (compute
+capability 10.0 or 12.0) and are skipped elsewhere: on the RTX 4060 Laptop GPU 637 cases pass and 59 are skipped.
+
+The benchmarks in `bench/` time the kernels and one NVFP4 linear layer and compare optimizer options on a small
+byte-level language model:
+
+```bash
 python bench/bench_kernels.py                      # kernel timings
 python bench/bench_fp4_layer.py                    # one NVFP4 linear layer per compute policy and FP4 recipe
 python bench/optimizer_ablation.py --variant ...   # optimizer options on a small byte-level LM
 ```
 
-The tests build small models from random weights and download nothing. Tests of layer splits and the pipeline
-use two GPUs when there are two and run on one otherwise; tests of FP4 and MXFP8 GEMMs need GPUs that have them
-(compute capability 10.0 or 12.0) and are skipped elsewhere.
+## Research it builds on
+
+- Muon (Jordan et al., 2024): orthogonalized updates with Newton-Schulz iterations; its quintic coefficients are
+  one of the schedules.
+- Polar Express (Amsel et al., 2025): the per-iteration minimax Newton-Schulz schedule.
+- Newton-Schulz on the Gram matrix (Zhang, Amsel, Chen and Dao, 2026): the `gram` algorithm for wide blocks.
+- NorMuon (arXiv 2510.05491): row normalization of the orthogonalized direction.
+- arXiv 2509.23106: Muon keeps working with 8-bit momentum, which the low-bit momentum options rely on.
+- Adafactor (Shazeer and Stern, 2018): the factored second moment.
+- NVIDIA's NVFP4 training recipe: round-to-nearest activations, stochastically rounded gradients and random
+  Hadamard rotations of the weight-gradient operands; the `nvidia` recipe.
+- Four over six: the choice between two NVFP4 block scales; the `4over6` recipe and format suffix.
+- Quartet II: MS-EDEN rounding of gradients with 128-point rotations; the `quartet2` recipes.
+- OCP Microscaling (MX) formats: MXFP8, MXFP6, MXFP4 and the MXFP8 compute path.
+- QLoRA (Dettmers et al., 2023): the NF4 format.
+- GPTQ and AWQ, compressed-tensors and NVIDIA ModelOpt: checkpoint layouts that load without loss.
+- COAT (arXiv 2410.19313): FP8 compression of activations saved for backward.
+- Mini-Sequence Transformer (arXiv 2407.15892), MEMO (arXiv 2407.12117), Seq1F1B (arXiv 2406.03488) and FPDT
+  (arXiv 2408.16978): running layers over pieces of the sequence and keeping fewer activations for long contexts.
+- Gated DeltaNet (Yang et al., 2024): the linear-attention layers of the Qwen3.5 family, run on the kernels of
+  flash-linear-attention.
 
 ## License
 
 MIT
-
-This is a personal project that I build for my own use, with a great deal of help from AI. Much of the code and
-nearly all of the documentation were written with AI, so the documentation may contain mistakes; the code and its
-tests are the reference.
