@@ -8,10 +8,10 @@ Low-bit training usually keeps a full-precision master copy of every weight next
 only casts to the low-bit format for the forward pass. The copy and the moments take 12 to 16 bytes per weight,
 far more than the 4-bit weight itself, and they decide how large a model fits on a GPU.
 
-Bitlattice has no master copy. Weights stay in their storage format during training (NVFP4, MXFP4, INT2–INT8,
+Bitlattice has no master copy. Weights stay in their storage format during training (NVFP4, MXFP4, INT2 to INT8,
 FP8, ternary, binary, NF4, any ExMy float, custom level tables, BF16/FP16/FP32). Each weight carries a small
-phase of 0–8 bits that accumulates updates smaller than one step of the format, and projections back to the
-format use unbiased stochastic rounding. Optimizer state is 0–8 bits per weight instead of 64–96.
+phase of 0 to 8 bits that accumulates updates smaller than one step of the format, and projections back to the
+format use unbiased stochastic rounding. Optimizer state is 0 to 8 bits per weight instead of 64 to 96.
 
 Bitlattice extends PyTorch rather than replacing it: a quantized weight is a `torch.Tensor` subclass, models keep
 their `nn.Module` code, and the optimizer is a `torch.optim.Optimizer`.
@@ -75,7 +75,7 @@ complement for integers), so NVFP4/FP8 checkpoints load without re-encoding. Sca
 |---|---|
 | `format` | target format |
 | `method` | `rtn` or `mse` (per-group clipping search) |
-| `keep` | fraction 0–1 of input channels per layer stored in `keep_dtype` (chosen by saliency) |
+| `keep` | fraction from 0 to 1 of input channels per layer stored in `keep_dtype` (chosen by saliency) |
 | `saliency` | `weight` (column norm) or `activation` (with `bl.quant.calibrate`) |
 | `group`, `scale` | override the scale group and scale dtype |
 | `targets` | module types to quantize (default `nn.Linear`) |
@@ -92,13 +92,14 @@ projections; BF16 channel budget). Groups adapt to layer width where the format 
 
 | option | values |
 |---|---|
-| `direction` | `muon_block` (block-diagonal Newton–Schulz, `block`), `muon`, `factored`, `sinkhorn`, `colnorm`, `sign`, `raw` |
+| `direction` | `muon_block` (block-diagonal Newton-Schulz, `block`), `muon`, `factored`, `sinkhorn`, `colnorm`, `sign`, `raw` |
 | `vector_direction` | direction for 1-D parameters |
-| `phase_bits` | 0–8 |
+| `phase_bits` | 0 to 8 |
 | `rounding` | `sr`, `strat`, `rtn` |
 | `scale_rule` | `fit` (refit group scales to the updated values), `fit_latent`, `fixed` |
-| `momentum` | `none`, `fp32`, `ternary` |
-| `block` | Newton–Schulz block: int (square), `(rows, cols)`, or `(rows, None)` for row bands over the full width |
+| `momentum` | `none`, `fp32`, `bf16`, `int8`, `fp8`, `nvfp4`, `ternary` |
+| `normalize` | `none`, `row` (NorMuon: each row of the direction divided by a running RMS of the row) |
+| `block` | Newton-Schulz block: int (square), `(rows, cols)`, or `(rows, None)` for row bands over the full width |
 | `ns_steps`, `ns_dtype` | iterations; `bf16`, `fp16`, `fp32` |
 | `ns_coeffs` | `muon` (fixed quintic), `polar_express` (per-iteration schedule) |
 | `ns_algo` | `auto`, `standard`, `gram` (Gram-matrix iteration, fewer FLOPs for wide blocks) |
@@ -114,9 +115,10 @@ Presets:
 
 | preset | direction | phase | use |
 |---|---|---|---|
-| `muon` | block Newton–Schulz | 2 bits | default; 4–16-bit formats |
-| `muon_fast` | Gram Newton–Schulz on 256-row bands (fp16, Polar Express) | 2 bits | large models: ~7× cheaper orthogonalization |
-| `muon_precise` | block Newton–Schulz | 8 bits | ternary, binary, 2-bit formats |
+| `muon` | block Newton-Schulz | 2 bits | default; 4- to 16-bit formats |
+| `muon_fast` | Gram Newton-Schulz on 256-row bands (fp16, Polar Express) | 2 bits | large models: ~7× cheaper orthogonalization |
+| `normuon`, `normuon_fast` | as `muon` and `muon_fast`, rows normalized (NorMuon) | 2 bits | evens out step sizes between neurons |
+| `muon_precise` | block Newton-Schulz | 8 bits | ternary, binary, 2-bit formats |
 | `light` | factored | 1 bit | minimal state |
 | `balanced` | factored | 2 bits | |
 | `precise` | factored | 8 bits | hard formats and tasks |
@@ -152,7 +154,7 @@ for batch in data:
 
 Blocks alternate between the GPUs, and each process loads only its own. Every block processes all micro-batches
 before the next one, forward and backward, so one GPU works on block i of micro-batch m while the other works on
-block i+1 of micro-batch m−1. Each block's gradient is accumulated over the micro-batches and applied at once:
+block i+1 of micro-batch m-1. Each block's gradient is accumulated over the micro-batches and applied at once:
 one block of gradients in memory, the same update as the full batch.
 
 **Single process** (any model, simplest):
