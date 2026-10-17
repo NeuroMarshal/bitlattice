@@ -51,7 +51,6 @@ def test_quantized_load_matches_quantize_after_load(dense_dir):
         assert torch.equal(m(_ids()).logits, ref(_ids()).logits)
 
 
-# --------------------------------------------------------------------------------------------------------------
 # writers of external layouts (from the published specifications), used to build synthetic checkpoints
 
 def _to_i32(x64):

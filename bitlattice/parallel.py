@@ -315,7 +315,6 @@ def dispatch(model: torch.nn.Module, device_map: Mapping[str, torch.device | str
     return model
 
 
-# --------------------------------------------------------------------------------------------------------------
 # interleaved placement + layer-major micro-batch schedule
 
 def _compute_weight(name: str, p: torch.Tensor, embeddings: set) -> int:

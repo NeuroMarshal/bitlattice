@@ -26,7 +26,6 @@ _PART_SUFFIXES = ("weight_packed", "weight_scale", "weight_global_scale", "input
                   "scales", "g_idx")
 
 
-# --------------------------------------------------------------------------------------------------------------
 # checkpoint discovery
 
 def _resolve(path_or_id: str, revision: str | None) -> str:
@@ -92,7 +91,6 @@ def detect_layout(path: str, config) -> dict[str, Any]:
     raise NotImplementedError(f"quantization method {method!r}")
 
 
-# --------------------------------------------------------------------------------------------------------------
 # model skeleton
 
 def _model_class(config, model_cls):
@@ -154,7 +152,6 @@ def _ignored(name: str, patterns) -> bool:
     return False
 
 
-# --------------------------------------------------------------------------------------------------------------
 # loading
 
 _DT_BYTES = {"F64": 8, "I64": 8, "U64": 8, "F32": 4, "I32": 4, "U32": 4, "F16": 2, "BF16": 2, "I16": 2, "U16": 2,
@@ -429,7 +426,6 @@ def _gptq_dense(t, layout, dtype, device):
     return w.t().contiguous().to(dtype)
 
 
-# --------------------------------------------------------------------------------------------------------------
 # bitlattice checkpoints
 
 def _format_spec(fmt: F.Format) -> dict:

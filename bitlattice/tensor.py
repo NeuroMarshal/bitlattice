@@ -48,7 +48,6 @@ class LatticeTensor(torch.Tensor):
     def __init__(self, *args, **kwargs):  # state is set in __new__
         super().__init__()
 
-    # ------------------------------------------------------------------------------------------------------------
     # construction
 
     @classmethod
@@ -72,7 +71,6 @@ class LatticeTensor(torch.Tensor):
         logical = dtype or (w.dtype if w.dtype.is_floating_point else torch.bfloat16)
         return cls(q.packed, q.scales, q.global_scale, q.zeros, fmt, w.shape, logical, hi_idx, hi_val)
 
-    # ------------------------------------------------------------------------------------------------------------
     # views of the storage
 
     @property
@@ -117,7 +115,6 @@ class LatticeTensor(torch.Tensor):
         return (f"LatticeTensor(shape={tuple(self.shape)}, format={self.fmt.name}, dtype={self.dtype}, "
                 f"device={self.device}{keep})")
 
-    # ------------------------------------------------------------------------------------------------------------
     # torch.compile / FX support
 
     def __tensor_flatten__(self):
@@ -137,7 +134,6 @@ class LatticeTensor(torch.Tensor):
         t.compute = self.compute
         return t
 
-    # ------------------------------------------------------------------------------------------------------------
     # operator interception
 
     @classmethod
@@ -195,7 +191,6 @@ class LatticeTensor(torch.Tensor):
         return func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs))
 
 
-# --------------------------------------------------------------------------------------------------------------
 # autograd paths
 
 def _kernels(ctx):

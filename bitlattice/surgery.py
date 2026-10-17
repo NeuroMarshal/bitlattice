@@ -62,7 +62,6 @@ __all__ = [
 Init = str | torch.Tensor | Callable[[torch.Tensor, int, int], torch.Tensor]
 
 
-# --------------------------------------------------------------------------------------------------------------
 # parameter level
 
 def values(p: torch.Tensor) -> torch.Tensor:
@@ -173,7 +172,6 @@ def train_rows_(model: torch.nn.Module, name: str, rows) -> None:
     p.requires_grad_(True)
 
 
-# --------------------------------------------------------------------------------------------------------------
 # module level
 
 def sparse_embeddings_(model: torch.nn.Module) -> int:
@@ -303,7 +301,6 @@ def insert_(model: torch.nn.Module, list_name: str, index: int, new: torch.nn.Mo
     ml.insert(index, new)
 
 
-# --------------------------------------------------------------------------------------------------------------
 # compositions
 
 def mean_of_pieces(pieces: list[list[int]]) -> Callable[[torch.Tensor], None]:

@@ -17,7 +17,6 @@ from .packing import pack, sign_extend, unpack
 M32 = 0xFFFFFFFF
 
 
-# ---------------------------------------------------------------------------------------------------------------
 # counter-based uniform numbers
 
 def hash_uniform(n: int, seed: int, step: int, device, offset: int = 0) -> torch.Tensor:
@@ -52,7 +51,6 @@ def rounding_u(n: int, seed: int, step: int, device, mode: str, strata: int = 16
     raise ValueError(mode)
 
 
-# ---------------------------------------------------------------------------------------------------------------
 # scales
 
 def decode_scales(scales: torch.Tensor, spec: F.ScaleSpec) -> torch.Tensor:
@@ -101,7 +99,6 @@ def group_sum(x: torch.Tensor, spec: F.ScaleSpec) -> torch.Tensor:
     return x.reshape(rows, cols // spec.group, spec.group).sum(-1)
 
 
-# ---------------------------------------------------------------------------------------------------------------
 # codes <-> ranks <-> normalized levels
 
 def num_levels(fmt) -> int:
@@ -140,7 +137,6 @@ def nearest_rank(fmt, x: torch.Tensor, zero: torch.Tensor | None = None) -> torc
     return torch.clamp(torch.round(xk), fmt.qmin, fmt.qmax).long() - fmt.qmin
 
 
-# ---------------------------------------------------------------------------------------------------------------
 # quantize / dequantize
 
 class Quantized(NamedTuple):
@@ -249,7 +245,6 @@ def dequantize(q: Quantized, fmt, dtype=torch.float32) -> torch.Tensor:
     return (rank_level(fmt, rank, ze) * se).to(dtype)
 
 
-# ---------------------------------------------------------------------------------------------------------------
 # projection with a b-bit phase (shared by quantized and native formats)
 
 def _project(t, w, lo, hi, u, bits: int):
@@ -340,7 +335,6 @@ def lattice_step_quantized(q: Quantized, fmt, phase: torch.Tensor | None, D: tor
     return packed, scales, code
 
 
-# ---------------------------------------------------------------------------------------------------------------
 # native floating formats: neighbours by bit pattern
 
 _INT_OF = {torch.bfloat16: torch.int16, torch.float16: torch.int16, torch.float32: torch.int32,
@@ -399,7 +393,6 @@ def lattice_step_native(w: torch.Tensor, phase: torch.Tensor | None, D: torch.Te
     return out, code
 
 
-# ---------------------------------------------------------------------------------------------------------------
 # directions
 
 _PE = ((8.28721201814563, -23.595886519098837, 17.300387312530933),

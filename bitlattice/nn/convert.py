@@ -156,7 +156,7 @@ def _tensors(obj):
             yield from _tensors(x)
 
 
-# ---- module implementations ---------------------------------------------------------------------------------------
+# module implementations
 
 class RMSNorm(Converted):
     def __init__(self, original, eps: float, offset: float, cast_first: bool):
@@ -563,7 +563,7 @@ class CompressedSaves(Converted):
         return f"fmt={self.spec.fmt}"
 
 
-# ---- conversions --------------------------------------------------------------------------------------------------
+# conversions
 
 @dataclass(frozen=True)
 class Conversion:

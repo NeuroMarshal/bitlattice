@@ -261,7 +261,7 @@ struct ScaleOut {
   }
 };
 
-// ---------------------------------------------------------------- row layout: blocks along the last dimension
+// row layout: blocks along the last dimension
 // thread b handles block b; 8 consecutive threads hold one 128-element chunk (cols % 128 == 0 when rotating or EDEN)
 
 template <typename T, bool kAmax>
@@ -295,7 +295,7 @@ __global__ void row_kernel(const T* x, int64_t nblocks, int64_t cols, Opts o, fl
   }
 }
 
-// ---------------------------------------------------------------- column layout: blocks along the first dimension
+// column layout: blocks along the first dimension
 // A CTA of 256 threads takes a tile of 128 rows x 32 columns of the input (coalesced loads into shared memory);
 // thread t then owns column t / 8 and the 16 rows (t % 8) * 16 .. + 15, so 8 consecutive lanes hold one 128-element
 // chunk of a row of the transpose. Output row = input column.
@@ -359,7 +359,7 @@ __global__ void col_kernel(const T* x, int64_t rows, int64_t cols, Fp4Input w, O
   }
 }
 
-// ---------------------------------------------------------------- both layouts from one read (cast-transpose)
+// both layouts from one read (cast-transpose)
 // A CTA of 256 threads stages a 128 x 128 tile of x [M, K] in shared memory and quantizes its rows (operand rows of
 // x, blocks along K) and its columns (operand rows of x^T, blocks along M), each side with its own options. As in
 // the other kernels a thread owns one 16-element block and 8 consecutive lanes one 128-element chunk; the rotation

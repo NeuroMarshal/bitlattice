@@ -279,7 +279,7 @@ def fp4_mm(a: Fp4Operand, b: Fp4Operand, out_dtype: torch.dtype = torch.bfloat16
     return torch.ops.bitlattice.scale_(y, a.global_scale * b.global_scale.float())
 
 
-# ---- per-weight operands, cached while the weight is unchanged ------------------------------------------------
+# per-weight operands, cached while the weight is unchanged
 # A weight is used by the forward, the recomputed forward and the backward of every micro-batch before the optimizer
 # changes it (which bumps ``_bl_version``); its GEMM-layout scales and its transposed re-quantization are built once
 # per version. The cache is bounded (LRU by bytes) and holds only weak references to the weights.
@@ -365,7 +365,7 @@ def _pad_rows(x2: torch.Tensor, multiple: int) -> torch.Tensor:
     return torch.nn.functional.pad(x2, (0, 0, 0, pad)) if pad else x2
 
 
-# ---- recipe-driven quantization of GEMM operands ----------------------------------------------------------------
+# recipe-driven quantization of GEMM operands
 
 _RTN, _SR, _EDEN = 0, 1, 2
 
@@ -449,7 +449,7 @@ def nvfp4_linear(x: torch.Tensor, w, bias: torch.Tensor | None = None, recipe: F
     return y.reshape(*x.shape[:-1], w.shape[0])
 
 
-# ---- one quantization per input shared by its consumers -------------------------------------------------------
+# one quantization per input shared by its consumers
 # Projections reading the same tensor (q / k / v, gate / up) would quantize it once each and save one copy of x^T
 # each for backward. The last few inputs are remembered by identity (weak reference + version counter + recipe), so
 # the consumers share the operands (and the saved x^T: less activation memory as well). Sharing one random rotation
@@ -589,7 +589,7 @@ def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool
     return gx, gw
 
 
-# ---- deferred weight gradients ------------------------------------------------------------------------------------
+# deferred weight gradients
 # With micro-batches, every backward of a layer adds its weight gradient to .grad (a full read-modify-write of the
 # gradient per micro-batch) from a GEMM over that micro-batch's tokens only. Inside ``defer_wgrad()`` the FP4 path of
 # the 128-rotation recipes keeps the quantized operands (Eᵀ, xᵀ: power-of-two global scales) instead; ``flush_wgrad``
@@ -680,7 +680,7 @@ def flush_wgrad(params=None, optimizer=None) -> int:
     return n
 
 
-# ---- MXFP8 path: any weight format on FP8 tensor cores ------------------------------------------------------------
+# MXFP8 path: any weight format on FP8 tensor cores
 
 class Mx8Operand(NamedTuple):
     """A [rows, cols] matrix in MXFP8: E4M3 codes, E8M0 scales per 32 along cols in the GEMM's tiled layout."""

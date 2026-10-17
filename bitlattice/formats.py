@@ -222,7 +222,6 @@ class NativeFormat(Format):
         return torch.finfo(self.dtype).bits
 
 
-# ----------------------------------------------------------------------------------------------------------------
 # constructors
 
 def exmy_values(e: int, m: int, bias: int | None = None, special: str = "none") -> tuple[float, ...]:

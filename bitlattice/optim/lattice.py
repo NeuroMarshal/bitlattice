@@ -189,7 +189,6 @@ class Lattice(torch.optim.Optimizer):
                 if p.requires_grad:
                     self._hooks.append(p.register_post_accumulate_grad_hook(self._on_grad))
 
-    # ------------------------------------------------------------------------------------------------------------
     def _on_grad(self, p: torch.Tensor) -> None:
         if p.grad is None or self._defer or _deferred:
             return
@@ -230,7 +229,6 @@ class Lattice(torch.optim.Optimizer):
         finally:
             self._defer -= 1
 
-    # ------------------------------------------------------------------------------------------------------------
     # host-memory state
 
     _OFFLOAD = ("phase", "hi_phase", "m", "mq", "mb", "m8", "m8s", "m4p", "m4s", "m4g")
@@ -323,7 +321,6 @@ class Lattice(torch.optim.Optimizer):
             h.remove()
         self._hooks.clear()
 
-    # ------------------------------------------------------------------------------------------------------------
     def _momentum(self, G: torch.Tensor, st: dict, g: dict, pid: int) -> torch.Tensor:
         mode = g["momentum"]
         if mode == "none":
@@ -449,7 +446,6 @@ class Lattice(torch.optim.Optimizer):
             self._update_native(p, p.data, D, st, "phase", kw)
         self._send_back(p, st)
 
-    # ------------------------------------------------------------------------------------------------------------
     # row tiles: bounded transient memory for large matrices (same result as the untiled update)
 
     def _tileable(self, p: torch.Tensor, g: dict) -> bool:
@@ -509,7 +505,6 @@ class Lattice(torch.optim.Optimizer):
         if quant:
             p.scales.copy_(torch.cat(new_scales, 0))
 
-    # ------------------------------------------------------------------------------------------------------------
     # row-sparse gradients (embeddings): only the referenced rows are updated
 
     def _sparse_ok(self, p: torch.Tensor, g: dict) -> bool:
@@ -613,7 +608,6 @@ class Lattice(torch.optim.Optimizer):
         if bits:
             st["phase"].copy_(pack(code.to(torch.int32) & ((1 << bits) - 1), cb))
 
-    # ------------------------------------------------------------------------------------------------------------
     def state_bits(self) -> dict[str, float]:
         """Logical optimizer state in bits, by component (phase, factors, momentum)."""
         out = {"phase": 0.0, "factors": 0.0, "momentum": 0.0}

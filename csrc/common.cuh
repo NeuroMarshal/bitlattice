@@ -16,7 +16,6 @@ enum ScaleDtype : int { kF32 = 0, kF16 = 1, kBF16 = 2, kE4M3 = 3, kE8M0 = 4 };
 enum Rounding : int { kSR = 0, kStrat = 1, kRTN = 2 };
 enum ScaleRule : int { kFixed = 0, kFitRepresented = 1, kFitLatent = 2 };
 
-// ---------------------------------------------------------------------------------------------------------------
 // RNG: identical to bitlattice.reference.hash_uniform
 __device__ __forceinline__ float hash_uniform(uint64_t idx, uint32_t seed, uint32_t step) {
   uint32_t key = seed * 0x9E3779B1u + step * 0x85EBCA77u;
@@ -46,7 +45,6 @@ __device__ __forceinline__ float rounding_u(const RoundParams& rp, uint64_t idx)
   return 0.5f;
 }
 
-// ---------------------------------------------------------------------------------------------------------------
 // scale codecs; scales are addressed as raw bytes of their storage dtype
 __device__ __forceinline__ float decode_scale(const void* p, int64_t i, int dt) {
   switch (dt) {
@@ -103,7 +101,6 @@ __device__ __forceinline__ void store_scale(void* p, int64_t i, int dt, uint32_t
   }
 }
 
-// ---------------------------------------------------------------------------------------------------------------
 // packed access for a chunk of kEPT consecutive elements starting at a multiple of kEPT
 // container bits cb in {1,2,4,8,16,32}; returns raw (unsigned) patterns
 __device__ __forceinline__ void load_codes(const uint8_t* base, int64_t chunk, int cb, uint32_t out[kEPT]) {
@@ -160,7 +157,6 @@ __device__ __forceinline__ int sign_extend(uint32_t raw, int bits) {
   return (raw >> (bits - 1)) ? static_cast<int>(raw) - (1 << bits) : static_cast<int>(raw);
 }
 
-// ---------------------------------------------------------------------------------------------------------------
 // lattice description passed by value to kernels
 struct Lattice {
   int kind;            // Kind

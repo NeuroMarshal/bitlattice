@@ -153,7 +153,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> bl_mx_quantize2(at::T
   return {rc.view(f8), rs.view(at::kFloat8_e8m0fnu), cc.view(f8), cs.view(at::kFloat8_e8m0fnu)};
 }
 
-// ---------------------------------------------------------------- flat packing (saved activations)
+// flat packing (saved activations)
 // Contiguous values in groups of 32 -> E4M3 codes and E8M0 scales (rounded up), and back; no layout requirements
 // beyond the length being a multiple of 32. Eight lanes hold one group (4 values each).
 namespace {

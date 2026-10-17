@@ -227,7 +227,6 @@ __global__ void step_segments(Lattice L, StepParams P, uint8_t* codes, uint8_t* 
   }
 }
 
-// ---------------------------------------------------------------------------------------------------------------
 // native floating formats
 
 template <typename W> struct NativeTraits;
@@ -313,7 +312,6 @@ __global__ void step_native_kernel(W* w, uint8_t* phase, const float* D, int64_t
   }
 }
 
-// ---------------------------------------------------------------------------------------------------------------
 // dequantization
 
 template <typename O>
@@ -342,7 +340,6 @@ __global__ void dequantize_kernel(Lattice L, const uint8_t* codes, O* out, int64
 
 }  // namespace bl
 
-// ---------------------------------------------------------------------------------------------------------------
 // host side
 
 namespace {
