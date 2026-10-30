@@ -46,6 +46,8 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> bl_nvfp4_quantize2(Te
                                                                              std::optional<Tensor> global_scales,
                                                                              bool blocked,
                                                                              std::optional<Tensor> amax_out);
+Tensor bl_swiglu_fwd(Tensor g, Tensor u);
+std::tuple<Tensor, Tensor> bl_swiglu_bwd(Tensor g, Tensor u, Tensor da);
 Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::optional<Tensor> c, int64_t k, double beta2,
                     int64_t block, int64_t ns_steps, int64_t ns_dtype, int64_t sinkhorn_iters, double clip,
                     int64_t block_cols, int64_t ns_coeffs, int64_t ns_algo, std::optional<Tensor> row_state,
@@ -88,6 +90,8 @@ TORCH_LIBRARY(bitlattice, m) {
   m.def("mx_unpack(Tensor codes, Tensor scales, ScalarType dtype) -> Tensor");
   m.def("mx_quantize2(Tensor x, bool row=True, bool col=False, bool e5m2=False, bool blocked=False) "
         "-> (Tensor, Tensor, Tensor, Tensor)");
+  m.def("swiglu_fwd(Tensor g, Tensor u) -> Tensor");
+  m.def("swiglu_bwd(Tensor g, Tensor u, Tensor da) -> (Tensor, Tensor)");
   m.def("causal_conv1d_fwd(Tensor x, Tensor weight, Tensor? bias, bool silu_act) -> Tensor");
   m.def("causal_conv1d_bwd(Tensor x, Tensor weight, Tensor? bias, Tensor dy, bool silu_act) -> (Tensor, Tensor, Tensor)");
   m.def("rms_norm_fwd(Tensor x, Tensor? gate, Tensor w, float eps, float offset, bool cast_first) -> (Tensor, Tensor)");
@@ -109,6 +113,8 @@ TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
   m.impl("nvfp4_quantize", &bl_nvfp4_quantize);
   m.impl("nvfp4_quantize2", &bl_nvfp4_quantize2);
   m.impl("causal_conv1d_fwd", &bl_causal_conv1d_fwd);
+  m.impl("swiglu_fwd", &bl_swiglu_fwd);
+  m.impl("swiglu_bwd", &bl_swiglu_bwd);
   m.impl("mx_quantize2", &bl_mx_quantize2);
   m.impl("mx_pack", &bl_mx_pack);
   m.impl("mx_unpack", &bl_mx_unpack);
