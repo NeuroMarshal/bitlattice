@@ -136,10 +136,15 @@ class Lattice(torch.optim.Optimizer):
                    memory of a device; the choice is logged and kept in ``self.state_placement``)
     ``fused_backward``  apply each parameter's update as soon as its gradient is accumulated and free the gradient
                    (the optimizer step then only advances the step counter); peak memory holds one gradient
+    ``overlap``    run the updates on a side stream of each device, so they overlap the computation issued after
+                   them (the rest of the backward pass); the same updates, in the same order. A gradient lives until
+                   its update has run; ``step()`` (or :meth:`wait`) makes the device's work wait for the pending
+                   updates, so the next use of the weights sees them
     """
 
     def __init__(self, params, preset: str | None = None, *, lr: float = DEFAULTS["lr"], state: str = "gpu",
-                 fused_backward: bool = False, seed: int = 0, weight_decay: float = 0.0, **options):
+                 fused_backward: bool = False, seed: int = 0, weight_decay: float = 0.0, overlap: bool = False,
+                 **options):
         from .presets import PRESETS, param_groups
         if preset is not None:
             if preset not in PRESETS:
@@ -168,6 +173,8 @@ class Lattice(torch.optim.Optimizer):
         state_device = "cpu" if state == "ram" else "cuda"
         self.seed = int(seed)
         self.fused_backward = fused_backward
+        self.overlap = overlap
+        self._update_streams: dict = {}   # device -> side stream of the updates (overlap)
         self.state_device = state_device
         self._copy_streams: dict = {}     # device -> side stream for host-memory state transfers
         self._host_bufs: dict = {}        # (parameter, state key) -> its exact-size pinned host buffer
@@ -192,10 +199,32 @@ class Lattice(torch.optim.Optimizer):
     def _on_grad(self, p: torch.Tensor) -> None:
         if p.grad is None or self._defer or _deferred:
             return
-        with torch.no_grad():
+        with torch.no_grad(), self._side(p):
             self._update(p, self._group_of[p])
         p.grad = None
         self._done.add(p)
+
+    @contextlib.contextmanager
+    def _side(self, p: torch.Tensor):
+        """With ``overlap``: the update of ``p`` goes to the device's update stream, after everything issued so far
+        on the current stream (which produced the gradient)."""
+        if not (self.overlap and p.is_cuda):
+            yield
+            return
+        cur = torch.cuda.current_stream(p.device)
+        s = self._update_streams.get(p.device)
+        if s is None:
+            s = self._update_streams[p.device] = torch.cuda.Stream(device=p.device)
+        s.wait_stream(cur)
+        with torch.cuda.stream(s):
+            yield
+        if p.grad is not None:
+            p.grad.record_stream(s)            # freed by the caller; its memory is reused only after the update
+
+    def wait(self) -> None:
+        """Make the current stream of every device wait for the updates issued so far (``overlap``)."""
+        for dev, s in self._update_streams.items():
+            torch.cuda.current_stream(dev).wait_stream(s)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -207,7 +236,7 @@ class Lattice(torch.optim.Optimizer):
             for p in g["params"]:
                 if p in self._done or p.grad is None:
                     continue
-                with torch.cuda.device(p.device) if p.is_cuda else contextlib.nullcontext():
+                with torch.cuda.device(p.device) if p.is_cuda else contextlib.nullcontext(), self._side(p):
                     self._update(p, g)
                 if self.fused_backward:
                     p.grad = None
@@ -217,6 +246,7 @@ class Lattice(torch.optim.Optimizer):
             for order in self._order.values():
                 self._next.update(zip(order, order[1:]))
                 self._next[order[-1]] = order[0]
+        self.wait()
         return loss
 
     @contextlib.contextmanager
@@ -305,8 +335,8 @@ class Lattice(torch.optim.Optimizer):
             self._last_copy[p.device] = ev
 
     def synchronize(self) -> None:
-        """Wait for pending host-memory state transfers."""
-        for s in self._copy_streams.values():
+        """Wait for pending updates and host-memory state transfers."""
+        for s in (*self._update_streams.values(), *self._copy_streams.values()):
             s.synchronize()
 
     def state_dict(self):
