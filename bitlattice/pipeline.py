@@ -34,10 +34,18 @@ from . import backend
 from . import parallel as P
 from .kernel_choice import active as active_kernels
 
-__all__ = ["init", "is_main", "train_step"]
+__all__ = ["init", "is_main", "share_head_", "train_step"]
 
 _GROUPS: dict = {}
 _DEBUG = os.environ.get("BL_PIPELINE_DEBUG", "") == "1"
+# BL_NVTX=1: NVTX ranges per unit and micro-batch, for timelines from Nsight Systems
+_NVTX = os.environ.get("BL_NVTX", "") == "1"
+
+
+def _range(name: str):
+    if not _NVTX:
+        return contextlib.nullcontext()
+    return torch.cuda.nvtx.range(name)
 
 
 def _log(*a):
@@ -45,14 +53,118 @@ def _log(*a):
         print(f"[rank {dist.get_rank()}]", *a, flush=True)
 
 
-def init(backend: str = "nccl") -> tuple[int, int]:
-    """Start the process group for a one-process-per-GPU run (environment from torchrun). Returns (rank, world)."""
+_LINKS: dict = {}          # peer rank -> bitlattice.transport.HostLink (transport='host')
+
+
+def init(backend: str = "nccl", transport: str = "nccl") -> tuple[int, int]:
+    """Start the process group for a one-process-per-GPU run (environment from torchrun). Returns (rank, world).
+
+    transport -- how activations and gradients cross between the processes: 'nccl' (point-to-point operations of
+                 the process group) or 'host' (all processes on one host: rings in shared page-locked memory moved
+                 by the copy engines and synchronized by the GPUs, :mod:`bitlattice.transport`; no SM time, no proxy
+                 thread, the host may run far ahead of its GPU)"""
+    if transport not in ("nccl", "host"):
+        raise ValueError("transport must be 'nccl' or 'host'")
     os.environ.setdefault("TORCH_NCCL_SHOW_EAGER_INIT_P2P_SERIALIZATION_WARNING", "false")   # one group per direction
     local = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local)
     if not dist.is_initialized():
         dist.init_process_group(backend, device_id=torch.device("cuda", local))
+    if transport == "host" and not _LINKS:
+        if int(os.environ.get("LOCAL_WORLD_SIZE", dist.get_world_size())) != dist.get_world_size():
+            raise ValueError("transport='host' needs every process on one host")
+        from .transport import HostLink
+        me = dist.get_rank()
+        dev = torch.device("cuda", local)
+        for a in range(dist.get_world_size()):              # every pair, in the same order on all processes
+            for b in range(a + 1, dist.get_world_size()):
+                if me in (a, b):
+                    _LINKS[b if me == a else a] = HostLink(me, b if me == a else a, dev)
+                else:
+                    dist.barrier()                          # the barrier inside the pair's link construction
     return dist.get_rank(), dist.get_world_size()
+
+
+def share_head_(model) -> None:
+    """Give every process a copy of the model's frozen output layer and final norm (collective; every process calls
+    it). :func:`train_step` then computes the vocabulary-wide loss of micro-batch m on process m % world: the head
+    process sends the others the last hidden states of their micro-batches and gets back the loss and the input
+    gradient, so the loss's work is spread over the GPUs instead of following all blocks on one of them."""
+    from .nn.norm import _convention
+    me, world = dist.get_rank(), dist.get_world_size()
+    segs = getattr(model, "_bl_pipeline_plan", None) or _plan(model)
+    model._bl_pipeline_plan = segs
+    owner = segs[-1].owner
+    head = model.get_output_embeddings()
+    backbone = model.get_decoder() if hasattr(model, "get_decoder") else model.model
+    norm = next((getattr(backbone, n) for n in P._NORM_NAMES if hasattr(backbone, n)), None)
+    dev = model.bl_local_device
+    meta = [None]
+    if me == owner:
+        w = head.weight
+        if w.requires_grad or getattr(head, "bias", None) is not None:
+            raise ValueError("share_head_: the output layer must be frozen and without bias")
+        if not w.is_cuda:
+            raise ValueError("share_head_: the output layer must be on the GPU (not host_linear)")
+        conv = None
+        if norm is not None:
+            from .nn.convert import _eps
+            eps = _eps(norm)
+            c = _convention(norm, eps) if eps is not None else None
+            if c is None:
+                raise ValueError(f"share_head_: the final norm {type(norm).__name__} is not an RMSNorm convention "
+                                 "this library implements")
+            conv = (eps, c[1], c[2], tuple(norm.weight.shape), norm.weight.dtype)
+        meta = [(tuple(w.shape), w.dtype, conv)]
+    dist.broadcast_object_list(meta, src=owner)
+    shape, dtype, conv = meta[0]
+    w = head.weight.detach() if me == owner else torch.empty(shape, dtype=dtype, device=dev)
+    dist.broadcast(w, src=owner)
+    norm_fn = None
+    if conv is not None:
+        eps, offset, cast_first, nshape, ndtype = conv
+        nw = norm.weight.detach() if me == owner else torch.empty(nshape, dtype=ndtype, device=dev)
+        dist.broadcast(nw, src=owner)
+        if me == owner:
+            norm_fn = norm
+        else:
+            from .nn.norm import rms_norm
+            norm_fn = functools.partial(_norm_copy, nw, eps, offset, cast_first)
+    model._bl_head_share = (w, norm_fn)
+
+
+def _norm_copy(w, eps, offset, cast_first, x):
+    from .nn.norm import rms_norm
+    return rms_norm(x, w, eps, offset, cast_first)
+
+
+class _Weight:
+    """A stand-in output layer: a weight and no bias."""
+
+    def __init__(self, w):
+        self.weight = w
+
+
+class _Received:
+    """The gradient of a unit input computed on another process (stands in for the input in the schedule)."""
+
+    __slots__ = ("grad", "data", "dtype", "device")
+
+    def __init__(self, grad):
+        self.grad, self.data, self.dtype, self.device = grad, None, grad.dtype, grad.device
+
+
+class _Posted:
+    """A receive posted on a NCCL communicator."""
+
+    __slots__ = ("tensor", "work")
+
+    def __init__(self, tensor, work):
+        self.tensor, self.work = tensor, work
+
+    def take(self):
+        self.work.wait()
+        return self.tensor
 
 
 def is_main() -> bool:
@@ -279,7 +391,28 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
 
     grad = torch.enable_grad() if backward else torch.no_grad()
     ins, outs, losses, keep = {}, {}, {}, []
-    ahead = _RunAhead(max(1, run_ahead))
+
+    def send(t, dst, channel="main"):
+        if _LINKS:
+            _LINKS[dst].send(t.contiguous())
+        else:
+            keep.append((dist.isend(t.contiguous(), dst, group=_group(me, dst, channel)), None))
+
+    def recv(shape, src, channel="main", dt=dtype):
+        if _LINKS:
+            return _LINKS[src].recv(shape, dt)
+        t = torch.empty(shape, dtype=dt, device=dev)
+        return _Posted(t, dist.irecv(t, src, group=_group(src, me, channel)))
+
+    # with a shared head (share_head_), micro-batch m's loss is computed on process m % world
+    share = getattr(model, "_bl_head_share", None)
+    if share is not None and extra_loss is not None:
+        raise ValueError("a shared head (share_head_) does not support extra_loss")
+    world = dist.get_world_size()
+    head_of = [(m % world) if share is not None else segs[-1].owner for m in range(M)]
+    remote = {}                                       # micro-batch -> its loss (and gradient) from another process
+    # NCCL's proxy thread needs the host to keep up with the GPU; host links need nothing from the host
+    ahead = _RunAhead(max(1, run_ahead) if not _LINKS else max(64, run_ahead))
     offload = _ActivationOffload(dev) if offload_activations and backward else None
     head_owner = segs[-1].owner
     # the extra loss's input embeddings of tokens 1.. are sent by the embedding's process right after its last
@@ -307,14 +440,20 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
             if seg.owner != me:
                 continue
             last = len(seg.items) - 1
+            # with host links all of the segment's inputs are posted at once: they land while this GPU computes
+            incoming = ([_LINKS[seg.prev].recv((*run_mb[m].shape, width), dtype) for m in range(M)]
+                        if _LINKS and seg.prev is not None else None)
             for m in range(M):
                 shape = (*run_mb[m].shape, width)
                 y = None
                 for j, item in enumerate(seg.items):
                     if j == 0 and seg.prev is not None:
-                        y = torch.empty(shape, dtype=dtype, device=dev)
                         _log("fwd recv", s, m, "from", seg.prev)
-                        dist.irecv(y, seg.prev, group=_group(seg.prev, me)).wait()
+                        if incoming is not None:
+                            y = incoming[m].take()
+                        else:
+                            y = torch.empty(shape, dtype=dtype, device=dev)
+                            dist.irecv(y, seg.prev, group=_group(seg.prev, me)).wait()
                     elif j > 0 and y is not None:
                         prev = y
                         y = y.detach()
@@ -326,8 +465,16 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                     if item[0] == "embed":
                         y = prep[m][0]
                     elif item[0] == "block":
-                        out = blocks[item[1]](y, **prep[m][1][item[1]])
+                        with _range(f"F{item[1]}.{m}"):
+                            out = blocks[item[1]](y, **prep[m][1][item[1]])
                         y = out[0] if isinstance(out, tuple) else out
+                    elif head_of[m] != me:
+                        # another process computes this micro-batch's loss: it gets the last hidden states
+                        send(y.detach(), head_of[m], "aux")
+                        remote[m] = None
+                        if backward:
+                            _release(y)                     # only its gradient is needed from here on
+                        y = None
                     else:
                         e = aux_embeddings(m) if extra_loss is not None else None
                         fn = functools.partial(_head_loss, model, norm, head, lab_mb[m], ids_mb[m], chunk,
@@ -349,7 +496,10 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                             outs[(s, j, m)] = (y, y.shape)
                         if j == last and seg.next is not None:
                             _log("fwd send", s, m, "to", seg.next)
-                            keep.append((dist.isend(y.detach(), seg.next, group=_group(me, seg.next)), None))
+                            if _LINKS:
+                                _LINKS[seg.next].send(y.detach())
+                            else:
+                                keep.append((dist.isend(y.detach(), seg.next, group=_group(me, seg.next)), None))
                             # the activation now lives on the next process; backward needs only the graph node
                             if backward:
                                 _release(y)
@@ -358,6 +508,30 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                                  None))
                 ahead.tick()
                 _prune(keep)
+        head_owner_ = segs[-1].owner
+        if share is not None and me != head_owner_:
+            # the loss of this process's micro-batches: hidden states in, loss and input gradient out
+            w_head, norm_fn = share
+            mine = [m for m in range(M) if head_of[m] == me]
+            posted = [recv((*run_mb[m].shape, width), head_owner_, "aux") for m in mine]
+            for m, inc in zip(mine, posted):
+                yh = inc.take()
+                weight = n_tok[m] / max(1, sum(n_tok))
+                if backward:
+                    yh.requires_grad_(True)
+                    with torch.enable_grad():
+                        loss = _head_loss(model, norm_fn, _Weight(w_head), lab_mb[m], ids_mb[m], chunk, None, yh,
+                                          None) * weight
+                    loss.backward()
+                    send(yh.grad, head_owner_, "aux")
+                else:
+                    loss = _head_loss(model, norm_fn, _Weight(w_head), lab_mb[m], ids_mb[m], chunk, None, yh,
+                                      None) * weight
+                send(loss.detach().float().reshape(1), head_owner_, "aux")
+        elif share is not None and remote:
+            for m in sorted(remote):
+                remote[m] = (recv((*run_mb[m].shape, width), head_of[m], "aux") if backward else None,
+                             recv((1,), head_of[m], "aux", torch.float32))
         # backward: unit by unit, each over all micro-batches; a unit's gradients are complete after its last
         # micro-batch and the fused update applies and frees them, so one unit of gradients exists at a time
         if backward:
@@ -375,37 +549,55 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                         if nxt is not None:
                             for m in range(M):
                                 offload.prefetch((*nxt, m))
+                    incoming = ([_LINKS[seg.next].recv(outs[(s, j, m)][1], dtype) for m in range(M)]
+                                if _LINKS and j == last and seg.items[j][0] != "head" else None)
                     for m in range(M):
                         defer = (optimizer.accumulate() if optimizer is not None and m < M - 1
                                  else contextlib.nullcontext())
                         with defer, (backend.defer_wgrad() if defer_wgrad else contextlib.nullcontext()):
-                            if seg.items[j][0] == "head":
-                                torch.autograd.backward(losses[m])
+                            if seg.items[j][0] == "head" and m in remote:
+                                g_in, loss_in = remote[m]
+                                ins[(s, j, m)] = _Received(g_in.take())    # read by the previous unit as .grad
+                                losses[m] = loss_in.take()[0]
+                            elif seg.items[j][0] == "head":
+                                with _range(f"Bhead.{m}"):
+                                    torch.autograd.backward(losses[m])
                             else:
                                 y, shape = outs.pop((s, j, m))
                                 if j == last:
-                                    g = torch.empty(shape, dtype=dtype, device=dev)
                                     _log("bwd recv", s, m, "from", seg.next)
-                                    dist.irecv(g, seg.next, group=_group(seg.next, me)).wait()
+                                    if incoming is not None:
+                                        g = incoming[m].take()
+                                    else:
+                                        g = torch.empty(shape, dtype=dtype, device=dev)
+                                        dist.irecv(g, seg.next, group=_group(seg.next, me)).wait()
                                 else:
                                     g = ins.pop((s, j + 1, m)).grad
                                 if y.requires_grad and g is not None:
-                                    _backward_released(y, g)
+                                    with _range(f"B{seg.items[j][1] if seg.items[j][0] == 'block' else 'x'}.{m}"):
+                                        _backward_released(y, g)
                             x = ins.get((s, j, m))
                             if x is not None and x.grad is not None:
                                 x.data = torch.empty(0, dtype=x.dtype, device=x.device)   # only its .grad is read from now on
                         if j == 0 and seg.prev is not None:
                             gi = ins.pop((s, 0, m)).grad
                             _log("bwd send", s, m, "to", seg.prev)
-                            keep.append((dist.isend(gi, seg.prev, group=_group(me, seg.prev)), None))
+                            if _LINKS:
+                                _LINKS[seg.prev].send(gi.contiguous())
+                            else:
+                                keep.append((dist.isend(gi, seg.prev, group=_group(me, seg.prev)), None))
                         ahead.tick()
                         _prune(keep)
                     if defer_wgrad:
-                        backend.flush_wgrad(optimizer=optimizer)        # this unit's weight gradients, then updates
+                        with _range(f"flush{s}.{j}"):
+                            backend.flush_wgrad(optimizer=optimizer)    # this unit's weight gradients, then updates
                     if _DEBUG:
                         live = sum(1 for p in model.parameters() if p.grad is not None)
                         _log("bwd unit", s, j, "done:", f"{torch.cuda.memory_allocated() / 2 ** 30:.2f} GiB,",
                              live, "params hold a gradient")
+    if not backward:
+        for m, (_, loss_in) in remote.items():
+            losses[m] = loss_in.take()[0]
     _log("step done, waiting for", len(keep), "sends")
     for work, _ in keep:
         work.wait()                      # orders this process's stream after its sends (the works hold the tensors)

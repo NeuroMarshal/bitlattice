@@ -26,6 +26,7 @@ in training they are an error.
 from __future__ import annotations
 
 import contextlib
+import os
 
 import torch
 
@@ -476,6 +477,13 @@ class _Plan:
         return dx.view(dy.shape), grads
 
 
+_NVTX = os.environ.get("BL_NVTX", "") == "1"          # NVTX ranges for Nsight Systems timelines
+
+
+def _range(name: str):
+    return torch.cuda.nvtx.range(name) if _NVTX else contextlib.nullcontext()
+
+
 # CUDA graphs
 #
 # A fused layer is a fixed sequence of kernels for a given input shape, so it can be recorded once and replayed: one
@@ -643,7 +651,8 @@ class _Graphs:
             graph, _ = self._capture(dev, run)
             self.fwd[key] = (graph, yout)
         graph, yout = self.fwd[key]
-        graph.replay()
+        with _range("replay F"):
+            graph.replay()
         return yout.clone()
 
     def backward(self, x, cos, sin, dy):
@@ -660,7 +669,8 @@ class _Graphs:
         if key not in self.bwd:
             self.bwd[key] = self._capture_backward(dev, key, xin, cin, sinb, dyin, w_ops, wt_ops)
         graph, dxout, small, staged = self.bwd[key]
-        graph.replay()
+        with _range("replay B"):
+            graph.replay()
         grads = {t: b.clone() for t, b in small.items()}
         ops = {}
         for p, gt_b, xt_b in staged:

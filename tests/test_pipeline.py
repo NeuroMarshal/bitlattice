@@ -74,3 +74,25 @@ def test_pipeline_deferred_weight_gradients(dense_dir, tmp_path):
     assert abs(plain[0] - deferred[0]) <= 1e-3 * plain[0]
     assert deferred[-1] < 0.9 * deferred[0]
     assert all(abs(a - b) <= 0.05 * a for a, b in zip(plain, deferred)), (plain, deferred)
+
+
+def test_shared_head_matches_the_head_process(dense_dir, tmp_path):
+    base = _pipe(dense_dir, tmp_path, "frozen", ["--freeze-head", "--micro", "4"])
+    shared = _pipe(dense_dir, tmp_path, "shared", ["--share-head", "--micro", "4"])
+    # the first step's loss is the same computation; afterwards the norm kernel of the other process (the library's,
+    # not the model's module) differs in last bits, which training at this learning rate amplifies a little
+    assert abs(base[0] - shared[0]) <= 1e-5 * base[0]
+    assert all(abs(a - b) <= 0.02 * a for a, b in zip(base, shared)), (base, shared)
+
+
+def test_overlapped_updates_match(dense_dir, tmp_path):
+    base = _pipe(dense_dir, tmp_path, "inline", [])
+    overlapped = _pipe(dense_dir, tmp_path, "overlap", ["--overlap"])
+    assert all(abs(a - b) <= 1e-3 * a for a, b in zip(base, overlapped)), (base, overlapped)
+
+
+@pytest.mark.skipif(GPUS < 2, reason="needs two GPUs")
+def test_host_transport_matches_nccl(dense_dir, tmp_path):
+    nccl = _pipe(dense_dir, tmp_path, "nccl", ["--micro", "4"])
+    host = _pipe(dense_dir, tmp_path, "host", ["--micro", "4", "--transport", "host"])
+    assert nccl == host, (nccl, host)

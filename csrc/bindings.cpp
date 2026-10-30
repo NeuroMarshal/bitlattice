@@ -3,6 +3,7 @@
 #include <torch/library.h>
 
 #include <optional>
+#include <string>
 
 using at::Tensor;
 
@@ -47,6 +48,12 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> bl_nvfp4_quantize2(Te
                                                                              bool blocked,
                                                                              std::optional<Tensor> amax_out,
                                                                              std::optional<Tensor> epoch);
+void bl_ring_create(std::string name, int64_t slot_bytes, int64_t slots);
+int64_t bl_link_open(std::string in_name, std::string out_name, int64_t slot_bytes, int64_t slots, int64_t device);
+void bl_link_close(int64_t h, bool unlink_in);
+void bl_link_send(int64_t h, Tensor x);
+int64_t bl_link_recv(int64_t h, Tensor out);
+void bl_link_take(int64_t h, int64_t ticket);
 void bl_lattice_update(Tensor packed, std::optional<Tensor> phase, Tensor scales, std::optional<Tensor> global_scale,
                        std::optional<Tensor> zeros, Tensor G, Tensor sorted, Tensor rank_of_code, Tensor sorted_code,
                        int64_t kind, int64_t bits, int64_t cb, int64_t qmin, int64_t qmax, int64_t zero_point,
@@ -100,6 +107,12 @@ TORCH_LIBRARY(bitlattice, m) {
   m.def("mx_unpack(Tensor codes, Tensor scales, ScalarType dtype) -> Tensor");
   m.def("mx_quantize2(Tensor x, bool row=True, bool col=False, bool e5m2=False, bool blocked=False) "
         "-> (Tensor, Tensor, Tensor, Tensor)");
+  m.def("ring_create(str name, int slot_bytes, int slots) -> ()", &bl_ring_create);
+  m.def("link_open(str in_name, str out_name, int slot_bytes, int slots, int device) -> int", &bl_link_open);
+  m.def("link_close(int h, bool unlink_in) -> ()", &bl_link_close);
+  m.def("link_send(int h, Tensor x) -> ()");
+  m.def("link_recv(int h, Tensor(a!) out) -> int");
+  m.def("link_take(int h, int ticket) -> ()", &bl_link_take);
   m.def(
       "lattice_update(Tensor(a!) packed, Tensor(b!)? phase, Tensor(c!) scales, Tensor? global_scale, Tensor? zeros, "
       "Tensor G, Tensor sorted, Tensor rank_of_code, Tensor sorted_code, int kind, int bits, int cb, int qmin, "
@@ -134,6 +147,8 @@ TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
   m.impl("swiglu_fwd", &bl_swiglu_fwd);
   m.impl("fp4_fold_scales", &bl_fp4_fold_scales);
   m.impl("lattice_update", &bl_lattice_update);
+  m.impl("link_send", &bl_link_send);
+  m.impl("link_recv", &bl_link_recv);
   m.impl("swiglu_bwd", &bl_swiglu_bwd);
   m.impl("mx_quantize2", &bl_mx_quantize2);
   m.impl("mx_pack", &bl_mx_pack);
