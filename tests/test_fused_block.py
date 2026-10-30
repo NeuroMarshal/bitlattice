@@ -75,8 +75,18 @@ def test_fused_block_matches_the_layers():
             assert _rel(gb[n], ga[n]) < (0.15 if n.endswith(("A_log", "dt_bias")) else 3e-2), n
 
 
-@pytest.mark.parametrize("compute", ["exact", "quartet2_fast"])
-def test_graph_replays_match_eager(compute):
+def test_fused_output_can_release_its_storage():
+    m = _model()
+    x, kws = _inputs(m)
+    bl.surgery.convert_(m, r"re:layers\.\d+$", "fused_block")
+    x = x.detach().requires_grad_(True)
+    y = m.layers[0](x, **kws[0])
+    assert y._base is None
+
+
+@pytest.mark.parametrize("compute", ["exact", "quartet2_fast", "quartet2_bound"])
+@pytest.mark.parametrize("mlp_chunk", [0, 128])
+def test_graph_replays_match_eager(compute, mlp_chunk):
     if compute != "exact" and not backend.fp4_supported(0):
         pytest.skip("needs FP4 tensor cores")
     base = _model()
@@ -85,7 +95,7 @@ def test_graph_replays_match_eager(compute):
     runs = []
     for graphs in (False, True):
         m = copy.deepcopy(base)
-        bl.surgery.convert_(m, r"re:layers\.\d+$", "fused_block", graphs=graphs)
+        bl.surgery.convert_(m, r"re:layers\.\d+$", "fused_block", graphs=graphs, mlp_chunk=mlp_chunk)
         bl.surgery.set_compute_(m, "*", compute, skip_unfit=True)
         out = []
         for i in range(2):
@@ -118,3 +128,40 @@ def test_swiglu_kernels_match_autograd():
     dg, du = torch.ops.bitlattice.swiglu_bwd(g, u, da)
     assert torch.equal(du, ur.grad)
     assert (dg.float() - gr.grad.float()).abs().max().item() <= 1e-2 * gr.grad.float().abs().max().item()
+
+
+@pytest.mark.parametrize("layer", [0, 1])
+def test_mlp_pieces_match_the_whole(layer):
+    base = _model()
+    x0, kws = _inputs(base, T=300)
+    runs = []
+    for chunk in (0, 128):
+        m = copy.deepcopy(base)
+        bl.surgery.convert_(m, r"re:layers\.\d+$", "fused_block", mlp_chunk=chunk)
+        torch.manual_seed(0)
+        x = x0 + torch.randn_like(x0)
+        gy = torch.randn_like(x0) * 0.1
+        runs.append(_run(m.layers[layer], kws[layer], x, gy))
+    (ya, xa, ga), (yb, xb, gb) = runs
+    assert set(ga) == set(gb)
+    # pieces are position-wise the same computation (GEMMs over fewer rows may sum in another order)
+    assert _rel(yb, ya) < 1e-3 and _rel(xb, xa) < 1e-3
+    assert all(_rel(gb[n], ga[n]) < 1e-2 for n in ga)
+
+
+@pytest.mark.parametrize("graphs", [False, True])
+def test_sequence_pieces_preserve_state_and_gradients(graphs):
+    base = _model()
+    x, kws = _inputs(base, T=300)
+    gy = torch.randn_like(x) * 0.1
+    runs = []
+    for chunk in (0, 128):
+        m = copy.deepcopy(base)
+        bl.surgery.convert_(m, r"re:layers\.\d+$", "fused_block", graphs=graphs, seq_chunk=chunk, mlp_chunk=128)
+        for _ in range(3):
+            result = _run(m.layers[0], kws[0], x, gy)
+        runs.append(result)
+    (ya, xa, ga), (yb, xb, gb) = runs
+    assert set(ga) == set(gb)
+    assert _rel(yb, ya) < 1e-2 and _rel(xb, xa) < 2e-2
+    assert all(_rel(gb[n], ga[n]) < (0.15 if n.endswith(("A_log", "dt_bias")) else 3e-2) for n in ga)

@@ -140,7 +140,7 @@ def test_transposed_requantization_matches_dense_transpose():
     assert ((wt - ref).norm() / ref.norm()).item() < 0.12
 
 
-RECIPES = ("nvidia", "4over6", "quartet2", "quartet2_4o6", "quartet2_fast", "quartet2_delayed")
+RECIPES = ("nvidia", "4over6", "quartet2", "quartet2_4o6", "quartet2_fast", "quartet2_delayed", "quartet2_bound")
 
 
 def _C(policy, recipe="nvidia"):
@@ -218,6 +218,8 @@ def test_compute_settings_are_requirements():
     assert net[0].weight.compute is None
     with pytest.raises(ValueError):
         bl.backend.Fp4Recipe(gradients="eden", rotation=16)
+    with pytest.raises(ValueError, match="dgrad_scale"):
+        bl.backend.Fp4Recipe(dgrad_scale="bound")
 
 
 def test_fp4_recipes_train():

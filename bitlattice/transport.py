@@ -1,11 +1,7 @@
-"""Transfers between the processes of one host through shared page-locked memory.
+"""Copy-engine transfers through shared pinned-memory rings for processes on one host.
 
-GPUs without peer access (consumer cards) exchange data through host memory. NCCL does this with copy kernels that
-occupy SMs and with a proxy thread per process that must keep running, so the host can only run a few units of work
-ahead of its GPU. A :class:`HostLink` uses a ring of slots in shared memory per direction instead: the copy engines
-move the data, and a host thread per direction (C++, no interpreter lock) watches the sequence flags of the ring and
-issues each copy when it can run at once (``csrc/transport.cu``). No GPU stream ever waits for the other process,
-and the calling thread waits only for data it asks to use before it has arrived.
+C++ threads submit copies when the peer's sequence flags allow slot reuse. ``take`` waits on the host until a copy
+has been issued, then orders the caller's CUDA stream after it.
 
     link = HostLink(me, peer, device)          # every pair of processes: both call it, in the same order
     link.send(x)                               # after the work that produced x on the current stream
@@ -21,9 +17,8 @@ __all__ = ["HostLink"]
 
 
 class HostLink:
-    """Both directions between this process and ``peer``. Messages of a direction are received in the order they
-    were sent. ``slot_bytes`` x ``slots`` of shared memory per direction; a message takes ceil(bytes / slot_bytes)
-    slots, and a sender's copy waits only when all slots hold messages the receiver has not taken yet."""
+    """Ordered messages to and from ``peer``, using ``slot_bytes * slots`` shared bytes per direction.
+    Both peers must construct their links in the same order; messages larger than a slot span consecutive slots."""
 
     def __init__(self, me: int, peer: int, device: torch.device, *, tag: str | None = None,
                  slot_bytes: int = 4 << 20, slots: int = 64):

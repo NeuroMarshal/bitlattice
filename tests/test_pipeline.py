@@ -79,10 +79,11 @@ def test_pipeline_deferred_weight_gradients(dense_dir, tmp_path):
 def test_shared_head_matches_the_head_process(dense_dir, tmp_path):
     base = _pipe(dense_dir, tmp_path, "frozen", ["--freeze-head", "--micro", "4"])
     shared = _pipe(dense_dir, tmp_path, "shared", ["--share-head", "--micro", "4"])
-    # the first step's loss is the same computation; afterwards the norm kernel of the other process (the library's,
-    # not the model's module) differs in last bits, which training at this learning rate amplifies a little
     assert abs(base[0] - shared[0]) <= 1e-5 * base[0]
-    assert all(abs(a - b) <= 0.02 * a for a, b in zip(base, shared)), (base, shared)
+    assert all(abs(a - b) <= 1e-3 * a for a, b in zip(base, shared)), (base, shared)
+    norms = [torch.tensor(json.loads((tmp_path / f"{tag}.jsonl").read_text().splitlines()[-1])["norm"])
+             for tag in ("frozen", "shared")]
+    assert torch.allclose(*norms, rtol=1e-3, atol=1e-3), norms
 
 
 def test_overlapped_updates_match(dense_dir, tmp_path):
@@ -92,7 +93,9 @@ def test_overlapped_updates_match(dense_dir, tmp_path):
 
 
 @pytest.mark.skipif(GPUS < 2, reason="needs two GPUs")
-def test_host_transport_matches_nccl(dense_dir, tmp_path):
-    nccl = _pipe(dense_dir, tmp_path, "nccl", ["--micro", "4"])
-    host = _pipe(dense_dir, tmp_path, "host", ["--micro", "4", "--transport", "host"])
+@pytest.mark.parametrize("shared", [False, True])
+def test_host_transport_matches_nccl(dense_dir, tmp_path, shared):
+    extra = ["--micro", "4"] + (["--share-head"] if shared else [])
+    nccl = _pipe(dense_dir, tmp_path, "nccl", extra)
+    host = _pipe(dense_dir, tmp_path, "host", extra + ["--transport", "host"])
     assert nccl == host, (nccl, host)

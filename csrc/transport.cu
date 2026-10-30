@@ -1,20 +1,9 @@
-// Transfers between processes on one host whose GPUs cannot reach each other's memory (no peer access): a ring of
-// slots per direction in shared page-locked host memory, filled and drained by the copy engines. Sequence flags in
-// the same memory tell the other side what is there. Each direction of a link has a host thread of its own that
-// watches the flags and issues the copies only when they can run at once, so no GPU stream ever waits for the other
-// process (a kernel spinning on a flag can deadlock two GPUs through lazy module loading or shared hardware queues),
-// and the caller's thread never waits either, except for data it asks to use before it has arrived.
-//
-//   send of message seq to slot k = (seq - 1) % n:  wait (host) until read[k] >= seq - n; copy the data into the
-//                                                   slot on the send stream; when the copy is done, written[k] = seq
-//   receipt of seq:                                 wait (host) until written[k] >= seq; copy the slot out on the
-//                                                   receive stream; when the copy is done, read[k] = seq
-//
-// Both ends number a direction's messages identically (they issue them in the same order). A message larger than a
-// slot takes consecutive slots, so the sender's copy of one piece overlaps the receiver's copy of the previous one.
+// Shared pinned-memory rings connect GPUs without peer access. Host threads submit DMA and publish sequence flags.
+// A slot is reusable only after the receiver's copy completes; GPU streams never spin on peer flags.
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -110,6 +99,7 @@ struct Incoming {
   at::Tensor out;
   uint32_t seq;
   cudaEvent_t ready = nullptr;
+  cudaEvent_t available = nullptr;
   std::atomic<bool> issued{false};
 };
 
@@ -154,6 +144,9 @@ class Link {
   // after the work issued so far on the current stream, send x (kept alive until it has been copied)
   void send(const at::Tensor& x) {
     check();
+    TORCH_CHECK(x.get_device() == device_, "link send: tensor is on another device");
+    c10::cuda::CUDACachingAllocator::recordStream(x.storage().data_ptr(),
+        c10::cuda::getStreamFromExternal(send_stream_, device_));
     cudaEvent_t ready = event();
     C10_CUDA_CHECK(cudaEventRecord(ready, at::cuda::getCurrentCUDAStream()));
     std::lock_guard<std::mutex> lk(mu_);
@@ -164,9 +157,17 @@ class Link {
 
   // post the receipt of the next message into out; returns a ticket for take()
   int64_t recv(const at::Tensor& out) {
+    check();
+    TORCH_CHECK(out.get_device() == device_, "link recv: tensor is on another device");
+    c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(device_));
     auto in = std::make_shared<Incoming>();
     in->out = out;
     in->ready = event();
+    // A reused allocation may still have work queued on its allocating stream. Order the receive after that work.
+    in->available = event();
+    C10_CUDA_CHECK(cudaEventRecord(in->available, at::cuda::getCurrentCUDAStream()));
+    c10::cuda::CUDACachingAllocator::recordStream(out.storage().data_ptr(),
+        c10::cuda::getStreamFromExternal(recv_stream_, device_));
     std::lock_guard<std::mutex> lk(mu_);
     in->seq = seq_in_;
     seq_in_ += pieces(out);
@@ -180,6 +181,7 @@ class Link {
   // the current stream waits (on the GPU) for the copy of the ticket's message; the caller waits only until that
   // copy has been issued, i.e. until the data has arrived in host memory
   void take(int64_t ticket) {
+    c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(device_));
     std::shared_ptr<Incoming> in;
     {
       std::unique_lock<std::mutex> lk(mu_);
@@ -286,6 +288,7 @@ class Link {
         Backoff wait;
         while (s > out_.slots && !reached(load(out_.read + k), s - static_cast<uint32_t>(out_.slots))) {
           publish(inflight, out_.written);
+          if (stop_.load()) return;
           wait.pause();
         }
         const int64_t len = std::min<int64_t>(out_.slot_bytes, n - off);
@@ -331,6 +334,8 @@ class Link {
         continue;
       }
       bo.reset();
+      BL_LINK_CUDA(cudaStreamWaitEvent(recv_stream_, in->available, 0));
+      give(in->available);
       auto* dst = static_cast<unsigned char*>(in->out.data_ptr());
       const int64_t n = in->out.numel() * in->out.element_size();
       uint32_t s = in->seq;

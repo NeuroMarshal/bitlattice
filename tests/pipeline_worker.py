@@ -52,9 +52,15 @@ def main():
         if a.data == "random" or step == 0:
             x = torch.randint(0, model.config.vocab_size, (a.batch, a.seq + 1), generator=g)
         losses.append(runner.step(x).item())
+    backbone = model.get_decoder() if hasattr(model, "get_decoder") else model.model
+    owner = bl.pipeline._plan(model)[-1].owner
+    norm = torch.empty_like(backbone.norm.weight, device=model.bl_local_device)
+    if torch.distributed.get_rank() == owner:
+        norm.copy_(backbone.norm.weight.detach())
+    torch.distributed.broadcast(norm, src=owner)
     if bl.parallel.is_main():
         with open(a.json, "a") as f:
-            f.write(json.dumps({"losses": losses}) + "\n")
+            f.write(json.dumps({"losses": losses, "norm": norm.float().cpu().tolist()}) + "\n")
     dist.destroy_process_group()
 
 

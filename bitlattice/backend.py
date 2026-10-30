@@ -71,6 +71,9 @@ class Fp4Recipe:
                                         backward (MS-EDEN with MS-EDEN gradients), or quantized once per weight
                                         version (round to nearest, one rotation per version; as the transposed
                                         weight of the NVIDIA recipe)
+    dgrad_scale      'current' | 'bound'   cached W^T global scale: an amax pass over the rotated weight, or the
+                                        bound sqrt(128) * W.global_scale. The bound removes that pass; block scales
+                                        are still current, but their E4M3 rounding and underflow can differ
     scale_source     'current' | 'delayed'   per-tensor scales from an amax pass over the operand (exact), or from
                                         the amax the previous call of the same layer saw (times ``scale_margin``;
                                         no extra pass; values beyond the range saturate). Applies to the one-read
@@ -85,6 +88,7 @@ class Fp4Recipe:
     backward_4over6: bool = False
     select: str = "mse"
     dgrad_weight: str = "requantize"
+    dgrad_scale: str = "current"
     scale_source: str = "current"
     scale_margin: float = 2.0
 
@@ -101,6 +105,11 @@ class Fp4Recipe:
             raise ValueError("select must be 'mse' or 'mae'")
         if self.dgrad_weight not in ("requantize", "cached"):
             raise ValueError("dgrad_weight must be 'requantize' or 'cached'")
+        if self.dgrad_scale not in ("current", "bound"):
+            raise ValueError("dgrad_scale must be 'current' or 'bound'")
+        if self.dgrad_scale == "bound" and not (self.dgrad_weight == "cached" and self.rotate_dgrad
+                                                and self.rotation == 128):
+            raise ValueError("dgrad_scale='bound' needs cached weights and the 128-element dgrad rotation")
         if self.scale_source not in ("current", "delayed"):
             raise ValueError("scale_source must be 'current' or 'delayed'")
         if not self.scale_margin >= 1.0:
@@ -122,6 +131,8 @@ FP4_RECIPES: dict[str, Fp4Recipe] = {
                                dgrad_weight="cached"),
     "quartet2_delayed": Fp4Recipe(activations="4over6", gradients="eden", rotation=128, rotate_dgrad=True,
                                   dgrad_weight="cached", scale_source="delayed"),
+    "quartet2_bound": Fp4Recipe(activations="4over6", gradients="eden", rotation=128, rotate_dgrad=True,
+                                dgrad_weight="cached", dgrad_scale="bound"),
 }
 def as_recipe(r) -> Fp4Recipe:
     """A recipe from its name in ``FP4_RECIPES`` (or the recipe itself)."""
@@ -331,18 +342,24 @@ def weight_t_operand(w) -> Fp4Operand:
     return _cached(w, "wt", make)
 
 
-def weight_t_rotated_operand(w, four_over_six: bool = False, seed: int | None = None) -> Fp4Operand:
+def weight_t_rotated_operand(w, four_over_six: bool = False, seed: int | None = None,
+                             scale_source: str = "current") -> Fp4Operand:
     """W^T [K, N] rotated along N (128-blocks) and re-quantized once per weight version (round to nearest); the
     rotation seed (``rotate_seed`` of the result) is fixed per version, or ``seed`` (then not cached)."""
+    if scale_source not in ("current", "bound"):
+        raise ValueError("scale_source must be 'current' or 'bound'")
     def make(seed):
+        # |H_128 W| <= sqrt(128) * 6 * 448 * W.global_scale; local scales still use the current block maxima.
+        given = (w.global_scale.float() * (128 ** 0.5) * (448.0 / 256.0 if four_over_six else 1.0)
+                 if scale_source == "bound" else None)
         packed, scales, g = torch.ops.bitlattice.nvfp4_quantize(w.packed, True, _RTN, four_over_six, False, True, 0,
-                                                                None, w.scales, w.global_scale, seed, True)
+                                                                given, w.scales, w.global_scale, seed, True)
         return Fp4Operand(packed, scales, g, True, seed)
     if seed is not None:
         return make(seed)
     ver = getattr(w, "_bl_version", 0)
     seed = (id(w) * 2654435761 + ver * 40503 + 1) & 0x7FFFFFFF
-    return _cached(w, "wt128_4o6" if four_over_six else "wt128", lambda: make(seed))
+    return _cached(w, ("wt128_4o6" if four_over_six else "wt128") + "_" + scale_source, lambda: make(seed))
 
 
 @cache
@@ -500,8 +517,9 @@ def _site(w, role: str) -> dict:
 
 
 def _input_operands(x: torch.Tensor, recipe: Fp4Recipe, site: dict | None = None,
-                    epoch: torch.Tensor | None = None) -> tuple[Fp4Operand, Fp4Operand]:
-    """Forward operand of x and its (rotated) transposed operand for the weight gradient."""
+                    epoch: torch.Tensor | None = None, row: bool = True) -> tuple[Fp4Operand | None, Fp4Operand]:
+    """Forward operand of x (None with ``row=False``) and its (rotated) transposed operand for the weight
+    gradient."""
     K = x.shape[-1]
     x2 = _pad_rows(x.reshape(-1, K), _pad_to(recipe)).contiguous()
     if recipe.rotation == 128 and K % 128 == 0:
@@ -510,7 +528,7 @@ def _input_operands(x: torch.Tensor, recipe: Fp4Recipe, site: dict | None = None
         fos = recipe.backward_4over6 or (mode == _RTN and recipe.activations == "4over6")
         # the weight-gradient operands get power-of-two global scales: micro-batches can then be concatenated
         # exactly into one GEMM (deferred weight gradients)
-        return _q2(x2, _side(True, _RTN, recipe.activations == "4over6"),
+        return _q2(x2, _side(row, _RTN, recipe.activations == "4over6"),
                    _side(True, mode, fos, _seed(), _seed(), pow2=True, mix_rot=True), recipe, site, epoch)
     if epoch is not None:
         raise RuntimeError("operands replayed from a CUDA graph need a recipe with the 128-element rotation")
@@ -554,7 +572,7 @@ def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool
         # (columns, rotated along the tokens with the rotation of the saved x^T)
         mode = _EDEN if recipe.gradients == "eden" else _SR
         if need_x and recipe.dgrad_weight == "cached" and wt is None:
-            wt = weight_t_rotated_operand(w, b46)
+            wt = weight_t_rotated_operand(w, b46, scale_source=recipe.dgrad_scale)
         r = wt.rotate_seed if wt is not None else _seed()
         # the dgrad rotation must match W^T's (made outside a graph): only the wgrad side mixes it with the epoch
         gq, gt = _q2(g2p, _side(need_x, mode, b46, r, _seed()),
@@ -574,7 +592,8 @@ def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool
     if need_x:
         if recipe.rotate_dgrad and N % 128 == 0:
             mode = _EDEN if recipe.gradients == "eden" else _SR
-            wt = weight_t_rotated_operand(w, b46) if recipe.dgrad_weight == "cached" else None
+            wt = (weight_t_rotated_operand(w, b46, scale_source=recipe.dgrad_scale)
+                  if recipe.dgrad_weight == "cached" else None)
             r = wt.rotate_seed if wt is not None else _seed()
             gq = _q(g2p, mode=mode, four_over_six=b46, recipe=recipe, rotate_seed=r, seed=_seed())
             # W^T: MS-EDEN with MS-EDEN gradients (both factors unbiased), else round to nearest
@@ -654,7 +673,9 @@ def _concat(ops: list) -> Fp4Operand:
     rows = ops[0].packed.shape[0]
     nr = -(-rows // 128)
     dev = packed.device
-    count = _FOLD_ROUNDED.setdefault(dev, torch.zeros((), dtype=torch.int64, device=dev))
+    count = _FOLD_ROUNDED.get(dev)
+    if count is None:
+        count = _FOLD_ROUNDED[dev] = torch.zeros((), dtype=torch.int64, device=dev)
     tiles = [o.scales.view(torch.uint8).view(nr, -1, 512) for o in ops]
     g = torch.cat([o.global_scale.reshape(1).float() for o in ops])
     if _choice().fused_fold:
@@ -710,7 +731,14 @@ def flush_wgrad(params=None, optimizer=None) -> int:
         p = ref()
         if p is None or not items:
             continue
-        gw = fp4_mm(_concat([gt for gt, _ in items]), _concat([xt for _, xt in items]), p.dtype)
+        gs, xs = [gt for gt, _ in items], [xt for _, xt in items]
+        items.clear()
+        gt = _concat(gs)
+        gs.clear()                       # the copies of the first operand can be reused for the second concat
+        xt = _concat(xs)
+        xs.clear()
+        gw = fp4_mm(gt, xt, p.dtype)
+        del gt, xt
         p.grad = gw if p.grad is None else p.grad.add_(gw)
         if optimizer is not None and getattr(optimizer, "fused_backward", False):
             optimizer._on_grad(p)

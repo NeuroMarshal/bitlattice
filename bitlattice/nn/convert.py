@@ -39,7 +39,9 @@ Conversions:
                       bitlattice.nn.fused_block); replaces ``checkpoint`` for such layers; ``graphs=True`` records
                       the layer's forward and backward as CUDA graphs per input shape and replays them (one host call
                       per layer instead of hundreds of launches; stochastic seeds drawn on the device); ``slots``:
-                      buffers for the weights' derived operands (consecutive layers of a pipeline unit)
+                      buffers for the weights' derived operands (consecutive layers of a pipeline unit);
+                      ``mlp_chunk``: the MLP over pieces of that many tokens (long sequences);
+                      ``seq_chunk``: the delta-rule recurrence over pieces (multiple of 64), carrying its state
     checkpoint        activation checkpointing of the module: the forward keeps only its inputs, backward
                       recomputes it; ``saved`` ('fp8' / 'nvfp4', lossy) stores the recomputed module's saved
                       tensors compressed, which lowers the per-layer peak (use it instead of the model's own
@@ -634,9 +636,9 @@ def _width(m) -> int | None:
     return int(w.shape[-1]) if w is not None else None
 
 
-def _make_fused_block(m, graphs: bool = False, slots: int = 2):
+def _make_fused_block(m, graphs: bool = False, slots: int = 2, mlp_chunk: int = 0, seq_chunk: int = 0):
     from .fused_block import make_fused_block
-    return make_fused_block(m, graphs, slots)
+    return make_fused_block(m, graphs, slots, mlp_chunk, seq_chunk)
 
 
 def _fused_probe(m, new):

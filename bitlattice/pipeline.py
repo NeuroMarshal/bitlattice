@@ -86,10 +86,9 @@ def init(backend: str = "nccl", transport: str = "nccl") -> tuple[int, int]:
 
 
 def share_head_(model) -> None:
-    """Give every process a copy of the model's frozen output layer and final norm (collective; every process calls
-    it). :func:`train_step` then computes the vocabulary-wide loss of micro-batch m on process m % world: the head
-    process sends the others the last hidden states of their micro-batches and gets back the loss and the input
-    gradient, so the loss's work is spread over the GPUs instead of following all blocks on one of them."""
+    """Replicate the frozen output head; every process must call this collective.
+    Micro-batch m's loss runs on rank m % world. A trainable final norm is synchronized before use, and its gradients
+    return to the owner in micro-batch order for one update."""
     from .nn.norm import _convention
     me, world = dist.get_rank(), dist.get_world_size()
     segs = getattr(model, "_bl_pipeline_plan", None) or _plan(model)
@@ -114,28 +113,44 @@ def share_head_(model) -> None:
             if c is None:
                 raise ValueError(f"share_head_: the final norm {type(norm).__name__} is not an RMSNorm convention "
                                  "this library implements")
-            conv = (eps, c[1], c[2], tuple(norm.weight.shape), norm.weight.dtype)
+            conv = (eps, c[1], c[2], tuple(norm.weight.shape), norm.weight.dtype, norm.weight.requires_grad)
         meta = [(tuple(w.shape), w.dtype, conv)]
     dist.broadcast_object_list(meta, src=owner)
     shape, dtype, conv = meta[0]
     w = head.weight.detach() if me == owner else torch.empty(shape, dtype=dtype, device=dev)
     dist.broadcast(w, src=owner)
-    norm_fn = None
+    norm_fn, nw, train_norm = None, None, False
     if conv is not None:
-        eps, offset, cast_first, nshape, ndtype = conv
-        nw = norm.weight.detach() if me == owner else torch.empty(nshape, dtype=ndtype, device=dev)
-        dist.broadcast(nw, src=owner)
+        eps, offset, cast_first, nshape, ndtype, train_norm = conv
+        nw = norm.weight if me == owner else torch.empty(nshape, dtype=ndtype, device=dev)
+        with torch.no_grad():
+            dist.broadcast(nw, src=owner)
+        if me != owner:
+            nw.requires_grad_(train_norm)
         if me == owner:
             norm_fn = norm
         else:
-            from .nn.norm import rms_norm
-            norm_fn = functools.partial(_norm_copy, nw, eps, offset, cast_first)
-    model._bl_head_share = (w, norm_fn)
+            import copy
+            norm_fn = copy.deepcopy(norm)
+            norm_fn.weight = torch.nn.Parameter(nw, requires_grad=train_norm)
+            nw = norm_fn.weight
+    model._bl_head_share = _HeadShare(w, norm_fn, nw, train_norm, owner)
 
 
-def _norm_copy(w, eps, offset, cast_first, x):
-    from .nn.norm import rms_norm
-    return rms_norm(x, w, eps, offset, cast_first)
+@dataclass
+class _HeadShare:
+    weight: torch.Tensor
+    norm: object
+    norm_weight: torch.Tensor | None
+    train_norm: bool
+    owner: int
+
+    def sync(self):
+        if self.train_norm:
+            with torch.no_grad():
+                dist.broadcast(self.norm_weight, src=self.owner)
+            if dist.get_rank() != self.owner:
+                self.norm_weight.grad = None
 
 
 class _Weight:
@@ -291,6 +306,25 @@ class _ActivationOffload:
         self.host: dict = {}
         self.ready: dict = {}
 
+    def save_input(self, t: torch.Tensor):
+        """Resolve saved input views through their restored owner; replacing t.data alone leaves SavedVariable's
+        detached storage alive. Other saved tensors keep their usual lifetime."""
+        storage = t.untyped_storage().data_ptr()
+        offset = t.storage_offset()
+
+        def pack(saved):
+            if saved.device == t.device and saved.dtype == t.dtype and saved.untyped_storage().data_ptr() == storage:
+                return (t, saved.shape, saved.stride(), saved.storage_offset() - offset)
+            return saved
+
+        def unpack(saved):
+            if isinstance(saved, tuple):
+                owner, shape, stride, delta = saved
+                return owner.as_strided(shape, stride, owner.storage_offset() + delta)
+            return saved
+
+        return torch.autograd.graph.saved_tensors_hooks(pack, unpack)
+
     def put(self, key, t: torch.Tensor) -> None:
         ev = torch.cuda.Event()
         ev.record(torch.cuda.current_stream(t.device))
@@ -408,6 +442,8 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
     share = getattr(model, "_bl_head_share", None)
     if share is not None and extra_loss is not None:
         raise ValueError("a shared head (share_head_) does not support extra_loss")
+    if share is not None:
+        share.sync()
     world = dist.get_world_size()
     head_of = [(m % world) if share is not None else segs[-1].owner for m in range(M)]
     remote = {}                                       # micro-batch -> its loss (and gradient) from another process
@@ -465,7 +501,8 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                     if item[0] == "embed":
                         y = prep[m][0]
                     elif item[0] == "block":
-                        with _range(f"F{item[1]}.{m}"):
+                        with _range(f"F{item[1]}.{m}"), (offload.save_input(y) if offload is not None
+                                                        else contextlib.nullcontext()):
                             out = blocks[item[1]](y, **prep[m][1][item[1]])
                         y = out[0] if isinstance(out, tuple) else out
                     elif head_of[m] != me:
@@ -479,10 +516,7 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                         e = aux_embeddings(m) if extra_loss is not None else None
                         fn = functools.partial(_head_loss, model, norm, head, lab_mb[m], ids_mb[m], chunk,
                                                extra_loss)
-                        # the head (final norm, vocabulary-wide loss, extra heads) is recomputed in backward, so only
-                        # its input lives from forward to backward
-                        # with a frozen output layer the loss forms its input gradient in forward and keeps only
-                        # that: recomputing it would repeat the vocabulary-wide work for nothing
+                        # A frozen head saves its input gradient in forward; checkpointing would repeat that work.
                         ckpt = (checkpoint_head if checkpoint_head != "auto" else
                                 getattr(getattr(head, "weight", None), "requires_grad", True)
                                 or not active_kernels().grad_in_forward)
@@ -511,7 +545,7 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
         head_owner_ = segs[-1].owner
         if share is not None and me != head_owner_:
             # the loss of this process's micro-batches: hidden states in, loss and input gradient out
-            w_head, norm_fn = share
+            w_head, norm_fn = share.weight, share.norm
             mine = [m for m in range(M) if head_of[m] == me]
             posted = [recv((*run_mb[m].shape, width), head_owner_, "aux") for m in mine]
             for m, inc in zip(mine, posted):
@@ -524,6 +558,9 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                                           None) * weight
                     loss.backward()
                     send(yh.grad, head_owner_, "aux")
+                    if share.train_norm:
+                        send(share.norm_weight.grad, head_owner_, "aux")
+                        share.norm_weight.grad = None
                 else:
                     loss = _head_loss(model, norm_fn, _Weight(w_head), lab_mb[m], ids_mb[m], chunk, None, yh,
                                       None) * weight
@@ -531,6 +568,8 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
         elif share is not None and remote:
             for m in sorted(remote):
                 remote[m] = (recv((*run_mb[m].shape, width), head_of[m], "aux") if backward else None,
+                             recv(share.norm_weight.shape, head_of[m], "aux", share.norm_weight.dtype)
+                             if backward and share.train_norm else None,
                              recv((1,), head_of[m], "aux", torch.float32))
         # backward: unit by unit, each over all micro-batches; a unit's gradients are complete after its last
         # micro-batch and the fused update applies and frees them, so one unit of gradients exists at a time
@@ -552,12 +591,17 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                     incoming = ([_LINKS[seg.next].recv(outs[(s, j, m)][1], dtype) for m in range(M)]
                                 if _LINKS and j == last and seg.items[j][0] != "head" else None)
                     for m in range(M):
-                        defer = (optimizer.accumulate() if optimizer is not None and m < M - 1
+                        shared_norm = (share is not None and share.train_norm and seg.items[j][0] == "head")
+                        defer = (optimizer.accumulate() if optimizer is not None and (m < M - 1 or shared_norm)
                                  else contextlib.nullcontext())
                         with defer, (backend.defer_wgrad() if defer_wgrad else contextlib.nullcontext()):
                             if seg.items[j][0] == "head" and m in remote:
-                                g_in, loss_in = remote[m]
+                                g_in, norm_in, loss_in = remote[m]
                                 ins[(s, j, m)] = _Received(g_in.take())    # read by the previous unit as .grad
+                                if norm_in is not None:
+                                    # Accumulate in micro-batch order, as when every loss lives on the head process.
+                                    w, gn = share.norm_weight, norm_in.take()
+                                    w.grad = gn if w.grad is None else w.grad.add_(gn)
                                 losses[m] = loss_in.take()[0]
                             elif seg.items[j][0] == "head":
                                 with _range(f"Bhead.{m}"):
@@ -588,6 +632,9 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                                 keep.append((dist.isend(gi, seg.prev, group=_group(me, seg.prev)), None))
                         ahead.tick()
                         _prune(keep)
+                    if share is not None and seg.items[j][0] == "head":
+                        if share.train_norm and optimizer is not None:
+                            optimizer._on_grad(share.norm_weight)
                     if defer_wgrad:
                         with _range(f"flush{s}.{j}"):
                             backend.flush_wgrad(optimizer=optimizer)    # this unit's weight gradients, then updates
@@ -596,7 +643,7 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                         _log("bwd unit", s, j, "done:", f"{torch.cuda.memory_allocated() / 2 ** 30:.2f} GiB,",
                              live, "params hold a gradient")
     if not backward:
-        for m, (_, loss_in) in remote.items():
+        for m, (_, _, loss_in) in remote.items():
             losses[m] = loss_in.take()[0]
     _log("step done, waiting for", len(keep), "sends")
     for work, _ in keep:

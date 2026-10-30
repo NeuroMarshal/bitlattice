@@ -1,27 +1,11 @@
-"""Fused decoder layers: a pre-norm transformer layer computed by Bitlattice code instead of its module tree.
+"""Qwen3.5 decoder blocks with recomputation and a manual backward.
 
-A decoder layer of Qwen3.5 (and models of the same shape)
+The forward saves the block input. Projections share quantized inputs; norms, SwiGLU and projections use explicit
+backward operations, while the mixer core keeps a local autograd graph. CUDA graphs can replay the block per shape.
 
-    x1 = x + mixer(norm1(x))          mixer: gated delta net (linear attention) or gated softmax attention
-    y  = x1 + down(silu(gate(h)) * up(h)),  h = norm2(x1)
-
-normally runs as dozens of modules, each a few PyTorch operators, plus autograd and activation checkpointing around
-them: on a slow CPU core the launches, not the GPU, set the pace. The ``fused_block`` conversion replaces the layer by
-one autograd node:
-
-* the forward keeps only the layer input; the backward recomputes the layer and differentiates it by hand;
-* projections that read the same input (q / k / v / z, gate / up) share one quantization of it, and the operands
-  of the weight gradients (NVFP4 and MXFP8 routes) are made once per input; with deferred weight gradients they are
-  kept for the end of the unit without passing through autograd;
-* the norms run on the CUDA kernels of :mod:`bitlattice.nn.norm`, the short convolution on
-  :func:`bitlattice.nn.causal_conv1d`, the delta rule on fla's chunked kernels, attention on the fused SDPA kernels;
-  only these few operators keep an autograd graph, local to the layer's backward.
-
-The layer's weights keep their compute settings (``bitlattice.surgery.set_compute_``): each projection computes on
-its route ('exact', 'nvfp4' with its FP4 recipe, 'mxfp8'); forward-only routes are not supported here. The
-conversion adopts the layer's parameters (same objects and names) and is checked against the layer on a random
-input. Calls with a cache, an attention mask or packed sequences go to the original layer (generation, evaluation);
-in training they are an error.
+Parameters and their compute settings are preserved. Supported routes are exact, NVFP4 and MXFP8 with their
+backward GEMMs enabled. Calls with caches, masks or packed sequences delegate to the original block during
+evaluation and raise during training.
 """
 from __future__ import annotations
 
@@ -36,11 +20,8 @@ from ..tensor import LatticeTensor
 __all__ = ["FusedBlock", "make_fused_block"]
 
 
-# projections
-
-
 class _Proj:
-    """A linear layer inside a fused block: computes on its weight's route, by hand (no autograd)."""
+    """Projection computed on its weight's route without building an autograd graph."""
 
     __slots__ = ("mod", "name")
 
@@ -65,9 +46,7 @@ class _Proj:
 
 
 class _Env:
-    """What a run replayed from a CUDA graph takes from outside the graph: the weights' derived operands (made
-    eagerly into fixed buffers, see :class:`_Scratch`), a device counter for the stochastic seeds, and a list that
-    receives the weight-gradient operands (copied out after the replay)."""
+    """Fixed weight operands, device RNG epoch and weight-gradient outputs of a graph replay."""
 
     __slots__ = ("epoch", "w_ops", "wt_ops", "keep")
 
@@ -77,28 +56,27 @@ class _Env:
 
 
 class _Input:
-    """One input [M, K] of several projections: its quantized operands are made once per (route, recipe) and
-    shared, so is the transposed operand of the weight gradients."""
+    """Shared quantized operands of a projection input [M, K], keyed by route and recipe."""
 
     def __init__(self, x2: torch.Tensor, train: bool, env: _Env | None = None):
         self.x2, self.train, self.env = x2, train, env
         self.ops: dict = {}
 
-    def operands(self, route: str, comp, site):
-        key = (route, comp.nvfp4 if route == "fp4_all" else None)
-        hit = self.ops.get(key)
+    def operands(self, route: str, comp, site, row: bool = True):
+        key = (route, comp.nvfp4 if route == "fp4_all" else None, row)
+        hit = self.ops.get(key) or self.ops.get(key[:2] + (True,))
         if hit is not None:
             return hit
         x = self.x2
         if route == "fp4_all":
             recipe = comp.nvfp4
             if self.train:
-                xq, xt = backend._input_operands(x, recipe, site, self.env.epoch if self.env else None)
+                xq, xt = backend._input_operands(x, recipe, site, self.env.epoch if self.env else None, row=row)
             else:
                 xq = backend._act_operand(backend._pad_rows(x, 16).contiguous(), recipe)
                 xt = None
         else:                                                                    # mxfp8_all
-            xq, xt = backend._mx2(backend._pad_rows(x, 128).contiguous(), True, self.train)
+            xq, xt = backend._mx2(backend._pad_rows(x, 128).contiguous(), row, self.train)
         self.ops[key] = (xq, xt)
         return xq, xt
 
@@ -139,6 +117,26 @@ def _project(p: _Proj, inp: _Input, saved: dict | None) -> torch.Tensor:
     return y
 
 
+def _prepare_back(p: _Proj, inp: _Input, saved: dict) -> None:
+    """Prepare the input operand for backward without recomputing an unused projection output."""
+    x = inp.x2
+    route, comp = p.route(x)
+    with _kernel_scope(comp):
+        xt = None
+        if route == "fp4_all":
+            _, xt = inp.operands(route, comp, backend._site(p.weight, "x"), row=False)
+        elif route == "mxfp8_all":
+            _, xt = inp.operands(route, comp, None, row=False)
+    saved[p.name] = (route, comp, xt, x if route not in ("fp4_all", "mxfp8_all") else None, inp.env)
+
+
+def _grad(grads: dict, t: torch.Tensor, g: torch.Tensor) -> None:
+    if t in grads:
+        grads[t] = grads[t] + g
+    else:
+        grads[t] = g
+
+
 def _project_back(p: _Proj, gy: torch.Tensor, saved: dict, need_x: bool, grads: dict) -> torch.Tensor | None:
     """Input gradient of a projection (None if not needed); its weight / bias gradients go to ``grads`` (a deferred
     weight gradient is kept by the back end instead)."""
@@ -165,10 +163,10 @@ def _project_back(p: _Proj, gy: torch.Tensor, saved: dict, need_x: bool, grads: 
     if gx is not None:
         gx = gx[:gy.shape[0]].to(gy.dtype)
     if gw is not None:
-        grads[w] = gw.to(w.dtype)
+        _grad(grads, w, gw.to(w.dtype))
     b = getattr(p.mod, "bias", None)
     if b is not None and b.requires_grad:
-        grads[b] = gy.sum(0).to(b.dtype)
+        _grad(grads, b, gy.sum(0).to(b.dtype))
     return gx
 
 
@@ -178,9 +176,6 @@ def _acc(a: torch.Tensor | None, b: torch.Tensor | None) -> torch.Tensor | None:
     if b is None:
         return a
     return a.add_(b)
-
-
-# norms
 
 
 class _Norm:
@@ -215,18 +210,13 @@ def _norm_of(mod) -> _Norm:
     return _Norm(mod, eps, conv[1], conv[2])
 
 
-# mixers: projections by hand, the rest ("core") through a small local graph
-
-
 def _leaves(params: list) -> list:
-    """Detached stand-ins of the layer's small parameters for the core's local graph (its gradients are taken at
-    them; the parameters' own autograd nodes are never part of it)."""
+    """Detached parameter leaves keep the core's local graph separate from the block's autograd node."""
     return [None if t is None else t.detach().requires_grad_(t.requires_grad) for t in params]
 
 
 def _core_grads(o, leaves: list, small: list, params: list, do, grads: dict) -> list:
-    """Gradients of the core output ``o`` (with ``do``) at the input leaves; the small parameters' gradients go to
-    ``grads``."""
+    """Return core input gradients and collect parameter gradients in ``grads``."""
     want = [(t, p) for t, p in zip(small, params) if t is not None and t.requires_grad]
     got = torch.autograd.grad(o, leaves + [t for t, _ in want], do, allow_unused=True)
     for (t, p), g in zip(want, got[len(leaves):]):
@@ -235,11 +225,9 @@ def _core_grads(o, leaves: list, small: list, params: list, do, grads: dict) -> 
 
 
 class _DeltaNetMixer:
-    """Gated delta net (Qwen3.5 / Qwen3-Next linear attention): in_proj_qkv / z / b / a, causal convolution + SiLU,
-    chunked gated delta rule (q / k l2-normalized, decay -exp(A_log) softplus(a + dt_bias), beta = sigmoid(b)),
-    normalize-then-gate RMSNorm with z, out_proj."""
+    """Qwen3.5 linear attention: causal convolution, gated delta rule and gated RMSNorm."""
 
-    def __init__(self, m):
+    def __init__(self, m, seq_chunk: int = 0):
         from .convert import Unfit
         need = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "conv1d", "A_log", "dt_bias", "norm", "out_proj")
         if not all(hasattr(m, k) for k in need):
@@ -250,7 +238,11 @@ class _DeltaNetMixer:
             from fla.ops.gated_delta_rule import chunk_gated_delta_rule
         except ImportError as e:
             raise Unfit(f"the delta rule kernels need flash-linear-attention ({e})") from None
+        if seq_chunk:
+            from .sequence import sequence_chunked
+            chunk_gated_delta_rule = sequence_chunked(chunk_gated_delta_rule, seq_chunk)
         self.rule = chunk_gated_delta_rule
+        self.seq_chunk = seq_chunk
         self.m = m
         self.qkv, self.z = _Proj(m.in_proj_qkv, "in_proj_qkv"), _Proj(m.in_proj_z, "in_proj_z")
         self.b, self.a = _Proj(m.in_proj_b, "in_proj_b"), _Proj(m.in_proj_a, "in_proj_a")
@@ -263,13 +255,11 @@ class _DeltaNetMixer:
         return [self.qkv, self.z, self.b, self.a, self.out]
 
     def small(self) -> list:
-        """The layer's own small parameters used by the core (None where absent)."""
         m = self.m
         return [m.conv1d.weight, m.conv1d.bias, m.A_log, m.dt_bias, m.norm.weight]
 
     def _core(self, qkv, z, b, a, B: int, T: int, small: list):
-        """Everything between the input projections and out_proj; [M, value_dim]. ``small``: the tensors to use for
-        the conv weight / bias, A_log, dt_bias and the norm weight (leaves of a local graph in backward)."""
+        """Mixer between the input and output projections; ``small`` supplies its parameter leaves."""
         from .conv import _CausalConv1d
         from .norm import rms_norm_gated
         conv_w, conv_b, A_log, dt_bias, norm_w = small
@@ -308,9 +298,7 @@ class _DeltaNetMixer:
 
 
 class _AttentionMixer:
-    """Gated softmax attention (Qwen3.5 full-attention layers): q_proj gives queries and an output gate per head,
-    q / k RMS-normalized per head, partial rotary embedding, causal SDPA with grouped KV heads, output gated by
-    sigmoid(gate), o_proj."""
+    """Qwen3.5 gated attention with per-head Q/K norms, partial RoPE and grouped KV heads."""
 
     def __init__(self, m):
         import sys
@@ -388,10 +376,10 @@ def _swiglu_bwd(g, u, da):
 
 
 class _SwiGLU:
-    """down(silu(gate(h)) * up(h)); the activation rounds as the reference does (silu to the activation dtype, then
-    the product)."""
+    """Position-wise SwiGLU in token pieces (``chunk=0``: all rows), preserving the reference's activation rounding.
+    Backward recomputes each piece from the MLP input and skips the unused down-projection output."""
 
-    def __init__(self, mlp):
+    def __init__(self, mlp, chunk: int = 0):
         from .convert import Unfit
         if not all(hasattr(mlp, k) for k in ("gate_proj", "up_proj", "down_proj")):
             raise Unfit("the MLP is not gate_proj / up_proj / down_proj")
@@ -400,46 +388,64 @@ class _SwiGLU:
             raise Unfit(f"MLP activation {type(act).__name__}")
         self.gate, self.up = _Proj(mlp.gate_proj, "gate_proj"), _Proj(mlp.up_proj, "up_proj")
         self.down = _Proj(mlp.down_proj, "down_proj")
+        self.chunk = int(chunk)
 
     def projections(self):
         return [self.gate, self.up, self.down]
 
-    def forward(self, h2, saved: dict | None, env=None):
-        inp = _Input(h2, saved is not None, env)
-        g, u = _project(self.gate, inp, saved), _project(self.up, inp, saved)
-        act = _swiglu(g, u)
-        if saved is not None:
-            saved["gu"] = (g, u)
-        return _project(self.down, _Input(act, saved is not None, env), saved)
+    def _pieces(self, n: int):
+        step = self.chunk if 0 < self.chunk < n else n
+        return [(r, min(n, r + step)) for r in range(0, n, step)]
 
-    def backward(self, dy, saved: dict, grads: dict) -> torch.Tensor:
-        da = _project_back(self.down, dy, saved, True, grads)
-        g, u = saved.pop("gu")
-        dg, du = _swiglu_bwd(g, u, da)
-        dh = _project_back(self.gate, dg, saved, True, grads)
-        return _acc(dh, _project_back(self.up, du, saved, True, grads))
+    def forward(self, h2, env=None):
+        pieces = self._pieces(h2.shape[0])
+        out = None if len(pieces) == 1 else torch.empty_like(h2)
+        for r0, r1 in pieces:
+            inp = _Input(h2[r0:r1], False, env)
+            y = _project(self.down, _Input(_swiglu(_project(self.gate, inp, None), _project(self.up, inp, None)),
+                                           False, env), None)
+            if out is None:
+                return y
+            out[r0:r1] = y
+        return out
 
-
-# the layer
+    def backward(self, h2, dy, grads: dict, env=None) -> torch.Tensor:
+        pieces = self._pieces(h2.shape[0])
+        dh = None if len(pieces) == 1 else torch.empty_like(h2)
+        for r0, r1 in pieces:
+            saved = {}
+            inp = _Input(h2[r0:r1] if len(pieces) > 1 else h2, True, env)
+            g, u = _project(self.gate, inp, saved), _project(self.up, inp, saved)
+            _prepare_back(self.down, _Input(_swiglu(g, u), True, env), saved)
+            del inp
+            da = _project_back(self.down, dy[r0:r1] if len(pieces) > 1 else dy, saved, True, grads)
+            dg, du = _swiglu_bwd(g, u, da)
+            del g, u, da
+            d = _project_back(self.gate, dg, saved, True, grads)
+            d = _acc(d, _project_back(self.up, du, saved, True, grads))
+            if dh is None:
+                return d
+            dh[r0:r1] = d
+        return dh
 
 
 class _Plan:
     """Forward and hand-written backward of one fused layer."""
 
-    def __init__(self, layer):
+    def __init__(self, layer, mlp_chunk: int = 0, seq_chunk: int = 0):
         from .convert import Unfit
         self.layer = layer
         self.norm1 = _norm_of(layer.input_layernorm)
         self.norm2 = _norm_of(layer.post_attention_layernorm)
         if hasattr(layer, "linear_attn"):
-            self.mixer = _DeltaNetMixer(layer.linear_attn)
+            self.mixer = _DeltaNetMixer(layer.linear_attn, seq_chunk)
         elif hasattr(layer, "self_attn"):
             self.mixer = _AttentionMixer(layer.self_attn)
         else:
             raise Unfit("no linear_attn / self_attn mixer")
         if not hasattr(layer, "mlp"):
             raise Unfit("no mlp")
-        self.mlp = _SwiGLU(layer.mlp)
+        self.mlp = _SwiGLU(layer.mlp, mlp_chunk)
 
     def params(self) -> list[torch.Tensor]:
         seen, out = set(), []
@@ -449,16 +455,17 @@ class _Plan:
                 out.append(p)
         return out
 
-    def run(self, x: torch.Tensor, ctx, saved: dict | None, env: _Env | None = None) -> torch.Tensor:
+    def run(self, x: torch.Tensor, ctx, saved: dict | None, env: _Env | None = None) -> torch.Tensor | None:
+        """Compute the output, or stop at the MLP input when preparing ``saved`` for backward."""
         B, T, D = x.shape
         x2 = x.reshape(B * T, D)
         h, r1 = self.norm1.forward(x2)
         x1 = x2 + self.mixer.forward(h, B, T, ctx, saved, env)
         h2, r2 = self.norm2.forward(x1)
-        out = x1 + self.mlp.forward(h2, saved, env)
         if saved is not None:
-            saved["norms"] = (x2, r1, x1, r2)
-        return out.view(B, T, D)
+            saved["norms"] = (x2, r1, x1, r2, h2)
+            return None
+        return (x1 + self.mlp.forward(h2, env)).view(B, T, D)
 
     def projections(self) -> list[_Proj]:
         return self.mixer.projections() + self.mlp.projections()
@@ -467,9 +474,10 @@ class _Plan:
         saved, grads = {}, {}
         with torch.no_grad():
             self.run(x, ctx, saved, env)
-            x2, r1, x1, r2 = saved.pop("norms")
+            x2, r1, x1, r2, h2 = saved.pop("norms")
             d = dy.reshape(x2.shape)
-            dh2 = self.mlp.backward(d, saved, grads)
+            dh2 = self.mlp.backward(h2, d, grads, env)
+            del h2
             dx1 = d + self.norm2.backward(x1, r2, dh2, grads)
             del x1, dh2
             dh = self.mixer.backward(dx1, saved, grads)
@@ -484,15 +492,7 @@ def _range(name: str):
     return torch.cuda.nvtx.range(name) if _NVTX else contextlib.nullcontext()
 
 
-# CUDA graphs
-#
-# A fused layer is a fixed sequence of kernels for a given input shape, so it can be recorded once and replayed: one
-# host call per layer and micro-batch instead of a few hundred kernel launches. What a replay needs from outside is
-# put in fixed places: the input (copied into a buffer per shape), the weights' derived operands (made eagerly into
-# per-slot buffers when the slot changes layer or the weights change), a device counter mixed into the stochastic
-# seeds (incremented by the graph itself), and the outputs (copied out of fixed buffers after the replay). All
-# fused-layer graphs of a device share one memory pool: replays run one after another on one stream and no graph's
-# memory is read after its replay.
+# Graphs share a pool and replay serially on one stream. Copy outputs out before another replay reuses the pool.
 
 
 class _Device:
@@ -550,7 +550,7 @@ def _load_slot(dev: _Device, plan, x, with_t: bool) -> tuple[dict, dict]:
     """Weight operands of the layer's FP4 projections in the slot's fixed buffers: (W operands, W^T operands). They
     are remade only when the slot held another layer or the weights changed since; W^T is added when first needed."""
     projs = _fp4_projs(plan, x)
-    key = (id(plan), tuple(getattr(p.weight, "_bl_version", 0) for p, _ in projs))
+    key = (id(plan), tuple((getattr(p.weight, "_bl_version", 0), comp.nvfp4) for p, comp in projs))
     held, bufs, w_ops, wt_ops = dev.slots.get(plan.slot, (None, {}, {}, {}))
     if held != key:
         w_ops, wt_ops = {}, {}
@@ -569,7 +569,8 @@ def _load_slot(dev: _Device, plan, x, with_t: bool) -> tuple[dict, dict]:
         for p, comp in projs:
             w = p.weight
             seed = _slot_seed(plan.slot, p.name)
-            wt = backend.weight_t_rotated_operand(w, comp.nvfp4.backward_4over6, seed=seed)
+            wt = backend.weight_t_rotated_operand(w, comp.nvfp4.backward_4over6, seed=seed,
+                                                   scale_source=comp.nvfp4.dgrad_scale)
             for k, t in (("tp", wt.packed), ("ts", wt.scales), ("tg", wt.global_scale.float().reshape(1))):
                 b = bufs.get((p.name, k))
                 if b is None or b.shape != t.shape:
@@ -680,7 +681,7 @@ class _Graphs:
             w = p.weight
             gw = backend._weight_grad(w, gt, xt)
             if gw is not None:
-                grads[w] = gw.to(w.dtype)
+                _grad(grads, w, gw.to(w.dtype))
         return dxout.clone(), grads
 
     def _capture_backward(self, dev, key, xin, cin, sinb, dyin, w_ops, wt_ops):
@@ -699,10 +700,11 @@ class _Graphs:
                 b.copy_(g)
                 small[t] = b
             staged, by_id = [], {}
-            for p, gt, xt in env.keep:
-                gt_b = _Staged.of(dev, ("gt", p.name, key[1:3]), gt)
+            for i, (p, gt, xt) in enumerate(env.keep):
+                # A chunked projection contributes several operands. Each must survive until the replay ends.
+                gt_b = _Staged.of(dev, ("gt", p.name, i, key[1:3]), gt)
                 if id(xt) not in by_id:
-                    by_id[id(xt)] = _Staged.of(dev, ("xt", p.name, key[1:3]), xt)
+                    by_id[id(xt)] = _Staged.of(dev, ("xt", p.name, i, key[1:3]), xt)
                 staged.append((p, gt_b, by_id[id(xt)]))
             holder.update(dxout=dxout, small=small, staged=staged)
         graph, _ = self._capture(dev, run)
@@ -738,7 +740,8 @@ class _FusedFn(torch.autograd.Function):
         with torch.no_grad():
             if graphs is not None:
                 return graphs.forward(x, cos, sin)
-            return plan.run(x, (cos, sin), None)
+            # The pipeline releases an output by replacing its data. A view would still retain its base's storage.
+            return plan.run(x, (cos, sin), None).detach()
 
     @staticmethod
     def backward(ctx, dy):
@@ -757,7 +760,7 @@ class _FusedFn(torch.autograd.Function):
 _SLOTS = [0]
 
 
-def make_fused_block(layer, graphs: bool = False, slots: int = 2):
+def make_fused_block(layer, graphs: bool = False, slots: int = 2, mlp_chunk: int = 0, seq_chunk: int = 0):
     from .convert import Unfit
     if not all(hasattr(layer, k) for k in ("input_layernorm", "post_attention_layernorm")):
         raise Unfit("not a pre-norm decoder layer (input_layernorm, post_attention_layernorm)")
@@ -765,7 +768,11 @@ def make_fused_block(layer, graphs: bool = False, slots: int = 2):
         raise Unfit("parameters not materialized (meta): the layer lives on another process")
     if graphs and not next(layer.parameters()).is_cuda:
         raise Unfit("CUDA graphs need the layer on a CUDA device")
-    plan = _Plan(layer)
+    if mlp_chunk < 0:
+        raise ValueError("mlp_chunk must be >= 0")
+    if seq_chunk < 0 or seq_chunk % 64:
+        raise ValueError("seq_chunk must be 0 or a positive multiple of 64")
+    plan = _Plan(layer, mlp_chunk, seq_chunk)
     plan.slot = _SLOTS[0] % max(1, slots)                 # consecutive layers use different operand slots
     _SLOTS[0] += 1
     return FusedBlock(layer, plan, _Graphs(plan) if graphs else None)
@@ -803,4 +810,5 @@ class FusedBlock(Converted):
 
     def settings(self):
         mixer = type(self.plan.mixer).__name__.strip("_").replace("Mixer", "").lower()
-        return f"{mixer}, graphs={'on' if self.graphs is not None else 'off'}"
+        return (f"{mixer}, graphs={'on' if self.graphs is not None else 'off'}, mlp_chunk={self.plan.mlp.chunk}, "
+                f"seq_chunk={getattr(self.plan.mixer, 'seq_chunk', 0)}")
