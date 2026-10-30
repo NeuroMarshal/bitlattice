@@ -331,17 +331,18 @@ def weight_t_operand(w) -> Fp4Operand:
     return _cached(w, "wt", make)
 
 
-def weight_t_rotated_operand(w, four_over_six: bool = False) -> Fp4Operand:
+def weight_t_rotated_operand(w, four_over_six: bool = False, seed: int | None = None) -> Fp4Operand:
     """W^T [K, N] rotated along N (128-blocks) and re-quantized once per weight version (round to nearest); the
-    rotation seed (``rotate_seed`` of the result) is fixed per version."""
-    ver = getattr(w, "_bl_version", 0)
-    seed = (id(w) * 2654435761 + ver * 40503 + 1) & 0x7FFFFFFF
-
-    def make():
+    rotation seed (``rotate_seed`` of the result) is fixed per version, or ``seed`` (then not cached)."""
+    def make(seed):
         packed, scales, g = torch.ops.bitlattice.nvfp4_quantize(w.packed, True, _RTN, four_over_six, False, True, 0,
                                                                 None, w.scales, w.global_scale, seed, True)
         return Fp4Operand(packed, scales, g, True, seed)
-    return _cached(w, "wt128_4o6" if four_over_six else "wt128", make)
+    if seed is not None:
+        return make(seed)
+    ver = getattr(w, "_bl_version", 0)
+    seed = (id(w) * 2654435761 + ver * 40503 + 1) & 0x7FFFFFFF
+    return _cached(w, "wt128_4o6" if four_over_six else "wt128", lambda: make(seed))
 
 
 @cache
@@ -394,14 +395,15 @@ def _q(x2: torch.Tensor, *, transpose: bool = False, mode: int = _RTN, four_over
 
 
 def _side(on: bool, mode: int = _RTN, four_over_six: bool = False, rotate_seed: int = -1, seed: int = 0,
-          pow2: bool = False) -> list:
-    return [int(on), mode, int(four_over_six), int(rotate_seed >= 0), seed, rotate_seed, int(pow2)]
+          pow2: bool = False, mix_rot: bool = False) -> list:
+    return [int(on), mode, int(four_over_six), int(rotate_seed >= 0), seed, rotate_seed, int(pow2), int(mix_rot)]
 
 
-def _q2(x2: torch.Tensor, row: list, col: list, recipe: Fp4Recipe, site: dict | None = None
-        ) -> tuple[Fp4Operand | None, Fp4Operand | None]:
+def _q2(x2: torch.Tensor, row: list, col: list, recipe: Fp4Recipe, site: dict | None = None,
+        epoch: torch.Tensor | None = None) -> tuple[Fp4Operand | None, Fp4Operand | None]:
     """Row and column (x2^T) operands of x2 [M, K] (both multiples of 128) from one read of x2 per pass. ``site``:
-    the delayed-scaling state of this operand (amax of the previous call, sides seen)."""
+    the delayed-scaling state of this operand (amax of the previous call, sides seen). ``epoch``: a device counter
+    mixed into the seeds (calls replayed from a CUDA graph)."""
     given = seen = None
     if recipe.scale_source == "delayed" and site is not None:
         on = (bool(row[0]), bool(col[0]))
@@ -414,7 +416,7 @@ def _q2(x2: torch.Tensor, row: list, col: list, recipe: Fp4Recipe, site: dict | 
                 given = torch.where(pow2, torch.exp2(torch.ceil(torch.log2(given))), given)
         seen = torch.zeros(2, device=x2.device)
     rp, rs, rg, cp, cs, cg = torch.ops.bitlattice.nvfp4_quantize2(x2, row, col, recipe.select == "mae", given, True,
-                                                                  seen)
+                                                                  seen, epoch)
     if seen is not None:
         hist = site.get("amax")
         site["amax"] = seen if hist is None else torch.stack([seen[i] if on[i] else hist[i] for i in range(2)])
@@ -497,7 +499,8 @@ def _site(w, role: str) -> dict:
     return sites.setdefault(role, {})
 
 
-def _input_operands(x: torch.Tensor, recipe: Fp4Recipe, site: dict | None = None) -> tuple[Fp4Operand, Fp4Operand]:
+def _input_operands(x: torch.Tensor, recipe: Fp4Recipe, site: dict | None = None,
+                    epoch: torch.Tensor | None = None) -> tuple[Fp4Operand, Fp4Operand]:
     """Forward operand of x and its (rotated) transposed operand for the weight gradient."""
     K = x.shape[-1]
     x2 = _pad_rows(x.reshape(-1, K), _pad_to(recipe)).contiguous()
@@ -508,7 +511,9 @@ def _input_operands(x: torch.Tensor, recipe: Fp4Recipe, site: dict | None = None
         # the weight-gradient operands get power-of-two global scales: micro-batches can then be concatenated
         # exactly into one GEMM (deferred weight gradients)
         return _q2(x2, _side(True, _RTN, recipe.activations == "4over6"),
-                   _side(True, mode, fos, _seed(), _seed(), pow2=True), recipe, site)
+                   _side(True, mode, fos, _seed(), _seed(), pow2=True, mix_rot=True), recipe, site, epoch)
+    if epoch is not None:
+        raise RuntimeError("operands replayed from a CUDA graph need a recipe with the 128-element rotation")
     xq = _act_operand(x2, recipe)
     if recipe.rotation == 16:
         # |x H/4| <= 4 max|x| for the orthogonal 16x16 rotation: the row-wise global scale bounds the rotated one
@@ -524,8 +529,18 @@ def _input_operands(x: torch.Tensor, recipe: Fp4Recipe, site: dict | None = None
 
 
 def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool,
-                 recipe: Fp4Recipe = Fp4Recipe()):
-    """Input and weight gradients of y = x W^T on FP4 tensor cores."""
+                 recipe: Fp4Recipe = Fp4Recipe(), *, wt: Fp4Operand | None = None, keep: list | None = None,
+                 epoch: torch.Tensor | None = None):
+    """Input and weight gradients of y = x W^T on FP4 tensor cores.
+
+    wt     the rotated W^T operand to use (``dgrad_weight='cached'`` recipes; default: the per-version cache)
+    keep   the weight-gradient operands (g^T, x^T) are appended here instead of being multiplied or deferred
+    epoch  device counter mixed into the stochastic seeds (calls replayed from a CUDA graph)"""
+    if (wt is not None or keep is not None or epoch is not None) and not (
+            recipe.rotation == 128 and recipe.rotate_dgrad and recipe.dgrad_weight == "cached"
+            and gy.shape[-1] % 128 == 0 and (xt is None or xt.rotate_seed >= 0)):
+        raise RuntimeError("explicit W^T / kept operands / device seeds need a 'quartet2_fast'-like recipe and "
+                           "output features in multiples of 128")
     N = gy.shape[-1]
     g2 = gy.reshape(-1, N)
     M = g2.shape[0]
@@ -538,20 +553,23 @@ def fp4_backward(gy: torch.Tensor, w, xt: Fp4Operand, need_x: bool, need_w: bool
         # one read of g for the input-gradient operand (rows, rotated along N) and the weight-gradient operand
         # (columns, rotated along the tokens with the rotation of the saved x^T)
         mode = _EDEN if recipe.gradients == "eden" else _SR
-        wt = None
-        if need_x and recipe.dgrad_weight == "cached":
+        if need_x and recipe.dgrad_weight == "cached" and wt is None:
             wt = weight_t_rotated_operand(w, b46)
         r = wt.rotate_seed if wt is not None else _seed()
+        # the dgrad rotation must match W^T's (made outside a graph): only the wgrad side mixes it with the epoch
         gq, gt = _q2(g2p, _side(need_x, mode, b46, r, _seed()),
-                     _side(need_w, mode, b46, xt.rotate_seed if need_w else -1, _seed(), pow2=True), recipe,
-                     _site(w, "g"))
+                     _side(need_w, mode, b46, xt.rotate_seed if need_w else -1, _seed(), pow2=True, mix_rot=True),
+                     recipe, _site(w, "g"), epoch)
         if need_x:
             if wt is None:
                 wt = _q(None, mode=_EDEN if mode == _EDEN else _RTN, four_over_six=b46, recipe=recipe, rotate_seed=r,
                         seed=_seed(), w=w)
             gx = fp4_mm(gq, wt, gy.dtype)[:M]
         if need_w:
-            gw = _weight_grad(w, gt, xt)
+            if keep is not None:
+                keep.append((gt, xt))
+            else:
+                gw = _weight_grad(w, gt, xt)
         return gx, gw
     if need_x:
         if recipe.rotate_dgrad and N % 128 == 0:

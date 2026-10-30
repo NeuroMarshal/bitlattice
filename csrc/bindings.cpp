@@ -45,7 +45,8 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> bl_nvfp4_quantize2(Te
                                                                              std::vector<int64_t> col, bool mae,
                                                                              std::optional<Tensor> global_scales,
                                                                              bool blocked,
-                                                                             std::optional<Tensor> amax_out);
+                                                                             std::optional<Tensor> amax_out,
+                                                                             std::optional<Tensor> epoch);
 Tensor bl_swiglu_fwd(Tensor g, Tensor u);
 std::tuple<Tensor, Tensor> bl_swiglu_bwd(Tensor g, Tensor u, Tensor da);
 Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::optional<Tensor> c, int64_t k, double beta2,
@@ -84,7 +85,7 @@ TORCH_LIBRARY(bitlattice, m) {
         "int rotate_seed=-1, bool blocked=False, bool pow2_global=False) "
         "-> (Tensor, Tensor, Tensor)");
   m.def("nvfp4_quantize2(Tensor x, int[] row, int[] col, bool mae=False, Tensor? global_scales=None, "
-        "bool blocked=False, Tensor(a!)? amax_out=None) "
+        "bool blocked=False, Tensor(a!)? amax_out=None, Tensor? epoch=None) "
         "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
   m.def("mx_pack(Tensor x) -> (Tensor, Tensor)");
   m.def("mx_unpack(Tensor codes, Tensor scales, ScalarType dtype) -> Tensor");

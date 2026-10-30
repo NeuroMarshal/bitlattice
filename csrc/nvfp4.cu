@@ -374,7 +374,14 @@ struct Side {
   bool rotate;
   uint32_t seed, rseed;
   bool pow2;         // global scale rounded up to a power of two (operands that are later concatenated exactly)
+  bool mix_rot;      // with a device epoch: the rotation seed is mixed with it too (else only the stochastic draws)
 };
+
+// Seeds of a call replayed from a CUDA graph: the host seeds are fixed in the graph, so each replay mixes in a
+// counter that lives on the device (incremented by the graph itself)
+__device__ __forceinline__ uint32_t mix_epoch(uint32_t seed, const uint32_t* epoch) {
+  return epoch ? seed ^ ((*epoch + 1u) * 0x9E3779B1u) : seed;
+}
 
 template <typename T> struct Stage { using type = T; static constexpr int kSwz = 3; };
 template <> struct Stage<float> { using type = float; static constexpr int kSwz = 2; };
@@ -405,7 +412,7 @@ template <typename T, bool kAmax>
 __global__ void __launch_bounds__(256) dual_kernel(const T* __restrict__ x, int64_t M, int64_t K, Side row, Side col,
                                                    bool mae, float* amax, const float* given, float* g_out,
                                                    uint8_t* rp, ScaleOut rs, uint8_t* cp, ScaleOut cs,
-                                                   float* amax_out) {
+                                                   float* amax_out, const uint32_t* epoch) {
   using E = typename Stage<T>::type;
   constexpr int kSwz = Stage<T>::kSwz;
   constexpr int kPer = 16 / sizeof(E);                       // elements per 16-byte vector
@@ -418,6 +425,12 @@ __global__ void __launch_bounds__(256) dual_kernel(const T* __restrict__ x, int6
         *reinterpret_cast<const uint4*>(x + (r0 + r) * K + k0 + c);
   }
   const int lane8 = threadIdx.x & 7, sub = threadIdx.x >> 3;   // sub: 0..31
+  if (epoch) {
+    row.seed = mix_epoch(row.seed, epoch);
+    col.seed = mix_epoch(col.seed, epoch);
+    if (row.mix_rot) row.rseed = mix_epoch(row.rseed, epoch);
+    if (col.mix_rot) col.rseed = mix_epoch(col.rseed, epoch);
+  }
   const uint32_t rmask = row.on && row.rotate ? sign_mask(lane8, row.rseed) : 0u;
   const uint32_t cmask = col.on && col.rotate ? sign_mask(lane8, col.rseed) : 0u;
   float gr = 0.0f, gc = 0.0f;
@@ -592,10 +605,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bl_nvfp4_quantize(at::Tensor x, b
 // (zeroed [2]): receives the amax of each (rotated) side as seen by the quantization pass.
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> bl_nvfp4_quantize2(
     at::Tensor x, std::vector<int64_t> row, std::vector<int64_t> col, bool mae, std::optional<at::Tensor> global_scales,
-    bool blocked, std::optional<at::Tensor> amax_out) {
+    bool blocked, std::optional<at::Tensor> amax_out, std::optional<at::Tensor> epoch) {
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 2, "x must be a contiguous 2-D CUDA tensor");
-  TORCH_CHECK((row.size() == 6 || row.size() == 7) && (col.size() == 6 || col.size() == 7),
-              "row / col: {on, mode, four_over_six, rotate, seed, rotate_seed[, pow2_global]}");
+  TORCH_CHECK(row.size() >= 6 && row.size() <= 8 && col.size() >= 6 && col.size() <= 8,
+              "row / col: {on, mode, four_over_six, rotate, seed, rotate_seed[, pow2_global[, mix_rotation]]}");
+  TORCH_CHECK(!epoch.has_value() || (epoch->is_cuda() && epoch->numel() == 1 &&
+                                     (epoch->scalar_type() == at::kInt || epoch->scalar_type() == at::kLong)),
+              "epoch: one int32 on the device");
   const int64_t M = x.size(0), K = x.size(1);
   TORCH_CHECK(M % 128 == 0 && K % 128 == 0, "both dimensions must be multiples of 128");
   TORCH_CHECK(!amax_out.has_value() || (amax_out->is_cuda() && amax_out->scalar_type() == at::kFloat &&
@@ -604,7 +620,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
   const c10::cuda::CUDAGuard guard(x.device());
   auto side = [](const std::vector<int64_t>& v) {
     return Side{v[0] != 0, static_cast<int>(v[1]), v[2] != 0, v[3] != 0, static_cast<uint32_t>(v[4]),
-                static_cast<uint32_t>(v[5] < 0 ? v[4] : v[5]), v.size() > 6 && v[6] != 0};
+                static_cast<uint32_t>(v[5] < 0 ? v[4] : v[5]), v.size() > 6 && v[6] != 0, v.size() > 7 && v[7] != 0};
   };
   const Side rs = side(row), cs = side(col);
   auto opt = x.options().dtype(at::kByte);
@@ -628,10 +644,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
       cudaFuncSetAttribute(k_quant, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
     }
     float* ao = amax_out.has_value() ? amax_out->data_ptr<float>() : nullptr;
+    const uint32_t* ep = epoch.has_value() ? reinterpret_cast<const uint32_t*>(epoch->data_ptr()) : nullptr;
     if (!gp) k_amax<<<grid, 256, smem, stream>>>(ptr, M, K, rs, cs, mae, amax.data_ptr<float>(), nullptr, nullptr,
-                                                 nullptr, rso, nullptr, cso, nullptr);
+                                                 nullptr, rso, nullptr, cso, nullptr, ep);
     k_quant<<<grid, 256, smem, stream>>>(ptr, M, K, rs, cs, mae, amax.data_ptr<float>(), gp, g.data_ptr<float>(),
-                                         rp.data_ptr<uint8_t>(), rso, cp.data_ptr<uint8_t>(), cso, ao);
+                                         rp.data_ptr<uint8_t>(), rso, cp.data_ptr<uint8_t>(), cso, ao, ep);
   };
   if (x.scalar_type() == at::kBFloat16) launch(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()));
   else if (x.scalar_type() == at::kHalf) launch(reinterpret_cast<const __half*>(x.data_ptr<at::Half>()));
