@@ -325,17 +325,38 @@ __global__ void col_kernel(const T* x, int64_t rows, int64_t cols, Fp4Input w, O
   __shared__ float tile[128][33];
   const int t = threadIdx.x;
   const int64_t r0 = static_cast<int64_t>(blockIdx.y) * 128, c0 = static_cast<int64_t>(blockIdx.x) * 32;
-#pragma unroll
-  for (int i = 0; i < 16; ++i) {
-    const int idx = i * 256 + t, rr = idx >> 5, cc = idx & 31;
+  if constexpr (std::is_same_v<T, uint8_t>) {
+    // One NVFP4 block per thread: load its eight packed bytes and scale once, then decode all sixteen values.
+    const int rr = t >> 1, cc = (t & 1) * 16;
     const int64_t r = r0 + rr, c = c0 + cc;
-    tile[rr][cc] = (r < rows && c < cols) ? load_elem<T>(x, cols, r, c, w) : 0.0f;
+    float decoded[16] = {};
+    if (r < rows && c < cols) {
+      const uint64_t bits = *reinterpret_cast<const uint64_t*>(w.packed + r * (cols / 2) + c / 2);
+      __nv_fp8_e4m3 s8;
+      s8.__x = w.scales[r * (cols / 16) + c / 16];
+      uint32_t codes[16];
+#pragma unroll
+      for (int i = 0; i < 16; ++i) codes[i] = (bits >> (4 * i)) & 15u;
+      values16(codes, static_cast<float>(s8), decoded);
+      const float global = *w.g;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) decoded[i] *= global;
+    }
+#pragma unroll
+    for (int i = 0; i < 16; ++i) tile[rr][(cc + i) ^ ((rr >> 4) * 4)] = decoded[i];
+  } else {
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const int idx = i * 256 + t, rr = idx >> 5, cc = idx & 31;
+      const int64_t r = r0 + rr, c = c0 + cc;
+      tile[rr][cc ^ ((rr >> 4) * 4)] = (r < rows && c < cols) ? load_elem<T>(x, cols, r, c, w) : 0.0f;
+    }
   }
   __syncthreads();
   const int col = t >> 3, lane8 = t & 7;
   float v[16];
 #pragma unroll
-  for (int i = 0; i < 16; ++i) v[i] = tile[lane8 * 16 + i][col];
+  for (int i = 0; i < 16; ++i) v[i] = tile[lane8 * 16 + i][col ^ (lane8 * 4)];
   if (o.rotate) rotate_block(v, lane8, o.rseed);
   const int64_t oc = c0 + col;                          // output row
   if (kAmax) {

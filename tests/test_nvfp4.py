@@ -84,6 +84,24 @@ def test_nvfp4_input_transposed():
     assert ((d - ref).norm() / ref.norm()).item() < 0.12
 
 
+@pytest.mark.parametrize("shape", [(128, 272), (256, 512)])
+@pytest.mark.parametrize("rotate", [False, True])
+@pytest.mark.parametrize("fos", [False, True])
+def test_packed_weight_transpose_matches_dense_input(shape, rotate, fos):
+    torch.manual_seed(0)
+    w = bl.LatticeTensor.from_float(_data(*shape).float(), "nvfp4", method="rtn")
+    packed, scales, g = torch.ops.bitlattice.nvfp4_quantize(
+        w.packed, True, 0, fos, False, rotate, 11, None, w.scales, w.global_scale)
+    # Preserve the packed-input kernel's two multiplications (level * block scale, then global scale).
+    values, local = _decode(w.packed, w.scales, w.global_scale, *shape)
+    dense = ((values.view(shape[0], -1, 16) * local[..., None]) * w.global_scale).reshape(shape)
+    ref_p, ref_s, ref_g = torch.ops.bitlattice.nvfp4_quantize(
+        dense.contiguous(), True, 0, fos, False, rotate, 11)
+    assert torch.equal(g, ref_g)
+    assert torch.equal(packed, ref_p)
+    assert torch.equal(scales.view(torch.uint8), ref_s.view(torch.uint8))
+
+
 SIDES = [  # (mode, four_over_six, rotate)
     ("rtn", False, False), ("rtn", True, False), ("sr", False, True), ("eden", False, True), ("eden", True, True),
     ("rtn", True, True),
