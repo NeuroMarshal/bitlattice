@@ -1,9 +1,7 @@
 # Bitlattice
 
-> **USE AT YOUR OWN RISK.** This is a personal research project, not a product. Much of the code and nearly all
-> of the documentation were written with AI, so the documentation may contain mistakes; the code and its tests are
-> the reference. Nothing here is guaranteed to be stable, correct or fit for any purpose, and the license gives no
-> warranty. Whatever you do with it, including training models you rely on, is at your own risk.
+> This document was written with AI and may contain mistakes. The code and
+> its tests are the reference.
 
 Bitlattice is an extension of PyTorch for training and fine-tuning models whose weights stay in a low-bit format
 the whole time. It works on ordinary `nn.Module` models and loads Hugging Face safetensors checkpoints, including
@@ -39,7 +37,7 @@ These figures come from development runs on that server; the tests do not reprod
 
 ## Status
 
-Bitlattice is a research prototype at version 0.2.0.
+Bitlattice is a research prototype at version 0.2.1.
 
 - Stability is not guaranteed. APIs, file formats and numerical results may change between versions, and there are
   bugs nobody has found yet.
@@ -213,6 +211,10 @@ Blocks alternate between the GPUs, and each process loads only its own. Every bl
 before the next one, forward and backward, so one GPU works on block i of micro-batch m while the other works on
 block i+1 of micro-batch m-1. Each block's gradient is accumulated over the micro-batches and applied at once:
 one block of gradients in memory, the same update as the full batch.
+
+On one Linux host, `bl.parallel.init(transport="host")` selects copy-engine transfers through shared pinned memory.
+`bl.parallel.share_head_(model)` can distribute the loss of a frozen, bias-free output head across the processes.
+Both are collective choices. See [Execution](docs/API.md#execution) for their requirements.
 
 **Single process** (any model, simplest):
 

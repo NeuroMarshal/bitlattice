@@ -136,11 +136,8 @@ class Lattice(torch.optim.Optimizer):
                    memory of a device; the choice is logged and kept in ``self.state_placement``)
     ``fused_backward``  apply each parameter's update as soon as its gradient is accumulated and free the gradient
                    (the optimizer step then only advances the step counter); peak memory holds one gradient
-    ``overlap``    issue the updates from a worker thread on a side stream of each device, so they overlap the
-                   computation issued after them (the rest of the backward pass) on the GPU and on the host; the same
-                   updates, in the same order. A gradient lives until its update has run; ``step()`` (or
-                   :meth:`wait`) makes the device's work wait for the pending updates, so the next use of the weights
-                   sees them
+    ``overlap``    issue updates from a worker thread on a side stream. ``step()`` / ``wait()`` order the caller's
+                   streams after pending updates; gradients remain alive until their updates complete
     """
 
     def __init__(self, params, preset: str | None = None, *, lr: float = DEFAULTS["lr"], state: str = "gpu",
@@ -217,10 +214,7 @@ class Lattice(torch.optim.Optimizer):
         from ..backend import drop_cached
         drop_cached(p)                                            # and frees them now
 
-    # overlap: updates computed by a worker thread on a side stream of each device. The caller only records an
-    # event after the work that produced the gradient and hands the update over; the worker issues the
-    # orthogonalization and the lattice step (C++ operators run without the interpreter lock) while the caller
-    # goes on issuing the backward pass.
+    # The worker waits for each gradient's event; the caller can keep issuing backward work on its own stream.
 
     def _update_stream(self, device: torch.device) -> torch.cuda.Stream:
         s = self._update_streams.get(device)

@@ -1,8 +1,5 @@
-// Folding of concatenated NVFP4 operands to one global scale. Deferred weight-gradient operands of the micro-batches
-// of a unit are concatenated along the token axis; each piece j has a power-of-two global scale g_j, so its E4M3
-// block scales times g_j / max(g) (a power of two <= 1) give the same values under the largest global scale. One
-// pass over the concatenated scales (128 x 4-tiled layout, 512 bytes per tile) does it for all pieces; products that
-// fall below E4M3's normal range lose mantissa bits and are counted.
+// Fold NVFP4 block scales by g_j / max(g), a power of two, preserving values within E4M3's normal range.
+// Count subnormal products, where folding may lose mantissa bits.
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -37,9 +34,8 @@ __global__ void fold_kernel(uint8_t* __restrict__ scales, int64_t n, int64_t nti
 
 }  // namespace
 
-// scales: uint8 / e4m3 [rows_tiles * ntiles_col * 512] (folded in place); piece: int32 [ntiles_col], the piece of
-// every column tile; g: float32 [npieces] power-of-two global scales; rounded: int64 [1] counter. Returns the common
-// global scale [1].
+// Fold 128x4-tiled scales in place. piece maps column tiles to the power-of-two scales in g.
+// rounded is an int64 counter; the return value is the common global scale [1].
 at::Tensor bl_fp4_fold_scales(at::Tensor scales, at::Tensor piece, at::Tensor g, at::Tensor rounded) {
   TORCH_CHECK(scales.is_cuda() && scales.is_contiguous() && scales.element_size() == 1, "scales: contiguous bytes");
   TORCH_CHECK(piece.scalar_type() == at::kInt && g.scalar_type() == at::kFloat && rounded.scalar_type() == at::kLong,

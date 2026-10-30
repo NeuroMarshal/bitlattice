@@ -1,8 +1,5 @@
-// SwiGLU activation of gated MLPs, a = silu(g) * u, and its gradient, in one pass each (8 elements per thread,
-// 16-byte loads). The roundings are those of the reference autograd graph in the activation dtype T:
-//   forward   s = T(silu(g)),  a = T(s * u)
-//   backward  du = T(da * s),  ds = T(da * u),  dg = T(ds * sigmoid(g) * (1 + g * (1 - sigmoid(g))))
-// so the results are bit for bit those of torch.nn.functional.silu(g) * u and its autograd backward.
+// SwiGLU forward/backward, rounding SiLU and each product to the activation dtype as PyTorch autograd does.
+// Each thread handles eight elements with 16-byte loads.
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>

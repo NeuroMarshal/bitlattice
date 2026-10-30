@@ -58,6 +58,10 @@ rounding uses `frac((bitrev(step mod K) + h_i)/K)`.
   scale; ties go to the lower value, as everywhere in the library.
 * Compiled with `--fmad=false` so that kernels and the reference (`bitlattice/reference.py`) agree bit for bit
   except where a group sum order decides a scale step at a numerical tie.
+* `lattice_update` dispatches the direction and lattice step over a parameter's row tiles from C++.
+* `fp4_fold_scales` rescales concatenated weight-gradient operands in one CUDA pass and counts subnormal scales.
+* `vocab_pass` tiles the output vocabulary in C++, with CUDA reductions for online softmax. For a frozen head it
+  computes the input gradient in forward; logits and softmax weights stay in the GEMM dtype, sums in fp32.
 
 ## Integration with PyTorch
 
@@ -104,6 +108,17 @@ them block-major over the micro-batches, forward and backward, sending each micr
 There is one NCCL process group per direction, because NCCL P2P streams are in order. A segment's gradients are
 accumulated over the micro-batches (`Lattice.accumulate`) and applied by the fused update after the last one.
 
+The optional host transport uses a shared pinned-memory ring per direction. Host threads submit DMA and publish
+sequence flags after each copy finishes. Receivers order writes after the allocation stream and reads after the
+receive stream, so the caching allocator cannot reuse a buffer while either copy still uses it.
+
+Shared output heads assign micro-batch m to rank m % world. Replicas use the current final-norm weights and return
+its gradients to the owner in micro-batch order. The head weights remain frozen.
+
+`fused_block` saves only a decoder block's input and computes its backward explicitly, keeping a local autograd
+graph for the mixer core. Graph replays share a device pool and fixed operand slots; a device epoch varies stochastic
+seeds. MLP token pieces and recurrent-state pieces bound intermediate memory without truncating the context.
+
 ## Loading
 
 `bl.io.load` builds the model with `accelerate.init_empty_weights(include_buffers=False)`, groups checkpoint
@@ -116,8 +131,5 @@ module at a time.
    1×16 re-quantization of `Wᵀ`.
 2. Fused dequantize-GEMM for formats without a hardware path (level table in shared memory); FP8 path for int4/int5.
 3. Symmetric GEMM kernels for Newton-Schulz (`XXᵀ`, `R²` at half the FLOPs).
-4. Pipeline:
-   - a split backward (input gradient first, weight gradient in the bubbles);
-   - a copy-engine transport without head-of-line blocking (~18 GB/s instead of ~5 GB/s).
-5. Kernels for linear-attention layers of hybrid models.
-6. GGUF loading.
+4. Schedule deferred weight-gradient GEMMs into pipeline bubbles.
+5. GGUF loading.

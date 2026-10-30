@@ -1,7 +1,5 @@
-// One parameter's lattice update in one call: for every row tile, the update direction (Newton-Schulz on row
-// bands, sign or raw gradient, RMS-clipped) and the fused lattice step of lattice.cu, the tile's new group scales
-// written in place. The caller (an optimizer thread) hands over a whole parameter and the interpreter lock is not
-// held while its tiles are issued.
+// Update a parameter in row tiles, computing each direction and lattice projection in one native call.
+// Tile scales are written in place; the caller does not hold the interpreter lock while issuing the tiles.
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -27,9 +25,8 @@ std::optional<Tensor> rows_of(const std::optional<Tensor>& t, int64_t r0, int64_
 }
 }  // namespace
 
-// packed / phase / scales / zeros: the parameter's storage, rows first (updated in place); G: its gradient
-// [rows, cols]; direction = (kind, block, block_cols, ns_steps, ns_dtype, ns_coeffs, ns_algo) as in bl_direction;
-// tile_rows: rows per tile (a multiple of the Newton-Schulz block rows).
+// Storage and G are rows first. Direction options follow bl_direction.
+// tile_rows must be a multiple of the Newton-Schulz block rows.
 void bl_lattice_update(Tensor packed, std::optional<Tensor> phase, Tensor scales, std::optional<Tensor> global_scale,
                        std::optional<Tensor> zeros, Tensor G, Tensor sorted, Tensor rank_of_code, Tensor sorted_code,
                        int64_t kind, int64_t bits, int64_t cb, int64_t qmin, int64_t qmax, int64_t zero_point,

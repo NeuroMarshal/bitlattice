@@ -398,8 +398,7 @@ struct Side {
   bool mix_rot;      // with a device epoch: the rotation seed is mixed with it too (else only the stochastic draws)
 };
 
-// Seeds of a call replayed from a CUDA graph: the host seeds are fixed in the graph, so each replay mixes in a
-// counter that lives on the device (incremented by the graph itself)
+// A device epoch prevents graph replays from repeating their captured host seeds.
 __device__ __forceinline__ uint32_t mix_epoch(uint32_t seed, const uint32_t* epoch) {
   return epoch ? seed ^ ((*epoch + 1u) * 0x9E3779B1u) : seed;
 }
