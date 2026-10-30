@@ -156,7 +156,7 @@ def _backward_released(out: torch.Tensor, grad: torch.Tensor) -> None:
 def _head_loss(model, norm, head, labels, input_ids, chunk, extra_loss, y, e):
     from .nn.loss import linear_cross_entropy
     h = norm(y) if norm is not None else y
-    loss = linear_cross_entropy(h[:, :-1], head.weight, labels[:, 1:], getattr(head, "bias", None), chunk)
+    loss = linear_cross_entropy(h, head.weight, labels[:, 1:], getattr(head, "bias", None), chunk)
     if extra_loss is not None:
         loss = loss + extra_loss(model, y, input_ids, labels, e)
     return loss
@@ -242,8 +242,9 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
     backward  -- False: evaluation only (no graph, no update).
     run_ahead -- units of work (segment x micro-batch) the host may queue ahead of the GPU.
     extra_loss -- fn(model, hidden, input_ids, labels, next_embeds) -> loss added on the head's process, with
-                 ``hidden`` the last block output (before the final norm) and ``next_embeds`` the input embeddings
-                 of tokens 1.. (detached; sent from the embedding's process), e.g. a multi-token-prediction head.
+                 ``hidden`` the last block output (before the final norm) at positions 0..T-2 and ``next_embeds``
+                 the input embeddings of tokens 1..T-1 (detached; sent from the embedding's process), aligned with
+                 ``hidden``, e.g. a multi-token-prediction head.
     offload_activations -- keep the unit inputs (the only activations that live from forward to backward with
                  checkpointed blocks) in pinned host memory: GPU memory then no longer grows with the number of
                  tokens per step beyond one unit's working set.
@@ -266,6 +267,9 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
     width, dtype = model.config.hidden_size, emb.weight.dtype
     labels = input_ids if labels is None else labels
     ids_mb = [t.to(dev) for t in input_ids.chunk(micro, 0)]
+    # the model runs on positions 0..T-2: the last token is only a target, and a window of T = seq + 1 tokens then
+    # gives GEMMs of exactly seq rows (no padding to the next multiple of 128)
+    run_mb = [t[:, :-1] for t in ids_mb]
     # micro-batch losses are means over their own labelled tokens; weighted by those counts (taken where the labels
     # are, no device synchronization for host labels) they add up to the mean over the batch
     n_tok = [int((t[:, 1:] != -100).sum()) for t in labels.chunk(micro, 0)]
@@ -295,7 +299,7 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
         dist.irecv(e, aux_from, group=_group(aux_from, me, "aux")).wait()
         return e
     with grad:
-        prep = [_block_kwargs(backbone, blocks, ids, embed_here, width, dtype, dev) for ids in ids_mb]
+        prep = [_block_kwargs(backbone, blocks, ids, embed_here, width, dtype, dev) for ids in run_mb]
         # forward: each segment (run of units on this GPU) micro-batch by micro-batch, so its output for micro-batch
         # m leaves for the next GPU as early as possible. The graph is cut between every two units, also locally,
         # so that the backward can go unit by unit.
@@ -304,7 +308,7 @@ def train_step(model, input_ids: torch.Tensor, labels: torch.Tensor | None = Non
                 continue
             last = len(seg.items) - 1
             for m in range(M):
-                shape = (*ids_mb[m].shape, width)
+                shape = (*run_mb[m].shape, width)
                 y = None
                 for j, item in enumerate(seg.items):
                     if j == 0 and seg.prev is not None:

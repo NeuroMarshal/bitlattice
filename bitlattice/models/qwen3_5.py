@@ -86,12 +86,16 @@ def mtp_hidden(model, hidden: torch.Tensor, input_ids: torch.Tensor, pos_offset:
                next_embeds: torch.Tensor | None = None) -> torch.Tensor:
     """MTP output states for positions 0..T-2 (predicting tokens 2..T): hidden[:, t] with embedding(token t+1)
     (``next_embeds`` when the embedding lives elsewhere, e.g. on another pipeline process)."""
-    mtp = model.mtp
-    dev = mtp.fc.weight.device
-    h = hidden[:, :-1].to(dev)
     if next_embeds is None:
         next_embeds = model.model.embed_tokens(input_ids[:, 1:].to(model.model.embed_tokens.weight.device))
-    e = next_embeds.to(dev)
+    return _mtp_states(model, hidden[:, :-1], next_embeds, pos_offset)
+
+
+def _mtp_states(model, h: torch.Tensor, e: torch.Tensor, pos_offset: int) -> torch.Tensor:
+    """MTP output states for hidden states ``h`` [B, T, D] and the embeddings ``e`` of the next tokens (aligned)."""
+    mtp = model.mtp
+    dev = mtp.fc.weight.device
+    h, e = h.to(dev), e.to(dev)
     B, T = h.shape[:2]
     pos = _positions(B, T, dev, pos_offset)
     rot = model.model.rotary_emb
@@ -142,11 +146,11 @@ def mtp_extra_loss(weight: float = 0.3, pos_offset: int = 1, chunk: int = 1024, 
     from ..nn.loss import linear_cross_entropy
 
     def fn(model, hidden, input_ids, labels, next_embeds):
+        # hidden: positions 0..T-2, next_embeds: tokens 1..T-1 (aligned); position t predicts token t+2
         if checkpoint and torch.is_grad_enabled():
-            m = ckpt(lambda h, e: mtp_hidden(model, h, input_ids, pos_offset, e), hidden, next_embeds,
-                     use_reentrant=False)
+            m = ckpt(lambda h, e: _mtp_states(model, h, e, pos_offset), hidden, next_embeds, use_reentrant=False)
         else:
-            m = mtp_hidden(model, hidden, input_ids, pos_offset, next_embeds)
+            m = _mtp_states(model, hidden, next_embeds, pos_offset)
         head = model.get_output_embeddings()
         return weight * linear_cross_entropy(m[:, :-1], head.weight, labels[:, 2:].to(head.weight.device), None,
                                              chunk)

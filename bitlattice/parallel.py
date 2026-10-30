@@ -486,7 +486,7 @@ def pipelined_causal_lm_loss(model: torch.nn.Module, input_ids: torch.Tensor, la
     ids_mb, lab_mb = input_ids.chunk(micro, 0), labels.chunk(micro, 0)
     states, per_dev = [], []
     for ids in ids_mb:
-        h, kws = _block_inputs(backbone, blocks, ids, kwargs)
+        h, kws = _block_inputs(backbone, blocks, ids[:, :-1], kwargs)     # the last token is only a target
         states.append(h)
         per_dev.append(kws)
     devs = [next(b.parameters()).device for b in blocks]
@@ -514,7 +514,7 @@ def pipelined_causal_lm_loss(model: torch.nn.Module, input_ids: torch.Tensor, la
     for h, lb, n in zip(states, lab_mb, n_tok):
         if norm is not None:
             h = norm(h)
-        loss = loss + linear_cross_entropy(h[:, :-1], head.weight, lb[:, 1:], getattr(head, "bias", None),
+        loss = loss + linear_cross_entropy(h, head.weight, lb[:, 1:], getattr(head, "bias", None),
                                            chunk) * (n / sum(n_tok))
     return loss
 
