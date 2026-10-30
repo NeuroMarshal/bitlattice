@@ -33,6 +33,13 @@ Conversions:
                       recomputed in backward -- the layer keeps its input, K and V instead of all its internals;
                       runs on fused attention kernels only (never a materialized score matrix); calls with a
                       cache or unknown attention arguments go to the original module
+    fused_block       a pre-norm decoder layer (gated delta net or q/k-normed gated attention, SwiGLU MLP; Qwen3.5)
+                      computed by one autograd node: it keeps its input only, recomputes itself in backward and
+                      differentiates by hand; projections reading the same input share its quantization (see
+                      bitlattice.nn.fused_block); replaces ``checkpoint`` for such layers; ``graphs=True`` records
+                      the layer's forward and backward as CUDA graphs per input shape and replays them (one host call
+                      per layer instead of hundreds of launches; stochastic seeds drawn on the device); ``slots``:
+                      buffers for the weights' derived operands (consecutive layers of a pipeline unit)
     checkpoint        activation checkpointing of the module: the forward keeps only its inputs, backward
                       recomputes it; ``saved`` ('fp8' / 'nvfp4', lossy) stores the recomputed module's saved
                       tensors compressed, which lowers the per-layer peak (use it instead of the model's own
@@ -627,6 +634,28 @@ def _width(m) -> int | None:
     return int(w.shape[-1]) if w is not None else None
 
 
+def _make_fused_block(m, graphs: bool = False, slots: int = 2):
+    from .fused_block import make_fused_block
+    return make_fused_block(m, graphs, slots)
+
+
+def _fused_probe(m, new):
+    D = m.input_layernorm.weight.shape[0]
+    attn = getattr(m, "self_attn", None)
+    rot = 64
+    if attn is not None:
+        cfg = getattr(attn, "config", None)
+        rp = getattr(cfg, "rope_parameters", None) or {}
+        factor = rp.get("partial_rotary_factor", getattr(cfg, "partial_rotary_factor", 1.0))
+        rot = int(attn.head_dim * factor)
+    T = 200                                                    # not a multiple of the quantization tiles
+    x = torch.randn(1, T, D, device=_device(m), dtype=_wdtype(m))
+    angle = torch.arange(T, device=x.device, dtype=torch.float32)[:, None] * \
+        torch.rand(rot // 2, device=x.device)[None] * 0.1
+    angle = torch.cat([angle, angle], -1)[None]
+    return x, (angle.cos().to(x.dtype), angle.sin().to(x.dtype))
+
+
 _CONVERSIONS: dict[str, Conversion] = {
     "rms_norm": Conversion(
         "lean RMSNorm (input + one fp32 value per row kept for backward)",
@@ -670,6 +699,12 @@ _CONVERSIONS: dict[str, Conversion] = {
         _make_host_linear,
         lambda m, new: (torch.randn(2, 33, m.in_features, device=new._device, dtype=_wdtype(m)),),
         exclusive=True),
+    "fused_block": Conversion(
+        "pre-norm decoder layer (gated delta net or gated attention, SwiGLU MLP) as one autograd node: recomputed "
+        "in backward, differentiated by hand, shared input quantization",
+        lambda m: all(hasattr(m, k) for k in ("input_layernorm", "post_attention_layernorm", "mlp")),
+        _make_fused_block,
+        _fused_probe),
     "checkpoint": Conversion(
         "recompute in backward (inputs kept); `saved` packs the recomputed saved tensors ('fp8' / 'nvfp4'); "
         "`weights='ram'` keeps the module's weights in host memory, streamed to the GPU around its uses",
