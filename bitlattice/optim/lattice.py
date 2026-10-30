@@ -136,10 +136,11 @@ class Lattice(torch.optim.Optimizer):
                    memory of a device; the choice is logged and kept in ``self.state_placement``)
     ``fused_backward``  apply each parameter's update as soon as its gradient is accumulated and free the gradient
                    (the optimizer step then only advances the step counter); peak memory holds one gradient
-    ``overlap``    run the updates on a side stream of each device, so they overlap the computation issued after
-                   them (the rest of the backward pass); the same updates, in the same order. A gradient lives until
-                   its update has run; ``step()`` (or :meth:`wait`) makes the device's work wait for the pending
-                   updates, so the next use of the weights sees them
+    ``overlap``    issue the updates from a worker thread on a side stream of each device, so they overlap the
+                   computation issued after them (the rest of the backward pass) on the GPU and on the host; the same
+                   updates, in the same order. A gradient lives until its update has run; ``step()`` (or
+                   :meth:`wait`) makes the device's work wait for the pending updates, so the next use of the weights
+                   sees them
     """
 
     def __init__(self, params, preset: str | None = None, *, lr: float = DEFAULTS["lr"], state: str = "gpu",
@@ -175,6 +176,9 @@ class Lattice(torch.optim.Optimizer):
         self.fused_backward = fused_backward
         self.overlap = overlap
         self._update_streams: dict = {}   # device -> side stream of the updates (overlap)
+        self._worker = None                # thread that issues the updates (overlap)
+        self._jobs = None
+        self._failure = None
         self.state_device = state_device
         self._copy_streams: dict = {}     # device -> side stream for host-memory state transfers
         self._host_bufs: dict = {}        # (parameter, state key) -> its exact-size pinned host buffer
@@ -199,30 +203,69 @@ class Lattice(torch.optim.Optimizer):
     def _on_grad(self, p: torch.Tensor) -> None:
         if p.grad is None or self._defer or _deferred:
             return
-        with torch.no_grad(), self._side(p):
-            self._update(p, self._group_of[p])
+        if self.overlap and p.is_cuda:
+            self._hand_over(p, self._group_of[p])
+        else:
+            with torch.no_grad():
+                self._update(p, self._group_of[p])
         p.grad = None
         self._done.add(p)
 
-    @contextlib.contextmanager
-    def _side(self, p: torch.Tensor):
-        """With ``overlap``: the update of ``p`` goes to the device's update stream, after everything issued so far
-        on the current stream (which produced the gradient)."""
-        if not (self.overlap and p.is_cuda):
-            yield
-            return
-        cur = torch.cuda.current_stream(p.device)
-        s = self._update_streams.get(p.device)
+    @staticmethod
+    def _invalidate(p: torch.Tensor) -> None:
+        p._bl_version = getattr(p, "_bl_version", 0) + 1          # invalidates cached derived operands
+        from ..backend import drop_cached
+        drop_cached(p)                                            # and frees them now
+
+    # overlap: updates computed by a worker thread on a side stream of each device. The caller only records an
+    # event after the work that produced the gradient and hands the update over; the worker issues the
+    # orthogonalization and the lattice step (C++ operators run without the interpreter lock) while the caller
+    # goes on issuing the backward pass.
+
+    def _update_stream(self, device: torch.device) -> torch.cuda.Stream:
+        s = self._update_streams.get(device)
         if s is None:
-            s = self._update_streams[p.device] = torch.cuda.Stream(device=p.device)
-        s.wait_stream(cur)
-        with torch.cuda.stream(s):
-            yield
-        if p.grad is not None:
-            p.grad.record_stream(s)            # freed by the caller; its memory is reused only after the update
+            s = self._update_streams[device] = torch.cuda.Stream(device=device)
+        return s
+
+    def _hand_over(self, p: torch.Tensor, g: dict) -> None:
+        import queue
+        import threading
+        self._invalidate(p)                                       # on the caller's thread: the caches are its own
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(p.device))
+        if self._worker is None:
+            self._jobs = queue.Queue()
+            self._worker = threading.Thread(target=self._work, name="bitlattice-updates", daemon=True)
+            self._worker.start()
+        self._jobs.put((p, g, p.grad, ready))
+
+    def _work(self) -> None:
+        while True:
+            job = self._jobs.get()
+            try:
+                if job is None:
+                    return
+                p, g, G, ready = job
+                torch.cuda.set_device(p.device)
+                s = self._update_stream(p.device)
+                with torch.cuda.stream(s), torch.no_grad():
+                    s.wait_event(ready)
+                    self._update(p, g, G, invalidate=False)
+                G.record_stream(s)             # the gradient's memory is reused only after the update has run
+            except BaseException as e:        # re-raised by wait()
+                self._failure = self._failure or e
+            finally:
+                self._jobs.task_done()
 
     def wait(self) -> None:
-        """Make the current stream of every device wait for the updates issued so far (``overlap``)."""
+        """Wait (on the host) until the updates handed over so far are issued, then make the current stream of every
+        device wait (on the GPU) for them (``overlap``)."""
+        if self._worker is not None:
+            self._jobs.join()
+        if self._failure is not None:
+            e, self._failure = self._failure, None
+            raise RuntimeError("a parameter update failed") from e
         for dev, s in self._update_streams.items():
             torch.cuda.current_stream(dev).wait_stream(s)
 
@@ -236,8 +279,11 @@ class Lattice(torch.optim.Optimizer):
             for p in g["params"]:
                 if p in self._done or p.grad is None:
                     continue
-                with torch.cuda.device(p.device) if p.is_cuda else contextlib.nullcontext(), self._side(p):
-                    self._update(p, g)
+                if self.overlap and p.is_cuda:
+                    self._hand_over(p, g)
+                else:
+                    with torch.cuda.device(p.device) if p.is_cuda else contextlib.nullcontext():
+                        self._update(p, g)
                 if self.fused_backward:
                     p.grad = None
         self._done.clear()
@@ -336,6 +382,8 @@ class Lattice(torch.optim.Optimizer):
 
     def synchronize(self) -> None:
         """Wait for pending updates and host-memory state transfers."""
+        if self._worker is not None:
+            self._jobs.join()
         for s in (*self._update_streams.values(), *self._copy_streams.values()):
             s.synchronize()
 
@@ -442,16 +490,15 @@ class Lattice(torch.optim.Optimizer):
         return _ops.direction(G, kind, r, c, st.get("k", 1), g["beta2"], g["block"], g["ns_steps"], g["ns_dtype"],
                               g["sinkhorn_iters"], g["clip"], **_ns(g), **rn)
 
-    def _update(self, p: torch.Tensor, g: dict) -> None:
-        p._bl_version = getattr(p, "_bl_version", 0) + 1          # invalidates cached derived operands
-        from ..backend import drop_cached
-        drop_cached(p)                                            # and frees them now
+    def _update(self, p: torch.Tensor, g: dict, G: torch.Tensor | None = None, invalidate: bool = True) -> None:
+        if invalidate:
+            self._invalidate(p)
         st = self.state[p]
         self._bring(p, st)
         st["step"] = st.get("step", 0) + 1
         pid = self._pid[p]
         seed = (self.seed + 7919 * pid) & 0xFFFFFFFF
-        G = p.grad
+        G = p.grad if G is None else G
         rows = getattr(p, "_bl_rows", None)
         if rows is not None:
             G = _restrict_rows(G, rows)
@@ -512,6 +559,20 @@ class Lattice(torch.optim.Optimizer):
         if bits and "phase" not in st:
             st["phase"] = (torch.zeros(rows, packed_cols(cols, cb), dtype=torch.uint8, device=p.device) if quant else
                            torch.zeros(_ops.phase_numel(p.numel()) * cb // 8, dtype=torch.uint8, device=p.device))
+        from ..kernel_choice import active
+        if quant and kind != "factored" and active().native_update and not _row_norm(g, st, rows, p.device):
+            # the whole loop over row tiles in one native call (no interpreter work between the tiles)
+            tables, args = _ops.lattice_args(p.fmt, p.packed.device)
+            j, k = _ops.strat_args(g["rounding"], st["step"], g["strata"])
+            br, bc = _ops.block_shape(g["block"]) if kind == "muon_block" else (0, 0)
+            torch.ops.bitlattice.lattice_update(
+                p.packed, st["phase"] if bits else None, p.scales, p.global_scale, p.zeros, G2.contiguous(), *tables,
+                *args, rows, cols, bits, cb, float(g["lr"]), float(1.0 - g["lr"] * g["weight_decay"]),
+                _ops._ROUNDING[g["rounding"]], int(seed) & 0xFFFFFFFF, int(st["step"]) & 0xFFFFFFFF, j, k,
+                _ops._RULE[g["scale_rule"]], float(_ops.kappa(g["trust"], g["trust_lr"], g["lr"])),
+                _ops._DIRECTION[kind], br, bc, int(g["ns_steps"]), _ops._NS_DTYPE[g["ns_dtype"]],
+                _ops._NS_COEFFS[g["ns_coeffs"]], _ops._NS_ALGO[g["ns_algo"]], float(g["clip"]), step_rows)
+            return
         new_scales = []
         for r0 in range(0, rows, step_rows):
             n = min(step_rows, rows - r0)

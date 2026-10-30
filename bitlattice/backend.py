@@ -650,19 +650,39 @@ def _concat(ops: list) -> Fp4Operand:
     ~2^4 in magnitude) and counted -- :func:`fold_rounded` -- instead of passing silently."""
     if len(ops) == 1:
         return ops[0]
-    g = torch.stack([o.global_scale.reshape(()) for o in ops]).amax()
     packed = torch.cat([o.packed for o in ops], 1)
     rows = ops[0].packed.shape[0]
     nr = -(-rows // 128)
-    tiles = []
     dev = packed.device
     count = _FOLD_ROUNDED.setdefault(dev, torch.zeros((), dtype=torch.int64, device=dev))
-    for o in ops:
-        f = (o.global_scale.reshape(()) / g)                       # a power of two <= 1
-        sf = o.scales.view(torch.float8_e4m3fn).float() * f
-        count += ((sf > 0) & (sf < _E4M3_MIN_NORMAL)).sum()
-        tiles.append(sf.to(torch.float8_e4m3fn).view(nr, -1, 512))
-    return Fp4Operand(packed, torch.cat(tiles, 1).reshape(-1), g.reshape(1), True)
+    tiles = [o.scales.view(torch.uint8).view(nr, -1, 512) for o in ops]
+    g = torch.cat([o.global_scale.reshape(1).float() for o in ops])
+    if _choice().fused_fold:
+        scales = torch.cat(tiles, 1)
+        piece = _piece_map(tuple(t.shape[1] for t in tiles), dev)
+        g_max = torch.ops.bitlattice.fp4_fold_scales(scales.view(-1), piece, g, count.view(1))
+        return Fp4Operand(packed, scales.view(-1).view(torch.float8_e4m3fn), g_max, True)
+    g_max = g.amax()
+    folded = []
+    for o, t in zip(ops, tiles):
+        f = o.global_scale.reshape(()).float() / g_max                  # a power of two <= 1
+        sf = t.view(torch.float8_e4m3fn).float() * f
+        count += ((sf > 0) & (sf < _E4M3_MIN_NORMAL) & (f != 1)).sum()
+        folded.append(sf.to(torch.float8_e4m3fn))
+    return Fp4Operand(packed, torch.cat(folded, 1).reshape(-1), g_max.reshape(1), True)
+
+
+_PIECES: dict = {}
+
+
+def _piece_map(widths: tuple, device) -> torch.Tensor:
+    """int32 [sum(widths)]: the piece of every column tile (cached per layout)."""
+    key = (widths, device)
+    t = _PIECES.get(key)
+    if t is None:
+        t = _PIECES[key] = torch.tensor([j for j, w in enumerate(widths) for _ in range(w)], dtype=torch.int32,
+                                        device=device)
+    return t
 
 
 def fold_rounded(reset: bool = False) -> int:

@@ -301,3 +301,23 @@ def test_low_precision_momentum_in_host_memory_matches_gpu(momentum):
     assert torch.equal(ps[0].packed, ps[1].packed) and torch.equal(ps[0].scales, ps[1].scales)
     host = [k for k, v in opts[1].state[ps[1]].items() if torch.is_tensor(v) and not v.is_cuda]
     assert any(k.startswith("m") for k in host), host
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("preset", ["muon", "muon_fast"])
+def test_native_tiled_update_matches_the_python_loop(preset):
+    torch.manual_seed(0)
+    w0 = bl.LatticeTensor.from_float(torch.randn(1024, 512, device="cuda") * 0.05, "nvfp4", method="rtn",
+                                     dtype=torch.bfloat16)
+    g = torch.randn(1024, 512, device="cuda", dtype=torch.bfloat16) * 1e-2
+    out = []
+    for native in (True, False):
+        p = torch.nn.Parameter(w0.clone())
+        opt = bl.optim.Lattice([p], preset, lr=1e-2, tile_elems=256 * 512)        # four row tiles
+        with bl.kernels(native_update=native):
+            for _ in range(3):
+                p.grad = g.clone()
+                opt.step()
+        out.append((p.packed.clone(), p.scales.clone(), opt.state[p]["phase"].clone()))
+    for a, b in zip(*out):
+        assert torch.equal(a, b)

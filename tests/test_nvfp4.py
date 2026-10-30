@@ -146,3 +146,21 @@ def test_dual_layout_reports_seen_amax():
     ref_col = Q.rht128(x.float().t().contiguous(), 7).abs().amax()
     assert torch.allclose(seen[0], x.float().abs().amax(), rtol=1e-6)
     assert torch.allclose(seen[1], ref_col, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fused_fold_matches_aten():
+    from bitlattice import backend
+    torch.manual_seed(0)
+    ops = []
+    for j, k in enumerate((256, 512, 256)):
+        x = torch.randn(256, k, device="cuda") * (4.0 ** -j)
+        ops.append(backend._q(x.contiguous(), pow2=True))
+    out = []
+    for fused in (True, False):
+        backend.fold_rounded(reset=True)
+        with bl.kernels(fused_fold=fused):
+            c = backend._concat(ops)
+        out.append((c.packed, c.scales.view(torch.uint8), c.global_scale, backend.fold_rounded(reset=True)))
+    (pa, sa, ga, na), (pb, sb, gb, nb) = out
+    assert torch.equal(pa, pb) and torch.equal(sa, sb) and torch.equal(ga.reshape(1), gb.reshape(1)) and na == nb

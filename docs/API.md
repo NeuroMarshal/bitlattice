@@ -47,6 +47,8 @@ for bit, or with sums in another order) and is on by default:
 | `fused_conv` | CUDA causal convolution in the `gated_delta_net` conversion |
 | `fused_pack` | CUDA FP8 packing of compressed saved tensors |
 | `grad_in_forward` | a frozen output layer forms its input gradient in the forward pass of the loss |
+| `native_update` | the optimizer updates a large quantized matrix (every row tile) in one native call |
+| `fused_fold` | deferred weight-gradient operands are brought to one global scale by one CUDA pass |
 
 ```python
 with bl.kernels(fused_norm=False):                        # a region; other fields keep their current value

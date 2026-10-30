@@ -47,6 +47,15 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> bl_nvfp4_quantize2(Te
                                                                              bool blocked,
                                                                              std::optional<Tensor> amax_out,
                                                                              std::optional<Tensor> epoch);
+void bl_lattice_update(Tensor packed, std::optional<Tensor> phase, Tensor scales, std::optional<Tensor> global_scale,
+                       std::optional<Tensor> zeros, Tensor G, Tensor sorted, Tensor rank_of_code, Tensor sorted_code,
+                       int64_t kind, int64_t bits, int64_t cb, int64_t qmin, int64_t qmax, int64_t zero_point,
+                       int64_t scale_dt, int64_t group, int64_t rows, int64_t cols, int64_t pb, int64_t pcb, double lr,
+                       double decay, int64_t rounding, int64_t seed, int64_t step, int64_t strat_j, int64_t strat_k,
+                       int64_t rule, double kappa, int64_t dir_kind, int64_t block, int64_t block_cols,
+                       int64_t ns_steps, int64_t ns_dtype, int64_t ns_coeffs, int64_t ns_algo, double clip,
+                       int64_t tile_rows);
+Tensor bl_fp4_fold_scales(Tensor scales, Tensor piece, Tensor g, Tensor rounded);
 Tensor bl_swiglu_fwd(Tensor g, Tensor u);
 std::tuple<Tensor, Tensor> bl_swiglu_bwd(Tensor g, Tensor u, Tensor da);
 Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::optional<Tensor> c, int64_t k, double beta2,
@@ -91,6 +100,14 @@ TORCH_LIBRARY(bitlattice, m) {
   m.def("mx_unpack(Tensor codes, Tensor scales, ScalarType dtype) -> Tensor");
   m.def("mx_quantize2(Tensor x, bool row=True, bool col=False, bool e5m2=False, bool blocked=False) "
         "-> (Tensor, Tensor, Tensor, Tensor)");
+  m.def(
+      "lattice_update(Tensor(a!) packed, Tensor(b!)? phase, Tensor(c!) scales, Tensor? global_scale, Tensor? zeros, "
+      "Tensor G, Tensor sorted, Tensor rank_of_code, Tensor sorted_code, int kind, int bits, int cb, int qmin, "
+      "int qmax, int zero_point, int scale_dt, int group, int rows, int cols, int pb, int pcb, float lr, "
+      "float decay, int rounding, int seed, int step, int strat_j, int strat_k, int rule, float kappa, int dir_kind, "
+      "int block, int block_cols, int ns_steps, int ns_dtype, int ns_coeffs, int ns_algo, float clip, "
+      "int tile_rows) -> ()");
+  m.def("fp4_fold_scales(Tensor(a!) scales, Tensor piece, Tensor g, Tensor(b!) rounded) -> Tensor");
   m.def("swiglu_fwd(Tensor g, Tensor u) -> Tensor");
   m.def("swiglu_bwd(Tensor g, Tensor u, Tensor da) -> (Tensor, Tensor)");
   m.def("causal_conv1d_fwd(Tensor x, Tensor weight, Tensor? bias, bool silu_act) -> Tensor");
@@ -115,6 +132,8 @@ TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
   m.impl("nvfp4_quantize2", &bl_nvfp4_quantize2);
   m.impl("causal_conv1d_fwd", &bl_causal_conv1d_fwd);
   m.impl("swiglu_fwd", &bl_swiglu_fwd);
+  m.impl("fp4_fold_scales", &bl_fp4_fold_scales);
+  m.impl("lattice_update", &bl_lattice_update);
   m.impl("swiglu_bwd", &bl_swiglu_bwd);
   m.impl("mx_quantize2", &bl_mx_quantize2);
   m.impl("mx_pack", &bl_mx_pack);

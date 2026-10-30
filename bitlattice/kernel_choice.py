@@ -32,6 +32,10 @@ class Kernels:
     fused_pack       CUDA FP8 packing of compressed saved tensors (else ATen code over pieces)
     grad_in_forward  a frozen output layer forms its input gradient in the forward pass of the vocabulary-wide loss
                      (one pass over the vocabulary, nothing recomputed); else the gradient is formed in backward
+    native_update    the optimizer's update of a large quantized matrix (direction and lattice step of every row
+                     tile) in one native call; else a Python loop over the tiles issues the same operations
+    fused_fold       deferred weight-gradient operands of the micro-batches are brought to one global scale by one
+                     CUDA pass over their block scales; else per micro-batch with ATen operations
     """
 
     two_level_gemm: bool = True
@@ -41,6 +45,8 @@ class Kernels:
     fused_conv: bool = True
     fused_pack: bool = True
     grad_in_forward: bool = True
+    native_update: bool = True
+    fused_fold: bool = True
 
     @classmethod
     def reference(cls) -> Kernels:
@@ -107,4 +113,5 @@ def kernels_available(device_index: int = 0) -> dict[str, bool]:
             "fp4_tensor_cores": cuda and backend.fp4_supported(device_index),
             "two_level_gemm": cuda and backend.fp4_supported(device_index) and backend._two_level(device_index),
             "mxfp8_tensor_cores": cuda and backend.mxfp8_supported(device_index),
-            "fused_norm": _ops.HAVE_EXT, "fused_conv": _ops.HAVE_EXT, "fused_pack": _ops.HAVE_EXT}
+            "fused_norm": _ops.HAVE_EXT, "fused_conv": _ops.HAVE_EXT, "fused_pack": _ops.HAVE_EXT,
+            "native_update": _ops.HAVE_EXT, "fused_fold": _ops.HAVE_EXT}
