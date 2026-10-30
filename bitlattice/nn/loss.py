@@ -43,6 +43,13 @@ def _vocab_pass(h, W, bias, y, valid, chunk, dtype, want_grad: bool):
     n, d = h.shape
     V = W.shape[0]
     host = W.device != h.device
+    from .. import _ops
+    from ..kernel_choice import active
+    if (not host and h.is_cuda and _ops.HAVE_EXT and active().fused_ce and h.is_contiguous() and W.is_contiguous()
+            and h.dtype == W.dtype == dtype and dtype in (torch.bfloat16, torch.float16, torch.float32) and d > 0):
+        lse, tgt, gh = torch.ops.bitlattice.vocab_pass(h, W, bias, y.contiguous(), valid.contiguous(), chunk,
+                                                     _VOCAB_TILE_BYTES, want_grad)
+        return lse, tgt, gh if want_grad else None
     lse = torch.empty(n, dtype=torch.float32, device=h.device)
     tgt = torch.empty(n, dtype=torch.float32, device=h.device)
     gh = torch.empty(n, d, dtype=h.dtype if h.dtype in (torch.bfloat16, torch.float16) else torch.float32,

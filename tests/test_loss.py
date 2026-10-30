@@ -77,3 +77,30 @@ def test_gradient_in_forward_for_frozen_head(bias):
         L._VOCAB_TILE_BYTES = old
     assert abs(got.item() - ref.item()) < 2e-2 * abs(ref.item())
     assert ((h2.grad.float() / 2 - h1.grad.float()).norm() / h1.grad.float().norm()).item() < 2e-2
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("want_grad", [False, True])
+def test_native_vocab_pass_matches_tiled_reference(dtype, bias, want_grad):
+    import bitlattice.nn.loss as L
+    torch.manual_seed(17)
+    h = torch.randn(137, 64, device=DEV, dtype=dtype)
+    w = torch.randn(519, 64, device=DEV, dtype=dtype) * 0.1
+    b = torch.randn(519, device=DEV, dtype=dtype) * 0.1 if bias else None
+    y = torch.randint(0, 519, (137,), device=DEV)
+    valid = (torch.arange(137, device=DEV) % 7 != 0).float()
+    old = L._VOCAB_TILE_BYTES
+    L._VOCAB_TILE_BYTES = 4 * 128 * 128
+    try:
+        with bl.kernels(fused_ce=False):
+            ref = L._vocab_pass(h, w, b, y, valid, 128, dtype, want_grad)
+        with bl.kernels(fused_ce=True):
+            got = L._vocab_pass(h, w, b, y, valid, 128, dtype, want_grad)
+    finally:
+        L._VOCAB_TILE_BYTES = old
+    assert torch.allclose(got[0], ref[0], atol=2e-6, rtol=1e-6)
+    assert torch.equal(got[1], ref[1])
+    if want_grad:
+        err = (got[2].float() - ref[2].float()).norm() / ref[2].float().norm()
+        assert err < (1e-5 if dtype == torch.float32 else 2e-3)

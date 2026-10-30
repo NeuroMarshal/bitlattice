@@ -63,6 +63,8 @@ void bl_lattice_update(Tensor packed, std::optional<Tensor> phase, Tensor scales
                        int64_t ns_steps, int64_t ns_dtype, int64_t ns_coeffs, int64_t ns_algo, double clip,
                        int64_t tile_rows);
 Tensor bl_fp4_fold_scales(Tensor scales, Tensor piece, Tensor g, Tensor rounded);
+std::tuple<Tensor, Tensor, Tensor> bl_vocab_pass(Tensor h, Tensor w, std::optional<Tensor> bias, Tensor labels,
+                                               Tensor valid, int64_t chunk, int64_t tile_bytes, bool want_grad);
 Tensor bl_swiglu_fwd(Tensor g, Tensor u);
 std::tuple<Tensor, Tensor> bl_swiglu_bwd(Tensor g, Tensor u, Tensor da);
 Tensor bl_direction(Tensor G, int64_t kind, std::optional<Tensor> r, std::optional<Tensor> c, int64_t k, double beta2,
@@ -122,6 +124,8 @@ TORCH_LIBRARY(bitlattice, m) {
       "int tile_rows) -> ()");
   m.def("fp4_fold_scales(Tensor(a!) scales, Tensor piece, Tensor g, Tensor(b!) rounded) -> Tensor");
   m.def("swiglu_fwd(Tensor g, Tensor u) -> Tensor");
+  m.def("vocab_pass(Tensor h, Tensor w, Tensor? bias, Tensor labels, Tensor valid, int chunk, int tile_bytes, "
+        "bool want_grad) -> (Tensor, Tensor, Tensor)");
   m.def("swiglu_bwd(Tensor g, Tensor u, Tensor da) -> (Tensor, Tensor)");
   m.def("causal_conv1d_fwd(Tensor x, Tensor weight, Tensor? bias, bool silu_act) -> Tensor");
   m.def("causal_conv1d_bwd(Tensor x, Tensor weight, Tensor? bias, Tensor dy, bool silu_act) -> (Tensor, Tensor, Tensor)");
@@ -145,6 +149,7 @@ TORCH_LIBRARY_IMPL(bitlattice, CUDA, m) {
   m.impl("nvfp4_quantize2", &bl_nvfp4_quantize2);
   m.impl("causal_conv1d_fwd", &bl_causal_conv1d_fwd);
   m.impl("swiglu_fwd", &bl_swiglu_fwd);
+  m.impl("vocab_pass", &bl_vocab_pass);
   m.impl("fp4_fold_scales", &bl_fp4_fold_scales);
   m.impl("lattice_update", &bl_lattice_update);
   m.impl("link_send", &bl_link_send);

@@ -36,6 +36,7 @@ class Kernels:
                      tile) in one native call; else a Python loop over the tiles issues the same operations
     fused_fold       deferred weight-gradient operands of the micro-batches are brought to one global scale by one
                      CUDA pass over their block scales; else per micro-batch with ATen operations
+    fused_ce         vocabulary-tiled loss and frozen-head input gradients in C++ with fused CUDA softmax reductions
     """
 
     two_level_gemm: bool = True
@@ -47,6 +48,7 @@ class Kernels:
     grad_in_forward: bool = True
     native_update: bool = True
     fused_fold: bool = True
+    fused_ce: bool = True
 
     @classmethod
     def reference(cls) -> Kernels:
@@ -114,4 +116,4 @@ def kernels_available(device_index: int = 0) -> dict[str, bool]:
             "two_level_gemm": cuda and backend.fp4_supported(device_index) and backend._two_level(device_index),
             "mxfp8_tensor_cores": cuda and backend.mxfp8_supported(device_index),
             "fused_norm": _ops.HAVE_EXT, "fused_conv": _ops.HAVE_EXT, "fused_pack": _ops.HAVE_EXT,
-            "native_update": _ops.HAVE_EXT, "fused_fold": _ops.HAVE_EXT}
+            "native_update": _ops.HAVE_EXT, "fused_fold": _ops.HAVE_EXT, "fused_ce": _ops.HAVE_EXT}
