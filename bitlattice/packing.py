@@ -30,7 +30,7 @@ def pack(codes: torch.Tensor, container_bits: int) -> torch.Tensor:
     c = (codes.to(torch.int32) & mask).reshape(*codes.shape[:-1], packed_cols(codes.shape[-1], container_bits),
                                                 per_byte)
     shifts = torch.arange(per_byte, device=codes.device, dtype=torch.int32) * container_bits
-    return (c << shifts).sum(-1).to(torch.uint8)
+    return (c << shifts).sum(-1, dtype=torch.int32).to(torch.uint8)
 
 
 def unpack(packed: torch.Tensor, container_bits: int, cols: int) -> torch.Tensor:
